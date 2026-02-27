@@ -55,6 +55,7 @@ from agents.roles import PSOCoder
 from agents.multi_agent import (
     _format_task_description,
     _format_training_examples,
+    _format_eval_diff,
     _strip_thinking,
     _extract_code,
 )
@@ -136,6 +137,18 @@ Rules:
 - The function must be named `transform`.
 - No print, no I/O, no side-effects.
 - The solution must generalise to all training pairs, not just the first one.
+- The output shape MUST match the training outputs exactly — check the dimensions!
+
+Strategy hints (think through these before coding):
+- Does each cell transform independently? → compute the rule (e.g. most-frequent value,
+  arithmetic on colors) rather than building a hardcoded input→output lookup table.
+- Is there a spatial transformation (rotate, flip, crop, tile)?
+- Are there discrete objects to detect and manipulate?
+- Does the output size differ from the input? → derive the output size from examples.
+
+⚠ IMPORTANT: Do NOT hardcode specific input-output value pairs from training.
+  Your function must work on ANY input following the same rule.
+  Discover the abstract rule; do not memorise the training examples.
 """
 
 
@@ -152,6 +165,7 @@ class Particle:
     pos:           np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     velocity:      np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     fitness:       float            = 0.0
+    last_eval:     dict             = field(default_factory=dict)
     pbest_code:    str              = ""
     pbest_pos:     np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     pbest_fitness: float            = -1.0
@@ -198,8 +212,9 @@ class PSOOrchestrator:
         c2:             float      = 1.5,
         temperature:    float      = 0.7,
         max_tokens:     int        = 4096,
-        timeout:        float      = 120.0,
-        embed_timeout:  float      = 30.0,
+        timeout:        float      = 180.0,
+        embed_timeout:  float      = 60.0,
+        fitness_alpha:  float      = 0.4,
         debug:          bool       = False,
     ) -> None:
         self.n_particles    = min(n_particles, len(PARTICLE_ROLES))
@@ -208,6 +223,7 @@ class PSOOrchestrator:
         self.w              = w
         self.c1             = c1
         self.c2             = c2
+        self.fitness_alpha  = fitness_alpha
         self.debug          = debug
         self.embed_model    = embed_model
 
@@ -230,20 +246,24 @@ class PSOOrchestrator:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _embed(self, code: str) -> np.ndarray:
+    def _embed(self, code: str, fallback_random: bool = True) -> np.ndarray | None:
         """Return L2-normalised embedding vector for the given code string.
 
-        On failure returns a random unit vector so the particle stays in a
-        meaningful (non-degenerate) region of the search space.
+        Args:
+            code:            Python source code to embed.
+            fallback_random: If True (default), return a random unit vector on
+                             failure so the particle stays in a valid position.
+                             If False, return None so the caller can skip this
+                             candidate entirely (used during candidate selection).
         """
         try:
             vec = self._llm.embed_code(code, model=self.embed_model)
         except Exception as exc:
             if self.debug:
                 print(f"[PSO] Embedding error: {exc}")
-            return _random_unit_vec()
+            return _random_unit_vec() if fallback_random else None
         norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else _random_unit_vec()
+        return vec / norm if norm > 0 else (_random_unit_vec() if fallback_random else None)
 
     def _eval_fitness(self, code: str, task: dict) -> tuple[float, dict]:
         """Evaluate code; return (continuous_fitness, sandbox_result)."""
@@ -341,9 +361,9 @@ class PSOOrchestrator:
                 # LLM call failed (likely timeout): use a random unit vector to
                 # preserve swarm diversity and avoid a cascaded embedding timeout.
                 p.pos = _random_unit_vec()
-                time.sleep(3)   # brief backoff so Ollama can recover
+                time.sleep(10)  # backoff so Ollama can drain the timed-out request
             p.velocity = np.zeros_like(p.pos)
-            p.fitness, _ = self._eval_fitness(p.code, task)
+            p.fitness, p.last_eval = self._eval_fitness(p.code, task)
             p.update_pbest(p.code, p.pos, p.fitness)
             if self.debug:
                 print(f"  Particle {p.particle_id} ({p.role_name}): fitness={p.fitness:.4f}")
@@ -371,6 +391,10 @@ class PSOOrchestrator:
         # ----------------------------------------------------------------
         # Phase 2 — PSO iteration loop
         # ----------------------------------------------------------------
+        stagnation_count   = 0
+        prev_gbest         = gbest_fitness
+        stagnation_limit   = max(2, self.max_iterations // 3)
+
         for iteration in range(self.max_iterations):
             if self.debug:
                 print(
@@ -415,6 +439,8 @@ class PSOOrchestrator:
                 # ------------------------------------------------------------
                 # Step 2 — LLM generates K candidate mutations
                 # ------------------------------------------------------------
+                diff_str = _format_eval_diff(p.last_eval)
+
                 try:
                     candidates = self._pso_coder.generate_mutations(
                         task_description=task_description,
@@ -427,6 +453,7 @@ class PSOOrchestrator:
                         gbest_fitness=gbest_fitness,
                         role_name=p.role_name,
                         role_description=p.role_desc,
+                        eval_diff=diff_str,
                     )
                 except Exception as exc:
                     if self.debug:
@@ -434,25 +461,40 @@ class PSOOrchestrator:
                     candidates = [p.pbest_code]
 
                 # ------------------------------------------------------------
-                # Step 3 — Generate-and-Project: select closest to target_pos
+                # Step 3 — Generate-and-Project: hybrid selection
+                # Evaluate all candidates; pick by weighted combination of
+                # PSO proximity (embedding distance to target) and fitness.
                 # ------------------------------------------------------------
                 best_candidate = p.pbest_code  # safe fallback
                 best_emb       = p.pbest_pos.copy()
-                min_dist       = float("inf")
+                best_score     = -float("inf")
 
+                cand_results: list[tuple[str, np.ndarray, float, float]] = []
                 for cand in candidates:
                     if not cand or not cand.strip():
                         continue
-                    emb = self._embed(cand)
-                    if not np.any(emb):
-                        continue
-                    if len(emb) != len(target_pos):
-                        continue
+                    emb = self._embed(cand, fallback_random=False)
+                    if emb is None or len(emb) != len(target_pos):
+                        continue   # skip candidates whose embedding failed
                     dist = cosine(emb, target_pos)
-                    if dist < min_dist:
-                        min_dist       = dist
-                        best_candidate = cand
-                        best_emb       = emb
+                    fit, _ = self._eval_fitness(cand, task)
+                    cand_results.append((cand, emb, dist, fit))
+
+                if cand_results:
+                    # Priority 1: take the highest-fitness candidate if it strictly
+                    # improves over the current particle's fitness.
+                    improving = [
+                        (c, e, d, f) for c, e, d, f in cand_results
+                        if f > p.fitness + 1e-6
+                    ]
+                    if improving:
+                        best_cand_tuple = max(improving, key=lambda x: x[3])
+                    else:
+                        # Priority 2: pure PSO exploration — pick by embedding proximity.
+                        best_cand_tuple = min(cand_results, key=lambda x: x[2])
+
+                    best_candidate = best_cand_tuple[0]
+                    best_emb       = best_cand_tuple[1]
 
                 # ------------------------------------------------------------
                 # Step 4 — Update particle state
@@ -467,7 +509,7 @@ class PSOOrchestrator:
                 # ------------------------------------------------------------
                 # Step 5 — Evaluate in sandbox
                 # ------------------------------------------------------------
-                p.fitness, eval_res = self._eval_fitness(p.code, task)
+                p.fitness, p.last_eval = self._eval_fitness(p.code, task)
 
                 # ------------------------------------------------------------
                 # Step 6 — Update personal best
@@ -493,13 +535,14 @@ class PSOOrchestrator:
                             f"{gbest_fitness:.4f} ***"
                         )
 
+                best_dist = min((r[2] for r in cand_results), default=None)
                 iter_log["particles"].append({
                     "particle_id":   p.particle_id,
                     "role":          p.role_name,
                     "fitness":       p.fitness,
                     "pbest_fitness": p.pbest_fitness,
-                    "n_candidates":  len(candidates),
-                    "min_dist":      round(min_dist, 5) if min_dist != float("inf") else None,
+                    "n_candidates":  len(cand_results),
+                    "best_dist":     round(best_dist, 5) if best_dist is not None else None,
                 })
 
             iter_log["gbest_fitness"] = gbest_fitness
@@ -509,6 +552,35 @@ class PSOOrchestrator:
                 if self.debug:
                     print(f"\n[PSO] Solved at iteration {iteration + 1}!")
                 return self._make_result(True, gbest_code, gbest_fitness, log, task)
+
+            # ----------------------------------------------------------------
+            # Stagnation check — reinitialise worst particle if stuck
+            # ----------------------------------------------------------------
+            if gbest_fitness <= prev_gbest + 1e-6:
+                stagnation_count += 1
+            else:
+                stagnation_count = 0
+                prev_gbest = gbest_fitness
+
+            if stagnation_count >= stagnation_limit and len(swarm) > 1:
+                worst = min(swarm, key=lambda pp: pp.pbest_fitness)
+                if self.debug:
+                    print(
+                        f"  [PSO] Stagnation ({stagnation_count} iters) — "
+                        f"reinitialising particle {worst.particle_id} ({worst.role_name})"
+                    )
+                worst.code, generated = self._init_particle_code(
+                    worst, task_description, training_examples
+                )
+                if generated:
+                    worst.pos = self._embed(worst.code)
+                else:
+                    worst.pos = _random_unit_vec()
+                worst.velocity     = np.zeros_like(worst.pos)
+                worst.fitness, worst.last_eval = self._eval_fitness(worst.code, task)
+                worst.pbest_fitness = -1.0   # reset personal best to explore fresh
+                worst.update_pbest(worst.code, worst.pos, worst.fitness)
+                stagnation_count   = 0
 
         if self.debug:
             print(f"\n[PSO] Budget exhausted.  Best fitness: {gbest_fitness:.4f}")

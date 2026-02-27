@@ -81,6 +81,21 @@ def _format_training_examples(task: dict) -> str:
     return "\n".join(lines)
 
 
+def _output_shape_constraint(task: dict) -> str:
+    """Return a hard-constraint string if all training outputs share the same shape."""
+    shapes = [tuple(p["output"].shape) for p in task["train"]]
+    if len(set(shapes)) == 1:
+        oh, ow = shapes[0]
+        return (
+            f"\n⚠ HARD CONSTRAINT: transform() MUST return an array of shape "
+            f"({oh}, {ow}) — i.e. exactly {oh} rows × {ow} columns.  "
+            "Any other output size is WRONG regardless of content."
+        )
+    # Variable output sizes: just summarise them
+    shape_strs = ", ".join(f"{h}×{w}" for h, w in shapes)
+    return f"\n(Output shapes per training pair: {shape_strs})"
+
+
 def _format_task_description(task: dict) -> str:
     pairs    = task["train"]
     max_cells = max(max(p["input"].size, p["output"].size) for p in pairs)
@@ -106,8 +121,37 @@ def _format_task_description(task: dict) -> str:
     test_inp = task["test"][0]["input"]
     th, tw   = test_inp.shape
     lines.append(f"### Test input ({th}×{tw}):\n{_grid_to_str(test_inp)}")
+    lines.append(_output_shape_constraint(task))
     lines.append("\nStudy the training pairs and identify the transformation rule.")
     return "\n".join(lines)
+
+
+def _format_eval_diff(eval_result: dict, max_pairs: int = 2) -> str:
+    """Format a concise diff of sandbox evaluation failures for LLM feedback."""
+    lines = []
+    for i, pair in enumerate(eval_result.get("pairs", [])[:max_pairs]):
+        if pair.get("error"):
+            lines.append(f"Pair {i + 1}: runtime error — {pair['error'][:120]}")
+            continue
+        pred = pair.get("predicted")
+        exp  = pair.get("expected")
+        if pred is None or exp is None:
+            lines.append(f"Pair {i + 1}: no prediction")
+            continue
+        if pred.shape != exp.shape:
+            lines.append(
+                f"Pair {i + 1}: wrong shape — got {pred.shape[0]}×{pred.shape[1]}, "
+                f"expected {exp.shape[0]}×{exp.shape[1]}"
+            )
+        else:
+            wrong = int(np.sum(pred != exp))
+            total = int(exp.size)
+            lines.append(f"Pair {i + 1}: {wrong}/{total} cells wrong")
+            # Show first few mismatches
+            mismatches = np.argwhere(pred != exp)[:4]
+            for r, c in mismatches:
+                lines.append(f"  [{r},{c}]: got {pred[r,c]}, expected {exp[r,c]}")
+    return "\n".join(lines) if lines else "No diff available"
 
 
 # ---------------------------------------------------------------------------

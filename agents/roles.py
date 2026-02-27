@@ -256,6 +256,7 @@ class PSOCoder:
         gbest_fitness:     float,
         role_name:         str,
         role_description:  str,
+        eval_diff:         str | None = None,
         temperature:       float | None = None,
     ) -> list[str]:
         """Return up to self.k candidate code strings.
@@ -269,6 +270,14 @@ class PSOCoder:
             + f"\n\nYour particle role: {role_name} — {role_description}"
         )
 
+        diff_section = ""
+        if eval_diff:
+            diff_section = (
+                "--- CURRENT FAILURES (address these in your mutations) ---\n"
+                + eval_diff
+                + "\n\n"
+            )
+
         content = (
             f"{task_description}\n\n"
             f"{training_context}\n\n"
@@ -276,7 +285,8 @@ class PSOCoder:
             f"Current code fitness : {current_fitness:.4f} / 1.0000\n"
             f"Personal best fitness: {pbest_fitness:.4f} / 1.0000\n"
             f"Global best fitness  : {gbest_fitness:.4f} / 1.0000\n\n"
-            "Personal best code:\n"
+            + diff_section
+            + "Personal best code:\n"
             f"```python\n{pbest_code}\n```\n\n"
             "Global best code:\n"
             f"```python\n{gbest_code}\n```\n\n"

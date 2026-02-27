@@ -145,19 +145,26 @@ class TestEmbed:
         result = orch._embed("some code")
         assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
 
-    def test_returns_random_unit_vec_on_connection_error(self):
+    def test_returns_random_unit_vec_on_connection_error_with_fallback(self):
         orch = make_orchestrator()
         orch._llm.embed_code = MagicMock(side_effect=ConnectionError("no Ollama"))
-        result = orch._embed("some code")
+        result = orch._embed("some code", fallback_random=True)
+        assert result is not None
         assert result.shape == (768,)
-        # Should be a non-zero random unit vector (not zeros)
         assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
+
+    def test_returns_none_on_connection_error_without_fallback(self):
+        orch = make_orchestrator()
+        orch._llm.embed_code = MagicMock(side_effect=ConnectionError("no Ollama"))
+        result = orch._embed("some code", fallback_random=False)
+        assert result is None
 
     def test_zero_vector_falls_back_to_random_unit_vec(self):
         orch = make_orchestrator()
         orch._llm.embed_code = MagicMock(return_value=np.zeros(768, dtype=np.float32))
-        result = orch._embed("empty")
+        result = orch._embed("empty", fallback_random=True)
         # Zero-norm input triggers random unit vector fallback
+        assert result is not None
         assert result.shape == (768,)
         assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
 

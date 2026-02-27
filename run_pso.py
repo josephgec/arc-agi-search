@@ -57,10 +57,12 @@ def parse_args() -> argparse.Namespace:
                    help="LLM sampling temperature.")
     p.add_argument("--max-tokens",  type=int,   default=4096,
                    help="Max tokens per LLM call.")
-    p.add_argument("--timeout",       type=float, default=120.0,
+    p.add_argument("--timeout",       type=float, default=180.0,
                    help="Per-LLM-generation timeout (seconds).")
-    p.add_argument("--embed-timeout", type=float, default=30.0,
+    p.add_argument("--embed-timeout", type=float, default=60.0,
                    help="Per-embedding timeout (seconds).")
+    p.add_argument("--fitness-alpha", type=float, default=0.4,
+                   help="Weight of actual fitness vs PSO proximity in candidate selection (0=pure PSO, 1=pure greedy).")
 
     # PSO hyperparameters
     p.add_argument("--n-particles",    type=int,   default=6,
@@ -104,6 +106,7 @@ def build_orchestrator(args: argparse.Namespace) -> PSOOrchestrator:
         max_tokens=args.max_tokens,
         timeout=args.timeout,
         embed_timeout=args.embed_timeout,
+        fitness_alpha=args.fitness_alpha,
         debug=args.debug,
     )
 
