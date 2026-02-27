@@ -585,7 +585,102 @@ class PSOOrchestrator:
         if self.debug:
             print(f"\n[PSO] Budget exhausted.  Best fitness: {gbest_fitness:.4f}")
 
+        # ----------------------------------------------------------------
+        # Phase 3 — Targeted refinement when fitness is near-perfect (≥0.85)
+        # ----------------------------------------------------------------
+        if 0.85 <= gbest_fitness < 1.0:
+            gbest_code, gbest_fitness = self._refinement_phase(
+                gbest_code, gbest_fitness, task,
+                task_description, training_examples, log
+            )
+
         return self._make_result(gbest_fitness >= 1.0, gbest_code, gbest_fitness, log, task)
+
+    # ------------------------------------------------------------------
+    # Refinement helpers
+    # ------------------------------------------------------------------
+
+    _REFINEMENT_SYSTEM = """\
+You are an expert ARC-AGI code debugger.  The provided `transform` function
+is ALMOST correct but has a systematic bug.  You will be shown which cells
+are wrong — your job is to find and fix the ROOT CAUSE in the logic.
+
+Available DSL (already imported): crop, rotate, flip, translate, scale, tile,
+recolor, mask, overlay, flood_fill, find_objects, bounding_box, crop_to_content, np
+
+Rules:
+- Return ONLY one ```python … ``` code block named `transform`.
+- Identify the SYSTEMATIC error pattern (e.g. wrong index, off-by-one, wrong axis).
+- Fix the underlying logic — do NOT hardcode specific coordinates or add shape-based if-else.
+- The fixed function must generalise to ALL training pairs, not just patch specific cells.
+- The output shape MUST remain the same as in the training examples.
+"""
+
+    def _refinement_phase(
+        self,
+        code:          str,
+        fitness:       float,
+        task:          dict,
+        task_desc:     str,
+        training_ctx:  str,
+        log:           list,
+        max_attempts:  int = 3,
+    ) -> tuple[str, float]:
+        """Run targeted fix attempts when fitness is near-perfect."""
+        if self.debug:
+            print(f"\n[PSO] Refinement phase  (gbest={fitness:.4f})")
+
+        best_code    = code
+        best_fitness = fitness
+
+        for attempt in range(max_attempts):
+            _, eval_res = self._eval_fitness(best_code, task)
+            diff = _format_eval_diff(eval_res, max_pairs=3)
+
+            content = (
+                f"{task_desc}\n\n"
+                f"{training_ctx}\n\n"
+                f"Current best code (fitness={best_fitness:.4f}):\n"
+                f"```python\n{best_code}\n```\n\n"
+                f"Error analysis:\n{diff}\n\n"
+                "Study the error pattern across all pairs — what SYSTEMATIC mistake "
+                "causes these wrong cells?\n"
+                "Fix the root cause in the algorithm.  Do NOT add if-else branches per "
+                "input shape or hardcode specific cell coordinates.\n"
+                "Return the corrected `transform` function."
+            )
+            messages = [{"role": "user", "content": content}]
+
+            try:
+                response = self._llm.generate(self._REFINEMENT_SYSTEM, messages)
+            except Exception as exc:
+                if self.debug:
+                    print(f"  [Refine] LLM error: {exc}")
+                break
+
+            clean = _strip_thinking(response)
+            fixed_code = _extract_code(clean) or _extract_code(response)
+            if not fixed_code:
+                continue
+
+            fixed_fitness, _ = self._eval_fitness(fixed_code, task)
+            if self.debug:
+                print(f"  [Refine] attempt {attempt + 1}: fitness={fixed_fitness:.4f}")
+            log.append({
+                "phase":          "refine",
+                "attempt":        attempt + 1,
+                "fitness_before": best_fitness,
+                "fitness_after":  fixed_fitness,
+            })
+
+            if fixed_fitness >= 1.0:
+                return fixed_code, 1.0
+
+            if fixed_fitness > best_fitness:
+                best_code    = fixed_code
+                best_fitness = fixed_fitness
+
+        return best_code, best_fitness
 
     # ------------------------------------------------------------------
     # Result construction
