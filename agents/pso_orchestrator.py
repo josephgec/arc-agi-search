@@ -1,0 +1,505 @@
+"""Particle Swarm Optimization Orchestrator for ARC-AGI.
+
+Architecture overview
+---------------------
+Standard LLM agent loops often get stuck in repetitive generation cycles
+(local minima).  This module escapes that trap by coupling a *continuous*
+mathematical optimizer (PSO) with a *discrete* LLM code generator via a
+"Generate-and-Project" bridge:
+
+  1. PSO computes a *target vector* in continuous embedding space.
+  2. The LLM generates K candidate code strings by intelligently blending
+     the particle's personal-best and the swarm's global-best solutions.
+  3. We embed all K candidates and select the one whose embedding is
+     *closest* (cosine distance) to the PSO target vector.
+
+This decouples search direction (math) from solution generation (LLM), so
+the swarm systematically explores the semantic space of programs rather than
+just randomly sampling.
+
+Particle roles
+--------------
+Each particle is seeded with a different "cognitive specialisation" prompt
+to maximise diversity in the initial population and reduce the chance that
+all particles converge to the same local optimum.
+
+PSO update equations
+--------------------
+  v_i ← w·v_i + c1·r1·(pbest_i − x_i) + c2·r2·(gbest − x_i)
+  target_i ← x_i + v_i   (then L2-normalised to lie on unit hypersphere)
+
+After selecting the best candidate via the bridge:
+  x_i ← embed(best_candidate)   (actual position, not the target)
+  v_i ← x_i_new − x_i_old      (implied velocity for next iteration)
+
+Fitness
+-------
+Uses arc.evaluate.calculate_continuous_fitness for a smooth [0, 1] signal.
+A fitness of 1.0 means all training pairs are pixel-perfect.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+from scipy.spatial.distance import cosine
+
+from arc import sandbox
+from arc.evaluate import calculate_continuous_fitness
+from arc.grid import Grid, grids_equal
+from agents.llm_client import LLMClient
+from agents.roles import PSOCoder
+from agents.multi_agent import (
+    _format_task_description,
+    _format_training_examples,
+    _strip_thinking,
+    _extract_code,
+)
+
+# ---------------------------------------------------------------------------
+# Particle role catalogue
+# ---------------------------------------------------------------------------
+
+PARTICLE_ROLES: list[tuple[str, str]] = [
+    (
+        "geometric_specialist",
+        "You excel at spatial transforms: rotation, flipping, translation, scaling, "
+        "and tiling.  Think in terms of grid geometry and structural symmetry.",
+    ),
+    (
+        "color_specialist",
+        "You excel at colour-based operations: recoloring, masking, overlaying, and "
+        "colour palette analysis.  Think in terms of colour relationships and mappings.",
+    ),
+    (
+        "pattern_analyst",
+        "You excel at finding repeating patterns, symmetries, and tile-level structure. "
+        "Think in terms of periodic grids, reflections, and sub-grid repetition.",
+    ),
+    (
+        "object_tracker",
+        "You excel at finding discrete objects using find_objects(), analysing their "
+        "properties (colour, size, bounding box), and applying object-level transforms.",
+    ),
+    (
+        "rule_abstractor",
+        "You excel at identifying the minimal abstract rule governing a transformation "
+        "and expressing it as clean, general Python code with few hard-coded constants.",
+    ),
+    (
+        "hybrid_solver",
+        "You take a holistic approach, combining geometric, colour, and object-level "
+        "reasoning.  You prefer elegant solutions that generalise across all pairs.",
+    ),
+]
+
+_INIT_CODER_SYSTEM = """\
+You are an ARC-AGI puzzle solver.  Study the training pairs and write a Python
+function called `transform(input_grid: np.ndarray) -> np.ndarray` that correctly
+maps every input to its corresponding output.
+
+Available DSL (already imported — do NOT re-import):
+  crop, rotate, flip, translate, scale, tile,
+  recolor, mask, overlay, flood_fill,
+  find_objects, bounding_box, crop_to_content, np
+
+Rules:
+- Return ONLY one ```python … ``` code block.
+- The function must be named `transform`.
+- No print, no I/O, no side-effects.
+- The solution must generalise to all training pairs, not just the first one.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Particle dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Particle:
+    particle_id:   int
+    role_name:     str
+    role_desc:     str
+    code:          str              = ""
+    pos:           np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    velocity:      np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    fitness:       float            = 0.0
+    pbest_code:    str              = ""
+    pbest_pos:     np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    pbest_fitness: float            = -1.0
+
+    def update_pbest(self, code: str, pos: np.ndarray, fitness: float) -> None:
+        self.pbest_code    = code
+        self.pbest_pos     = pos.copy()
+        self.pbest_fitness = fitness
+
+
+# ---------------------------------------------------------------------------
+# PSO Orchestrator
+# ---------------------------------------------------------------------------
+
+class PSOOrchestrator:
+    """Swarm of LLM-powered particles searching the code embedding space.
+
+    Args:
+        backend:        LLM backend — "ollama" or "anthropic".
+        model:          Chat model name (default: deepseek-r1:32b for ollama).
+        embed_model:    Ollama embedding model (default: nomic-embed-text).
+        n_particles:    Number of particles (≤ len(PARTICLE_ROLES) = 6).
+        max_iterations: PSO iteration budget.
+        k_candidates:   LLM mutation candidates per particle per iteration.
+        w:              Inertia weight (dampens velocity).
+        c1:             Cognitive coefficient (pull toward personal best).
+        c2:             Social coefficient (pull toward global best).
+        temperature:    LLM sampling temperature for code generation.
+        max_tokens:     Max tokens per LLM call.
+        timeout:        Per-LLM-call timeout in seconds.
+        debug:          Verbose progress logging.
+    """
+
+    def __init__(
+        self,
+        backend:        str        = "ollama",
+        model:          str | None = None,
+        embed_model:    str        = "nomic-embed-text",
+        n_particles:    int        = 6,
+        max_iterations: int        = 10,
+        k_candidates:   int        = 5,
+        w:              float      = 0.5,
+        c1:             float      = 1.5,
+        c2:             float      = 1.5,
+        temperature:    float      = 0.7,
+        max_tokens:     int        = 4096,
+        timeout:        float      = 120.0,
+        debug:          bool       = False,
+    ) -> None:
+        self.n_particles    = min(n_particles, len(PARTICLE_ROLES))
+        self.max_iterations = max_iterations
+        self.k_candidates   = k_candidates
+        self.w              = w
+        self.c1             = c1
+        self.c2             = c2
+        self.debug          = debug
+        self.embed_model    = embed_model
+
+        self._llm = LLMClient(
+            backend=backend,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            debug=debug,
+        )
+        self._pso_coder = PSOCoder(self._llm, k=k_candidates)
+
+        # Expose for CLI / logging
+        self.backend  = backend
+        self.model    = self._llm.model
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _embed(self, code: str) -> np.ndarray:
+        """Return L2-normalised embedding vector for the given code string."""
+        try:
+            vec = self._llm.embed_code(code, model=self.embed_model)
+        except Exception as exc:
+            if self.debug:
+                print(f"[PSO] Embedding error: {exc}")
+            return np.zeros(768, dtype=np.float32)   # nomic-embed-text dim
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
+
+    def _eval_fitness(self, code: str, task: dict) -> tuple[float, dict]:
+        """Evaluate code; return (continuous_fitness, sandbox_result)."""
+        if not code or not code.strip():
+            empty = {"pairs": [], "n_correct": 0, "n_total": 0, "all_correct": False}
+            return 0.0, empty
+
+        result = sandbox.evaluate_code(code, task)
+        if result["all_correct"]:
+            return 1.0, result
+
+        total = 0.0
+        for pair_res in result["pairs"]:
+            if pair_res["error"]:
+                total += 0.0
+            else:
+                total += calculate_continuous_fitness(
+                    pair_res["predicted"], pair_res["expected"]
+                )
+        fitness = total / result["n_total"] if result["n_total"] > 0 else 0.0
+        return fitness, result
+
+    def _init_particle_code(
+        self, particle: Particle, task_description: str, training_examples: str
+    ) -> str:
+        """Ask the LLM to write an initial solution for this particle's role."""
+        system = (
+            _INIT_CODER_SYSTEM
+            + f"\n\nYour cognitive specialisation: {particle.role_name} — {particle.role_desc}"
+        )
+        content = f"{task_description}\n\n{training_examples}\n\nWrite the `transform` function."
+        messages = [{"role": "user", "content": content}]
+
+        try:
+            response = self._llm.generate(system, messages)
+        except Exception as exc:
+            if self.debug:
+                print(f"[PSO] Init generation failed for particle {particle.particle_id}: {exc}")
+            return "def transform(input_grid):\n    return input_grid.copy()"
+
+        clean = _strip_thinking(response)
+        code  = _extract_code(clean) or _extract_code(response)
+        return code or "def transform(input_grid):\n    return input_grid.copy()"
+
+    # ------------------------------------------------------------------
+    # Core PSO loop
+    # ------------------------------------------------------------------
+
+    def solve(self, task: dict) -> dict:
+        """Run the PSO loop and return the best solution found.
+
+        Returns:
+            {
+              'success':       bool — True if gbest achieves fitness 1.0,
+              'code':          str  — best transform function found,
+              'gbest_fitness': float,
+              'prediction':    np.ndarray | None,
+              'test_correct':  bool | None  (only if test output is known),
+              'log':           list of per-iteration dicts,
+            }
+        """
+        task_description  = _format_task_description(task)
+        training_examples = _format_training_examples(task)
+        log: list[dict]   = []
+
+        # ----------------------------------------------------------------
+        # Phase 1 — Initialisation
+        # ----------------------------------------------------------------
+        if self.debug:
+            print(f"\n[PSO] Initialising {self.n_particles} particles …")
+
+        swarm: list[Particle] = [
+            Particle(
+                particle_id=i,
+                role_name=PARTICLE_ROLES[i % len(PARTICLE_ROLES)][0],
+                role_desc=PARTICLE_ROLES[i % len(PARTICLE_ROLES)][1],
+            )
+            for i in range(self.n_particles)
+        ]
+
+        for p in swarm:
+            p.code    = self._init_particle_code(p, task_description, training_examples)
+            p.pos     = self._embed(p.code)
+            p.velocity = np.zeros_like(p.pos)
+            p.fitness, _ = self._eval_fitness(p.code, task)
+            p.update_pbest(p.code, p.pos, p.fitness)
+            if self.debug:
+                print(f"  Particle {p.particle_id} ({p.role_name}): fitness={p.fitness:.4f}")
+
+        # Global best
+        gbest_particle = max(swarm, key=lambda p: p.pbest_fitness)
+        gbest_code     = gbest_particle.pbest_code
+        gbest_pos      = gbest_particle.pbest_pos.copy()
+        gbest_fitness  = gbest_particle.pbest_fitness
+
+        log.append({
+            "phase":           "init",
+            "gbest_fitness":   gbest_fitness,
+            "particle_states": [
+                {"id": p.particle_id, "role": p.role_name, "fitness": p.fitness}
+                for p in swarm
+            ],
+        })
+
+        if gbest_fitness >= 1.0:
+            if self.debug:
+                print("[PSO] Solved during initialisation!")
+            return self._make_result(True, gbest_code, gbest_fitness, log, task)
+
+        # ----------------------------------------------------------------
+        # Phase 2 — PSO iteration loop
+        # ----------------------------------------------------------------
+        for iteration in range(self.max_iterations):
+            if self.debug:
+                print(
+                    f"\n[PSO] Iteration {iteration + 1}/{self.max_iterations}  "
+                    f"gbest={gbest_fitness:.4f}"
+                )
+
+            iter_log: dict[str, Any] = {
+                "iteration":     iteration + 1,
+                "gbest_fitness": gbest_fitness,
+                "particles":     [],
+            }
+
+            for p in swarm:
+                dim = len(p.pos)
+
+                # ------------------------------------------------------------
+                # Step 1 — PSO velocity update (continuous embedding space)
+                # ------------------------------------------------------------
+                r1 = np.random.rand(dim).astype(np.float32)
+                r2 = np.random.rand(dim).astype(np.float32)
+
+                if len(p.velocity) != dim:
+                    p.velocity = np.zeros(dim, dtype=np.float32)
+                if len(gbest_pos) != dim:
+                    gbest_pos_d = np.zeros(dim, dtype=np.float32)
+                else:
+                    gbest_pos_d = gbest_pos
+
+                p.velocity = (
+                    self.w  * p.velocity
+                    + self.c1 * r1 * (p.pbest_pos - p.pos)
+                    + self.c2 * r2 * (gbest_pos_d - p.pos)
+                )
+
+                target_pos = p.pos + p.velocity
+                # Keep target on the unit hypersphere (embeddings are normalised)
+                t_norm = np.linalg.norm(target_pos)
+                if t_norm > 0:
+                    target_pos = target_pos / t_norm
+
+                # ------------------------------------------------------------
+                # Step 2 — LLM generates K candidate mutations
+                # ------------------------------------------------------------
+                try:
+                    candidates = self._pso_coder.generate_mutations(
+                        task_description=task_description,
+                        training_context=training_examples,
+                        current_code=p.code,
+                        current_fitness=p.fitness,
+                        pbest_code=p.pbest_code,
+                        pbest_fitness=p.pbest_fitness,
+                        gbest_code=gbest_code,
+                        gbest_fitness=gbest_fitness,
+                        role_name=p.role_name,
+                        role_description=p.role_desc,
+                    )
+                except Exception as exc:
+                    if self.debug:
+                        print(f"  [PSO] Mutation failed for particle {p.particle_id}: {exc}")
+                    candidates = [p.pbest_code]
+
+                # ------------------------------------------------------------
+                # Step 3 — Generate-and-Project: select closest to target_pos
+                # ------------------------------------------------------------
+                best_candidate = p.pbest_code  # safe fallback
+                best_emb       = p.pbest_pos.copy()
+                min_dist       = float("inf")
+
+                for cand in candidates:
+                    if not cand or not cand.strip():
+                        continue
+                    emb = self._embed(cand)
+                    if not np.any(emb):
+                        continue
+                    if len(emb) != len(target_pos):
+                        continue
+                    dist = cosine(emb, target_pos)
+                    if dist < min_dist:
+                        min_dist       = dist
+                        best_candidate = cand
+                        best_emb       = emb
+
+                # ------------------------------------------------------------
+                # Step 4 — Update particle state
+                # ------------------------------------------------------------
+                prev_pos   = p.pos.copy()
+                p.code     = best_candidate
+                p.pos      = best_emb
+                # Recompute actual velocity as displacement (more stable)
+                if len(p.pos) == len(prev_pos):
+                    p.velocity = p.pos - prev_pos
+
+                # ------------------------------------------------------------
+                # Step 5 — Evaluate in sandbox
+                # ------------------------------------------------------------
+                p.fitness, eval_res = self._eval_fitness(p.code, task)
+
+                # ------------------------------------------------------------
+                # Step 6 — Update personal best
+                # ------------------------------------------------------------
+                if p.fitness > p.pbest_fitness:
+                    p.update_pbest(p.code, p.pos, p.fitness)
+                    if self.debug:
+                        print(
+                            f"  Particle {p.particle_id} pbest update: "
+                            f"{p.pbest_fitness:.4f}"
+                        )
+
+                # ------------------------------------------------------------
+                # Step 7 — Update global best
+                # ------------------------------------------------------------
+                if p.fitness > gbest_fitness:
+                    gbest_code    = p.code
+                    gbest_pos     = p.pos.copy()
+                    gbest_fitness = p.fitness
+                    if self.debug:
+                        print(
+                            f"  *** New gbest! Particle {p.particle_id}: "
+                            f"{gbest_fitness:.4f} ***"
+                        )
+
+                iter_log["particles"].append({
+                    "particle_id":   p.particle_id,
+                    "role":          p.role_name,
+                    "fitness":       p.fitness,
+                    "pbest_fitness": p.pbest_fitness,
+                    "n_candidates":  len(candidates),
+                    "min_dist":      round(min_dist, 5) if min_dist != float("inf") else None,
+                })
+
+            iter_log["gbest_fitness"] = gbest_fitness
+            log.append(iter_log)
+
+            if gbest_fitness >= 1.0:
+                if self.debug:
+                    print(f"\n[PSO] Solved at iteration {iteration + 1}!")
+                return self._make_result(True, gbest_code, gbest_fitness, log, task)
+
+        if self.debug:
+            print(f"\n[PSO] Budget exhausted.  Best fitness: {gbest_fitness:.4f}")
+
+        return self._make_result(gbest_fitness >= 1.0, gbest_code, gbest_fitness, log, task)
+
+    # ------------------------------------------------------------------
+    # Result construction
+    # ------------------------------------------------------------------
+
+    def _make_result(
+        self,
+        success:      bool,
+        code:         str,
+        gbest_fitness: float,
+        log:          list,
+        task:         dict,
+    ) -> dict:
+        test_pair    = (task.get("test") or [{}])[0]
+        test_input   = test_pair.get("input")
+        prediction   = None
+        test_correct = None
+
+        if code and test_input is not None:
+            out, err = sandbox.execute(code, test_input)
+            if out is not None:
+                prediction = out
+                if "output" in test_pair:
+                    test_correct = grids_equal(prediction, test_pair["output"])
+
+        return {
+            "success":       success,
+            "code":          code,
+            "gbest_fitness": gbest_fitness,
+            "prediction":    prediction,
+            "test_correct":  test_correct,
+            "log":           log,
+        }
+
+    def predict(self, task: dict) -> Grid | None:
+        return self.solve(task)["prediction"]
