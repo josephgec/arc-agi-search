@@ -40,6 +40,7 @@ A fitness of 1.0 means all training pairs are pixel-perfect.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,6 +95,31 @@ PARTICLE_ROLES: list[tuple[str, str]] = [
         "reasoning.  You prefer elegant solutions that generalise across all pairs.",
     ),
 ]
+
+# Role-specific fallback transforms used when LLM generation fails during init.
+# Each is semantically different to preserve swarm diversity.
+_ROLE_FALLBACK: dict[str, str] = {
+    "geometric_specialist": "def transform(input_grid):\n    return rotate(input_grid, 1)",
+    "color_specialist":     "def transform(input_grid):\n    return flip(input_grid, axis=1)",
+    "pattern_analyst":      "def transform(input_grid):\n    return flip(input_grid, axis=0)",
+    "object_tracker":       "def transform(input_grid):\n    return crop_to_content(input_grid)",
+    "rule_abstractor":      "def transform(input_grid):\n    return tile(input_grid, 1, 1)",
+    "hybrid_solver":        "def transform(input_grid):\n    return rotate(input_grid, 2)",
+}
+_IDENTITY_FALLBACK = "def transform(input_grid):\n    return input_grid.copy()"
+
+_EMBED_DIM = 768  # nomic-embed-text output dimension
+
+
+def _random_unit_vec(rng: np.random.Generator | None = None) -> np.ndarray:
+    """Return a random L2-normalised float32 vector of length _EMBED_DIM."""
+    if rng is None:
+        v = np.random.randn(_EMBED_DIM).astype(np.float32)
+    else:
+        v = rng.standard_normal(_EMBED_DIM).astype(np.float32)
+    norm = np.linalg.norm(v)
+    return v / norm if norm > 0 else v
+
 
 _INIT_CODER_SYSTEM = """\
 You are an ARC-AGI puzzle solver.  Study the training pairs and write a Python
@@ -173,6 +199,7 @@ class PSOOrchestrator:
         temperature:    float      = 0.7,
         max_tokens:     int        = 4096,
         timeout:        float      = 120.0,
+        embed_timeout:  float      = 30.0,
         debug:          bool       = False,
     ) -> None:
         self.n_particles    = min(n_particles, len(PARTICLE_ROLES))
@@ -190,6 +217,7 @@ class PSOOrchestrator:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            embed_timeout=embed_timeout,
             debug=debug,
         )
         self._pso_coder = PSOCoder(self._llm, k=k_candidates)
@@ -203,15 +231,19 @@ class PSOOrchestrator:
     # ------------------------------------------------------------------
 
     def _embed(self, code: str) -> np.ndarray:
-        """Return L2-normalised embedding vector for the given code string."""
+        """Return L2-normalised embedding vector for the given code string.
+
+        On failure returns a random unit vector so the particle stays in a
+        meaningful (non-degenerate) region of the search space.
+        """
         try:
             vec = self._llm.embed_code(code, model=self.embed_model)
         except Exception as exc:
             if self.debug:
                 print(f"[PSO] Embedding error: {exc}")
-            return np.zeros(768, dtype=np.float32)   # nomic-embed-text dim
+            return _random_unit_vec()
         norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
+        return vec / norm if norm > 0 else _random_unit_vec()
 
     def _eval_fitness(self, code: str, task: dict) -> tuple[float, dict]:
         """Evaluate code; return (continuous_fitness, sandbox_result)."""
@@ -236,8 +268,13 @@ class PSOOrchestrator:
 
     def _init_particle_code(
         self, particle: Particle, task_description: str, training_examples: str
-    ) -> str:
-        """Ask the LLM to write an initial solution for this particle's role."""
+    ) -> tuple[str, bool]:
+        """Ask the LLM to write an initial solution for this particle's role.
+
+        Returns:
+            (code, generated) — generated=False when the LLM call failed so
+            the caller can skip the embedding step and apply backoff.
+        """
         system = (
             _INIT_CODER_SYSTEM
             + f"\n\nYour cognitive specialisation: {particle.role_name} — {particle.role_desc}"
@@ -250,11 +287,15 @@ class PSOOrchestrator:
         except Exception as exc:
             if self.debug:
                 print(f"[PSO] Init generation failed for particle {particle.particle_id}: {exc}")
-            return "def transform(input_grid):\n    return input_grid.copy()"
+            fallback = _ROLE_FALLBACK.get(particle.role_name, _IDENTITY_FALLBACK)
+            return fallback, False
 
         clean = _strip_thinking(response)
         code  = _extract_code(clean) or _extract_code(response)
-        return code or "def transform(input_grid):\n    return input_grid.copy()"
+        if code:
+            return code, True
+        fallback = _ROLE_FALLBACK.get(particle.role_name, _IDENTITY_FALLBACK)
+        return fallback, False
 
     # ------------------------------------------------------------------
     # Core PSO loop
@@ -293,8 +334,14 @@ class PSOOrchestrator:
         ]
 
         for p in swarm:
-            p.code    = self._init_particle_code(p, task_description, training_examples)
-            p.pos     = self._embed(p.code)
+            p.code, generated = self._init_particle_code(p, task_description, training_examples)
+            if generated:
+                p.pos = self._embed(p.code)
+            else:
+                # LLM call failed (likely timeout): use a random unit vector to
+                # preserve swarm diversity and avoid a cascaded embedding timeout.
+                p.pos = _random_unit_vec()
+                time.sleep(3)   # brief backoff so Ollama can recover
             p.velocity = np.zeros_like(p.pos)
             p.fitness, _ = self._eval_fitness(p.code, task)
             p.update_pbest(p.code, p.pos, p.fitness)

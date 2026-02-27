@@ -45,18 +45,20 @@ class LLMClient:
 
     def __init__(
         self,
-        backend:     str        = "ollama",
-        model:       str | None = None,
-        temperature: float      = 0.6,
-        max_tokens:  int        = 8192,
-        timeout:     float      = 120.0,
-        debug:       bool       = False,
+        backend:       str        = "ollama",
+        model:         str | None = None,
+        temperature:   float      = 0.6,
+        max_tokens:    int        = 8192,
+        timeout:       float      = 120.0,
+        embed_timeout: float      = 30.0,
+        debug:         bool       = False,
     ) -> None:
-        self.backend     = backend
-        self.temperature = temperature
-        self.max_tokens  = max_tokens
-        self.timeout     = timeout
-        self.debug       = debug
+        self.backend       = backend
+        self.temperature   = temperature
+        self.max_tokens    = max_tokens
+        self.timeout       = timeout
+        self.embed_timeout = embed_timeout
+        self.debug         = debug
 
         if backend == "anthropic":
             try:
@@ -214,7 +216,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(request, timeout=self.embed_timeout) as resp:
                 body = json.loads(resp.read())
         except urllib.error.URLError as exc:
             raise ConnectionError(

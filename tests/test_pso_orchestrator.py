@@ -145,18 +145,21 @@ class TestEmbed:
         result = orch._embed("some code")
         assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
 
-    def test_returns_zero_on_connection_error(self):
+    def test_returns_random_unit_vec_on_connection_error(self):
         orch = make_orchestrator()
         orch._llm.embed_code = MagicMock(side_effect=ConnectionError("no Ollama"))
         result = orch._embed("some code")
         assert result.shape == (768,)
-        np.testing.assert_array_equal(result, np.zeros(768, dtype=np.float32))
+        # Should be a non-zero random unit vector (not zeros)
+        assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
 
-    def test_zero_vector_not_normalised(self):
+    def test_zero_vector_falls_back_to_random_unit_vec(self):
         orch = make_orchestrator()
         orch._llm.embed_code = MagicMock(return_value=np.zeros(768, dtype=np.float32))
         result = orch._embed("empty")
-        np.testing.assert_array_equal(result, np.zeros(768, dtype=np.float32))
+        # Zero-norm input triggers random unit vector fallback
+        assert result.shape == (768,)
+        assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +391,7 @@ class TestSolveEmbeddingFailure:
         # Raise connection error on all embed calls
         orch._llm.embed_code = MagicMock(side_effect=ConnectionError("offline"))
 
-        # Should not raise; falls back to zero vectors
+        # Should not raise; falls back to random unit vectors
         result = orch.solve(SIMPLE_TASK)
         assert "success" in result
 
