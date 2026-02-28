@@ -140,17 +140,46 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
             )
 
     # Anti-diagonal groups in input (r+c = const): detect if non-zero cells share diagonals
+    # Only report when there are multiple distinct colors (otherwise trivially true).
     nz = np.argwhere(inp != 0)
     if 2 <= len(nz) <= 50:
         diag_vals: dict[int, set] = {}
         for r, c in nz:
             k = int(r + c)
             diag_vals.setdefault(k, set()).add(int(inp[r, c]))
-        # Each diagonal group should have exactly 1 unique color (clean anti-diag pattern)
-        if diag_vals and all(len(v) == 1 for v in diag_vals.values()):
+        # Each diagonal group must have exactly 1 unique color AND at least 2 different
+        # colors exist across diagonals (otherwise it's trivially "all cells are color X").
+        all_colors_on_diags = {list(v)[0] for v in diag_vals.values()}
+        if (diag_vals
+                and all(len(v) == 1 for v in diag_vals.values())
+                and len(all_colors_on_diags) >= 2):
             sorted_diags = sorted(diag_vals.items())
             desc = ", ".join(f"k={k}→{list(v)[0]}" for k, v in sorted_diags)
             notes.append(f"  [Structural] Input: anti-diagonals (r+c=k) have consistent colors: {desc}")
+
+    # Row-period detection: input rows cycle with period P; output extends that cycle.
+    # Only when output has more rows than input (extension pattern).
+    ir, ic = inp.shape
+    or_, oc = out.shape
+    if or_ > ir and ic == oc:
+        # Find minimal row period P in input
+        for P in range(1, ir + 1):
+            if all((inp[r] == inp[r % P]).all() for r in range(ir)):
+                # Confirm output continues the same cycle (with possible color remapping)
+                # Map colors: e.g. 1→2 is common; check if out[r] == remap(inp[r % P])
+                # Simple check: out rows are consistent with cycling inp rows (any remap)
+                cycle_rows = [inp[r % P] for r in range(or_)]
+                # Check if each out row matches the corresponding cycle row up to color remap
+                def rows_same_pattern(r1, r2):
+                    if r1.shape != r2.shape: return False
+                    # same non-zero pattern (positions where r1>0 == positions where r2>0)
+                    return ((r1 > 0) == (r2 > 0)).all()
+                if all(rows_same_pattern(out[r], cycle_rows[r]) for r in range(or_)):
+                    notes.append(
+                        f"  [Structural] Input rows cycle with period {P}; output extends "
+                        f"the cycle from {ir} to {or_} rows (possibly with color replacement)."
+                    )
+                    break
 
     # Periodic output pattern: check if output[r][c] = output[r % T][c % T] for small T
     if out.shape[0] == out.shape[1] == inp.shape[0]:

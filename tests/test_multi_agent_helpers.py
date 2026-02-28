@@ -333,13 +333,33 @@ class TestStructuralNote:
         assert note is not None
         assert "Shape changes" in note or "scaled" in note.lower()
 
-    def test_anti_diagonal_detected(self):
-        # Non-zero cells: (0,0)=1, (0,1)=2, (1,0)=2 → k=0→1, k=1→2
-        inp = np.array([[1, 2], [2, 0]], dtype=np.int32)
-        out = np.array([[1, 2], [2, 0]], dtype=np.int32)
+    def test_anti_diagonal_detected_multiple_colors(self):
+        # Multiple distinct colors across diagonals → pattern reported
+        # k=0: (0,0)=1;  k=1: (0,1)=2, (1,0)=2;  k=2: (1,1)=3
+        inp = np.array([[1, 2], [2, 3]], dtype=np.int32)
+        out = np.array([[1, 2], [2, 3]], dtype=np.int32)
         note = _structural_note(inp, out)
         assert note is not None
         assert "anti-diagonal" in note
+
+    def test_anti_diagonal_single_color_not_reported(self):
+        # All non-zero cells share the same color → trivial, not reported
+        inp = np.array([[0, 1], [1, 0]], dtype=np.int32)
+        out = np.array([[0, 1], [1, 0]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        # Should NOT contain anti-diagonal note (only one color in input)
+        assert note is None or "anti-diagonal" not in (note or "")
+
+    def test_row_cycle_extension_detected(self):
+        # Rows cycle with period 2; output is extended version (1→2 color swap)
+        inp = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0], [1, 0, 1],
+                        [0, 1, 0], [1, 0, 1]], dtype=np.int32)
+        out = np.array([[0, 2, 0], [2, 0, 2], [0, 2, 0], [2, 0, 2],
+                        [0, 2, 0], [2, 0, 2], [0, 2, 0], [2, 0, 2],
+                        [0, 2, 0]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "cycle" in note.lower()
 
     def test_none_for_identical_simple_grids(self):
         g = np.array([[1, 0], [0, 1]], dtype=np.int32)
