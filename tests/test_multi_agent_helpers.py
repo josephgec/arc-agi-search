@@ -367,3 +367,52 @@ class TestStructuralNote:
         note = _structural_note(g, g)
         # May be None or have no alarming content
         assert note is None or isinstance(note, str)
+
+    def test_vertical_divider_detected(self):
+        # Column 2 is all 5s → vertical divider
+        inp = np.array([[1, 0, 5, 0, 1],
+                        [0, 1, 5, 1, 0],
+                        [1, 0, 5, 0, 1]], dtype=np.int32)
+        out = np.array([[0, 0, 0],
+                        [0, 1, 0],
+                        [0, 0, 0]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "DIVIDER" in note.upper()
+        assert "column 2" in note
+
+    def test_horizontal_divider_detected(self):
+        # Row 1 is all 9s → horizontal divider
+        inp = np.array([[1, 0, 1],
+                        [9, 9, 9],
+                        [0, 1, 0]], dtype=np.int32)
+        out = np.array([[0, 0],
+                        [0, 0],
+                        [0, 0]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "DIVIDER" in note.upper()
+        assert "row 1" in note
+
+    def test_object_count_reported(self):
+        # Two separate single-cell objects of color 3
+        inp = np.array([[3, 0, 3],
+                        [0, 0, 0],
+                        [0, 0, 0]], dtype=np.int32)
+        out = np.array([[0, 0, 0],
+                        [0, 3, 0],
+                        [0, 0, 0]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        # Should mention 2 objects for the input
+        assert note is not None
+        assert "2" in note
+
+    def test_anti_diagonal_cycle_detected(self):
+        # 3-cycle: k=0→1, k=1→2, k=2→3
+        inp = np.array([[1, 2, 3],
+                        [2, 3, 0],
+                        [3, 0, 0]], dtype=np.int32)
+        out = np.zeros((3, 3), dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "CYCLE" in note.upper() or "cycle" in note.lower()
