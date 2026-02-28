@@ -118,6 +118,10 @@ def calculate_continuous_fitness(pred_grid: Grid | None, target_grid: Grid) -> f
     if pred_grid is None:
         return 0.0
 
+    # Guard against 1-D outputs (malformed transform return)
+    if pred_grid.ndim != 2:
+        return 0.0
+
     # -- Dimension score (20%) ------------------------------------------
     pr, pc = pred_grid.shape
     tr, tc = target_grid.shape
