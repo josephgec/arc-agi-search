@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 import numpy as np
@@ -81,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     # Evaluation
     p.add_argument("--max-tasks", type=int, default=None,
                    help="(--task-dir only) Maximum number of tasks to evaluate.")
+    p.add_argument("--task-timeout", type=float, default=None,
+                   help="(--task-dir only) Max seconds per task before skipping it.")
 
     # Output
     p.add_argument("--output", type=Path, default=None,
@@ -134,8 +137,13 @@ def solve_single(orchestrator: PSOOrchestrator, task_path: Path, debug: bool) ->
     return summary
 
 
-def run_directory(orchestrator: PSOOrchestrator, task_dir: Path, max_tasks: int | None,
-                  debug: bool) -> list[dict]:
+def run_directory(
+    orchestrator: PSOOrchestrator,
+    task_dir: Path,
+    max_tasks: int | None,
+    debug: bool,
+    task_timeout: float | None = None,
+) -> list[dict]:
     paths = sorted(task_dir.glob("*.json"))
     if max_tasks is not None:
         paths = paths[:max_tasks]
@@ -143,7 +151,29 @@ def run_directory(orchestrator: PSOOrchestrator, task_dir: Path, max_tasks: int 
     results = []
     for i, path in enumerate(paths, 1):
         print(f"[{i}/{len(paths)}] {path.name} … ", end="", flush=True)
-        summary = solve_single(orchestrator, path, debug)
+        if task_timeout is not None:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(solve_single, orchestrator, path, debug)
+                try:
+                    summary = future.result(timeout=task_timeout)
+                except FuturesTimeoutError:
+                    summary = {
+                        "task":          str(path),
+                        "success":       False,
+                        "gbest_fitness": 0.0,
+                        "test_correct":  None,
+                        "elapsed_s":     task_timeout,
+                        "prediction":    None,
+                        "code":          "",
+                        "iterations":    0,
+                        "timed_out":     True,
+                    }
+                    print(f"TIMEOUT (>{task_timeout:.0f}s)", flush=True)
+                    results.append(summary)
+                    continue
+        else:
+            summary = solve_single(orchestrator, path, debug)
+
         status  = "SOLVED" if summary["success"] else f"fitness={summary['gbest_fitness']:.4f}"
         print(status, flush=True)
         results.append(summary)
@@ -158,6 +188,7 @@ def main() -> None:
     args         = parse_args()
     orchestrator = build_orchestrator(args)
 
+    task_to_str = f"{args.task_timeout:.0f}s" if args.task_timeout else "none"
     print(
         f"PSO Swarm Solver\n"
         f"  Backend : {args.backend} / {orchestrator.model}\n"
@@ -165,6 +196,7 @@ def main() -> None:
         f"  Swarm   : {args.n_particles} particles × {args.max_iterations} iterations "
         f"× {args.k_candidates} candidates\n"
         f"  PSO     : w={args.w}, c1={args.c1}, c2={args.c2}\n"
+        f"  Timeout : {args.timeout:.0f}s/LLM, task-limit={task_to_str}\n"
     )
 
     if args.task:
@@ -172,7 +204,8 @@ def main() -> None:
         print(json.dumps(summary, indent=2, default=str))
         all_results = [summary]
     else:
-        all_results = run_directory(orchestrator, args.task_dir, args.max_tasks, args.debug)
+        all_results = run_directory(orchestrator, args.task_dir, args.max_tasks, args.debug,
+                                    task_timeout=args.task_timeout)
         if not args.debug:
             # Print compact per-task table
             print("\nPer-task results:")
