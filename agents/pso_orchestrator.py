@@ -59,6 +59,8 @@ from agents.multi_agent import (
     _strip_thinking,
     _extract_code,
     _parse_hypotheses,
+    _structural_note,
+    _grid_to_str,
 )
 
 # ---------------------------------------------------------------------------
@@ -713,11 +715,35 @@ Rules:
                         continue
                     if (pred == exp).all():
                         continue
-                    from agents.multi_agent import _grid_to_str
                     fc_lines.append(f"Pair {i+1} — predicted:\n  {_grid_to_str(pred)}")
                     fc_lines.append(f"Pair {i+1} — expected:\n  {_grid_to_str(exp)}")
                 if fc_lines:
                     full_comparison = "\n\nFull output comparison for failing pairs:\n" + "\n".join(fc_lines)
+
+            # Pass/fail contrast: when some pairs pass and others fail, highlight what differs
+            contrast_hint = ""
+            pairs_res = eval_res.get("pairs", [])
+            passing = [i for i, p in enumerate(pairs_res) if p["correct"]]
+            failing = [i for i, p in enumerate(pairs_res) if not p["correct"]]
+            if passing and failing and len(passing) < n_train:
+                contrast_hint = (
+                    f"\n\nNOTE: Pair(s) {[p+1 for p in passing]} pass but "
+                    f"pair(s) {[f+1 for f in failing]} fail — compare those inputs "
+                    "carefully to find what edge case the code mishandles."
+                )
+
+            # Structural hints from training data
+            struct_notes = []
+            for pair in task["train"]:
+                sn = _structural_note(
+                    pair["input"] if isinstance(pair["input"], np.ndarray) else np.array(pair["input"]),
+                    pair["output"] if isinstance(pair["output"], np.ndarray) else np.array(pair["output"]),
+                )
+                if sn and sn not in struct_notes:
+                    struct_notes.append(sn)
+            struct_section = ""
+            if struct_notes:
+                struct_section = "\n\nPattern hints:\n" + "\n".join(struct_notes)
 
             content = (
                 f"{task_desc}\n\n"
@@ -726,6 +752,8 @@ Rules:
                 f"```python\n{best_code}\n```\n\n"
                 f"Error analysis:\n{diff}"
                 + full_comparison
+                + contrast_hint
+                + struct_section
                 + "\n\nStudy the error pattern across all pairs — what SYSTEMATIC mistake "
                 "causes these wrong cells?\n"
                 "Fix the root cause in the algorithm.  Do NOT add if-else branches per "

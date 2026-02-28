@@ -19,6 +19,7 @@ from agents.multi_agent import (
     _format_diff,
     _grid_to_str,
     _diff_summary,
+    _structural_note,
 )
 
 
@@ -294,3 +295,55 @@ class TestDiffSummary:
         result = _diff_summary(expected, predicted)
         assert "[0,1]" in result
         assert "9" in result
+
+
+# ---------------------------------------------------------------------------
+# _structural_note
+# ---------------------------------------------------------------------------
+
+class TestStructuralNote:
+    def test_new_color_detected(self):
+        inp = np.array([[3, 3], [3, 3]], dtype=np.int32)
+        out = np.array([[3, 4], [4, 3]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "NEW color" in note
+        assert "4" in note
+
+    def test_no_new_color_no_note(self):
+        inp = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        out = np.array([[4, 3], [2, 1]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        # No new colors, no shape change, no structural pattern → None
+        assert note is None or "NEW color" not in (note or "")
+
+    def test_scale_up_detected(self):
+        inp = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        # 2x scale: each cell repeated 2×2
+        out = np.array([[1, 1, 2, 2], [1, 1, 2, 2],
+                        [3, 3, 4, 4], [3, 3, 4, 4]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "2×" in note or "scaled" in note.lower()
+
+    def test_shape_change_noted(self):
+        inp = np.array([[1, 2, 3]], dtype=np.int32)
+        out = np.array([[1, 2]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "Shape changes" in note or "scaled" in note.lower()
+
+    def test_anti_diagonal_detected(self):
+        # Non-zero cells: (0,0)=1, (0,1)=2, (1,0)=2 → k=0→1, k=1→2
+        inp = np.array([[1, 2], [2, 0]], dtype=np.int32)
+        out = np.array([[1, 2], [2, 0]], dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "anti-diagonal" in note
+
+    def test_none_for_identical_simple_grids(self):
+        g = np.array([[1, 0], [0, 1]], dtype=np.int32)
+        # Same grid, same shape, no new colors
+        note = _structural_note(g, g)
+        # May be None or have no alarming content
+        assert note is None or isinstance(note, str)

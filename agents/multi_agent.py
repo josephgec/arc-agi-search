@@ -102,6 +102,43 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
     """Detect and describe structural patterns in the pair (diagonal, periodic, etc.)."""
     notes = []
 
+    in_colors  = set(int(v) for v in np.unique(inp))
+    out_colors = set(int(v) for v in np.unique(out))
+
+    # New colors appearing only in output (flood-fill / object-completion hint)
+    new_colors = out_colors - in_colors
+    if new_colors:
+        c_list = sorted(new_colors)
+        notes.append(
+            f"  [Structural] Output introduces NEW color(s) {c_list} not present in input — "
+            "likely flood_fill, enclosed-region fill, or object completion."
+        )
+
+    # Colors removed in output (masking / filtering hint)
+    removed_colors = in_colors - out_colors
+    if removed_colors and 0 not in removed_colors:  # ignore background=0 disappearing
+        c_list = sorted(removed_colors)
+        notes.append(
+            f"  [Structural] Color(s) {c_list} present in input but absent from output — "
+            "possibly masked, filtered, or merged."
+        )
+
+    # Shape change analysis
+    ir, ic = inp.shape
+    or_, oc = out.shape
+    if ir != or_ or ic != oc:
+        # Check for integer scale factor
+        if or_ % ir == 0 and oc % ic == 0 and or_ // ir == oc // ic:
+            sf = or_ // ir
+            notes.append(f"  [Structural] Output is {sf}× scaled version of input.")
+        elif ir % or_ == 0 and ic % oc == 0 and ir // or_ == ic // oc:
+            sf = ir // or_
+            notes.append(f"  [Structural] Output is 1/{sf} scaled (cropped/compressed) version of input.")
+        else:
+            notes.append(
+                f"  [Structural] Shape changes: ({ir}×{ic}) → ({or_}×{oc})."
+            )
+
     # Anti-diagonal groups in input (r+c = const): detect if non-zero cells share diagonals
     nz = np.argwhere(inp != 0)
     if 2 <= len(nz) <= 50:
