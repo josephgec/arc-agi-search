@@ -84,6 +84,37 @@ def _diff_annotation(inp: np.ndarray, out: np.ndarray) -> str | None:
     return f"  ({n} cells changed: {', '.join(parts)}{suffix})"
 
 
+def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
+    """Detect and describe structural patterns in the pair (diagonal, periodic, etc.)."""
+    notes = []
+
+    # Anti-diagonal groups in input (r+c = const): detect if non-zero cells share diagonals
+    nz = np.argwhere(inp != 0)
+    if 2 <= len(nz) <= 50:
+        diag_vals: dict[int, set] = {}
+        for r, c in nz:
+            k = int(r + c)
+            diag_vals.setdefault(k, set()).add(int(inp[r, c]))
+        # Each diagonal group should have exactly 1 unique color (clean anti-diag pattern)
+        if diag_vals and all(len(v) == 1 for v in diag_vals.values()):
+            sorted_diags = sorted(diag_vals.items())
+            desc = ", ".join(f"k={k}→{list(v)[0]}" for k, v in sorted_diags)
+            notes.append(f"  [Structural] Input: anti-diagonals (r+c=k) have consistent colors: {desc}")
+
+    # Periodic output pattern: check if output[r][c] = output[r % T][c % T] for small T
+    if out.shape[0] == out.shape[1] == inp.shape[0]:
+        n = out.shape[0]
+        for T in range(1, min(n, 7)):
+            if n % T == 0:
+                tile = out[:T, :T]
+                tiled = np.tile(tile, (n // T, n // T))
+                if (tiled == out).all():
+                    notes.append(f"  [Structural] Output has a repeating {T}×{T} tile pattern")
+                    break
+
+    return "\n".join(notes) if notes else None
+
+
 def _format_training_examples(task: dict) -> str:
     lines = ["Training examples (use these to verify your implementation):"]
     for i, pair in enumerate(task["train"]):
@@ -96,6 +127,9 @@ def _format_training_examples(task: dict) -> str:
         ann = _diff_annotation(inp, out)
         if ann:
             lines.append(ann)
+        sn = _structural_note(inp, out)
+        if sn:
+            lines.append(sn)
     return "\n".join(lines)
 
 
