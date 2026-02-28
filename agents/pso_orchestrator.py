@@ -430,10 +430,15 @@ class PSOOrchestrator:
         stagnation_limit   = max(2, self.max_iterations // 3)
 
         for iteration in range(self.max_iterations):
+            # Adaptive inertia: linearly anneal w from self.w → self.w*0.4
+            # Early iterations explore; later ones exploit local optima.
+            progress = iteration / max(1, self.max_iterations - 1)
+            w_eff = self.w * (1.0 - 0.6 * progress)  # e.g. 0.50 → 0.20
+
             if self.debug:
                 print(
                     f"\n[PSO] Iteration {iteration + 1}/{self.max_iterations}  "
-                    f"gbest={gbest_fitness:.4f}"
+                    f"gbest={gbest_fitness:.4f}  w={w_eff:.3f}"
                 )
 
             iter_log: dict[str, Any] = {
@@ -459,7 +464,7 @@ class PSOOrchestrator:
                     gbest_pos_d = gbest_pos
 
                 p.velocity = (
-                    self.w  * p.velocity
+                    w_eff * p.velocity
                     + self.c1 * r1 * (p.pbest_pos - p.pos)
                     + self.c2 * r2 * (gbest_pos_d - p.pos)
                 )
@@ -667,8 +672,9 @@ Rules:
         if self.debug:
             print(f"\n[PSO] Refinement phase  (gbest={fitness:.4f})")
 
-        best_code    = code
-        best_fitness = fitness
+        best_code       = code
+        best_fitness    = fitness
+        no_improve_streak = 0
 
         for attempt in range(max_attempts):
             _, eval_res = self._eval_fitness(best_code, task)
@@ -733,8 +739,16 @@ Rules:
                 return fixed_code, 1.0
 
             if fixed_fitness > best_fitness:
-                best_code    = fixed_code
-                best_fitness = fixed_fitness
+                best_code         = fixed_code
+                best_fitness      = fixed_fitness
+                no_improve_streak = 0
+            else:
+                no_improve_streak += 1
+                # Early stop: 3 consecutive non-improving attempts
+                if no_improve_streak >= 3:
+                    if self.debug:
+                        print(f"  [Refine] Early stop after {no_improve_streak} non-improving attempts")
+                    break
 
         return best_code, best_fitness
 
