@@ -610,8 +610,26 @@ class PSOOrchestrator:
                         f"  [PSO] Stagnation ({stagnation_count} iters) — "
                         f"reinitialising particle {worst.particle_id} ({worst.role_name})"
                     )
+                # Use a divergence hypothesis: ask the Hypothesizer for fresh ideas
+                # explicitly different from the current best solution.
+                diverge_hyp: str | None = None
+                try:
+                    diverge_raw = self._hypothesizer.generate(
+                        task_description + "\n\n" + training_examples,
+                        feedback=(
+                            f"The current best approach (fitness={gbest_fitness:.3f}) "
+                            f"still fails.  Generate 3 COMPLETELY DIFFERENT hypotheses "
+                            f"that try different strategies — avoid the same approach."
+                        ),
+                    )
+                    diverge_hyps = _parse_hypotheses(diverge_raw, max_n=3)
+                    if diverge_hyps:
+                        # Pick one that's different from what was used at init
+                        diverge_hyp = diverge_hyps[worst.particle_id % len(diverge_hyps)]
+                except Exception:
+                    pass
                 worst.code, generated = self._init_particle_code(
-                    worst, task_description, training_examples
+                    worst, task_description, training_examples, hypothesis=diverge_hyp
                 )
                 if generated:
                     worst.pos = self._embed(worst.code)
