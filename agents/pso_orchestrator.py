@@ -138,7 +138,8 @@ Implement the rule as a Python function `transform(input_grid: np.ndarray) -> np
 Available DSL (already imported — do NOT re-import):
   crop, rotate, flip, translate, scale, tile,
   recolor, mask, overlay, flood_fill,
-  find_objects, bounding_box, crop_to_content, np
+  find_objects, bounding_box, crop_to_content,
+  pad, symmetrize, np
 
 Rules:
 - After your analysis, return EXACTLY one ```python … ``` code block.
@@ -438,7 +439,7 @@ class PSOOrchestrator:
                 # ------------------------------------------------------------
                 # Step 2 — LLM generates K candidate mutations
                 # ------------------------------------------------------------
-                diff_str = _format_eval_diff(p.last_eval)
+                diff_str = _format_eval_diff(p.last_eval, max_pairs=len(task["train"]))
 
                 try:
                     candidates = self._pso_coder.generate_mutations(
@@ -607,7 +608,8 @@ is ALMOST correct but has a systematic bug.  You will be shown which cells
 are wrong — your job is to find and fix the ROOT CAUSE in the logic.
 
 Available DSL (already imported): crop, rotate, flip, translate, scale, tile,
-recolor, mask, overlay, flood_fill, find_objects, bounding_box, crop_to_content, np
+recolor, mask, overlay, flood_fill, find_objects, bounding_box, crop_to_content,
+pad, symmetrize, np
 
 Rules:
 - Return ONLY one ```python … ``` code block named `transform`.
@@ -625,7 +627,7 @@ Rules:
         task_desc:     str,
         training_ctx:  str,
         log:           list,
-        max_attempts:  int = 3,
+        max_attempts:  int = 5,
     ) -> tuple[str, float]:
         """Run targeted fix attempts when fitness is near-perfect."""
         if self.debug:
@@ -636,15 +638,34 @@ Rules:
 
         for attempt in range(max_attempts):
             _, eval_res = self._eval_fitness(best_code, task)
-            diff = _format_eval_diff(eval_res, max_pairs=3)
+            n_train = len(task["train"])
+            diff = _format_eval_diff(eval_res, max_pairs=n_train, max_mismatches=24)
+
+            # For near-perfect solutions show full predicted vs expected for each failing pair
+            full_comparison = ""
+            if best_fitness >= 0.97:
+                fc_lines = []
+                for i, pair_res in enumerate(eval_res.get("pairs", [])):
+                    pred = pair_res.get("predicted")
+                    exp  = pair_res.get("expected")
+                    if pred is None or exp is None or pair_res.get("error"):
+                        continue
+                    if (pred == exp).all():
+                        continue
+                    from agents.multi_agent import _grid_to_str
+                    fc_lines.append(f"Pair {i+1} — predicted:\n  {_grid_to_str(pred)}")
+                    fc_lines.append(f"Pair {i+1} — expected:\n  {_grid_to_str(exp)}")
+                if fc_lines:
+                    full_comparison = "\n\nFull output comparison for failing pairs:\n" + "\n".join(fc_lines)
 
             content = (
                 f"{task_desc}\n\n"
                 f"{training_ctx}\n\n"
                 f"Current best code (fitness={best_fitness:.4f}):\n"
                 f"```python\n{best_code}\n```\n\n"
-                f"Error analysis:\n{diff}\n\n"
-                "Study the error pattern across all pairs — what SYSTEMATIC mistake "
+                f"Error analysis:\n{diff}"
+                + full_comparison
+                + "\n\nStudy the error pattern across all pairs — what SYSTEMATIC mistake "
                 "causes these wrong cells?\n"
                 "Fix the root cause in the algorithm.  Do NOT add if-else branches per "
                 "input shape or hardcode specific cell coordinates.\n"

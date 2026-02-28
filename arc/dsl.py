@@ -215,3 +215,57 @@ def crop_to_content(grid: Grid) -> Grid:
         return grid.copy()
     r_min, c_min, r_max, c_max = bounding_box(grid)
     return crop(grid, r_min, c_min, r_max + 1, c_max + 1)
+
+
+def pad(grid: Grid, top: int = 0, bottom: int = 0, left: int = 0, right: int = 0, fill: int = 0) -> Grid:
+    """Add padding around the grid.
+
+    Args:
+        grid:   Input grid.
+        top:    Rows to prepend above.
+        bottom: Rows to append below.
+        left:   Columns to prepend on the left.
+        right:  Columns to append on the right.
+        fill:   Value for new cells (default 0 / background).
+    """
+    rows, cols = grid.shape
+    new_h = rows + top + bottom
+    new_w = cols + left + right
+    result = np.full((new_h, new_w), fill, dtype=np.int32)
+    result[top:top + rows, left:left + cols] = grid
+    return result
+
+
+def symmetrize(grid: Grid, axis: int = 1) -> Grid:
+    """Make the grid symmetric by reflecting it about a central axis.
+
+    axis=0: vertical symmetry (reflect left half → right half).
+        The right half is replaced by the mirror of the left half.
+    axis=1: horizontal symmetry (reflect top half → bottom half).
+        The bottom half is replaced by the mirror of the top half.
+    axis=2: both axes (left-right then top-bottom).
+
+    Only overwrites background (0) cells in the destination half to avoid
+    clobbering existing content.
+    """
+    result = grid.copy()
+
+    if axis in (0, 2):
+        # Left → right mirror
+        cols = result.shape[1]
+        for c in range(cols // 2):
+            mirror = cols - 1 - c
+            col_src  = result[:, c]
+            col_dest = result[:, mirror]
+            result[:, mirror] = np.where(col_dest == 0, col_src, col_dest)
+
+    if axis in (1, 2):
+        # Top → bottom mirror
+        rows = result.shape[0]
+        for r in range(rows // 2):
+            mirror = rows - 1 - r
+            row_src  = result[r, :]
+            row_dest = result[mirror, :]
+            result[mirror, :] = np.where(row_dest == 0, row_src, row_dest)
+
+    return result

@@ -29,6 +29,7 @@ from arc.dsl import (
     crop, rotate, flip, translate, scale, tile,
     recolor, mask, overlay, flood_fill,
     find_objects, bounding_box, crop_to_content,
+    pad, symmetrize,
 )
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,8 @@ DSL_NAMESPACE: dict[str, Any] = {
     "find_objects":    find_objects,
     "bounding_box":    bounding_box,
     "crop_to_content": crop_to_content,
+    "pad":             pad,
+    "symmetrize":      symmetrize,
 }
 
 

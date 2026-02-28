@@ -158,7 +158,7 @@ def _format_task_description(task: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_eval_diff(eval_result: dict, max_pairs: int = 2) -> str:
+def _format_eval_diff(eval_result: dict, max_pairs: int = 2, max_mismatches: int = 8) -> str:
     """Format a concise diff of sandbox evaluation failures for LLM feedback."""
     lines = []
     for i, pair in enumerate(eval_result.get("pairs", [])[:max_pairs]):
@@ -179,10 +179,13 @@ def _format_eval_diff(eval_result: dict, max_pairs: int = 2) -> str:
             wrong = int(np.sum(pred != exp))
             total = int(exp.size)
             lines.append(f"Pair {i + 1}: {wrong}/{total} cells wrong")
-            # Show first few mismatches
-            mismatches = np.argwhere(pred != exp)[:4]
+            mismatches = np.argwhere(pred != exp)[:max_mismatches]
             for r, c in mismatches:
-                lines.append(f"  [{r},{c}]: got {pred[r,c]}, expected {exp[r,c]}")
+                got_name = _COLOR_NAMES.get(int(pred[r, c]), str(pred[r, c]))
+                exp_name = _COLOR_NAMES.get(int(exp[r, c]),  str(exp[r, c]))
+                lines.append(f"  [{r},{c}]: got {pred[r,c]}({got_name}), expected {exp[r,c]}({exp_name})")
+            if wrong > max_mismatches:
+                lines.append(f"  … and {wrong - max_mismatches} more wrong cells")
     return "\n".join(lines) if lines else "No diff available"
 
 

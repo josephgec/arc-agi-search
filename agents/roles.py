@@ -53,7 +53,8 @@ takes `input_grid: np.ndarray` and returns `np.ndarray`.
 Available DSL primitives (already imported — do NOT re-import):
   crop, rotate, flip, translate, scale, tile,
   recolor, mask, overlay, flood_fill,
-  find_objects, bounding_box, crop_to_content, np
+  find_objects, bounding_box, crop_to_content,
+  pad, symmetrize, np
 
 Rules:
 - Return ONLY a single ```python … ``` code block.
@@ -95,7 +96,8 @@ solutions get right, what they get wrong, and how to fix the root cause.
 Available DSL primitives (already imported):
   crop, rotate, flip, translate, scale, tile,
   recolor, mask, overlay, flood_fill,
-  find_objects, bounding_box, crop_to_content, np
+  find_objects, bounding_box, crop_to_content,
+  pad, symmetrize, np
 
 Rules:
 - Generate exactly {k} code blocks, each in its own ```python … ``` fence.

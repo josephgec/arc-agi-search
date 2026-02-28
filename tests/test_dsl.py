@@ -8,6 +8,7 @@ from arc.dsl import (
     crop, rotate, flip, translate, scale, tile,
     recolor, mask, overlay, flood_fill,
     find_objects, bounding_box, crop_to_content,
+    pad, symmetrize,
 )
 
 
@@ -305,3 +306,50 @@ class TestCropToContent:
         grid = g([0, 0, 0, 0], [0, 1, 2, 0], [0, 0, 0, 0])
         result = crop_to_content(grid)
         np.testing.assert_array_equal(result, g([1, 2]))
+
+
+class TestPad:
+    def test_top_padding(self):
+        grid = g([1, 2], [3, 4])
+        result = pad(grid, top=1)
+        np.testing.assert_array_equal(result, g([0, 0], [1, 2], [3, 4]))
+
+    def test_all_sides(self):
+        grid = g([1])
+        result = pad(grid, top=1, bottom=1, left=1, right=1)
+        np.testing.assert_array_equal(result, g([0, 0, 0], [0, 1, 0], [0, 0, 0]))
+
+    def test_custom_fill(self):
+        grid = g([1, 2])
+        result = pad(grid, right=1, fill=9)
+        np.testing.assert_array_equal(result, g([1, 2, 9]))
+
+    def test_no_padding_unchanged(self):
+        grid = g([1, 2], [3, 4])
+        np.testing.assert_array_equal(pad(grid), grid)
+
+
+class TestSymmetrize:
+    def test_left_right(self):
+        grid = g([1, 2, 0, 0], [3, 4, 0, 0])
+        result = symmetrize(grid, axis=0)
+        np.testing.assert_array_equal(result, g([1, 2, 2, 1], [3, 4, 4, 3]))
+
+    def test_top_bottom(self):
+        grid = g([1, 2], [3, 4], [0, 0], [0, 0])
+        result = symmetrize(grid, axis=1)
+        np.testing.assert_array_equal(result, g([1, 2], [3, 4], [3, 4], [1, 2]))
+
+    def test_preserves_existing_nonzero(self):
+        # Existing non-zero in dest half should not be overwritten
+        grid = g([1, 0, 5], [3, 0, 0])
+        result = symmetrize(grid, axis=0)
+        # mirror col 0→col 2: dest col[2] already has 5, keeps 5
+        assert result[0, 2] == 5
+
+    def test_both_axes(self):
+        grid = g([1, 2, 0, 0], [3, 4, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0])
+        result = symmetrize(grid, axis=2)
+        assert result.shape == (4, 4)
+        # top-left should be preserved
+        assert result[0, 0] == 1
