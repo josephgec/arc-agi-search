@@ -157,6 +157,31 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
             desc = ", ".join(f"k={k}→{list(v)[0]}" for k, v in sorted_diags)
             notes.append(f"  [Structural] Input: anti-diagonals (r+c=k) have consistent colors: {desc}")
 
+            # Check if these diagonal colors follow a cycling pattern of period N
+            ks     = [k for k, _ in sorted_diags]
+            colors = [list(v)[0] for _, v in sorted_diags]
+            n_diags = len(ks)
+            for period in range(2, min(n_diags + 1, 7)):
+                # Build the cycle: color at position k = cycle[(k - k_min) % period]
+                k_min = ks[0]
+                cycle = [None] * period
+                consistent = True
+                for k, col in zip(ks, colors):
+                    idx = (k - k_min) % period
+                    if cycle[idx] is None:
+                        cycle[idx] = col
+                    elif cycle[idx] != col:
+                        consistent = False
+                        break
+                if consistent and all(c is not None for c in cycle):
+                    notes.append(
+                        f"  [Structural] Anti-diagonal colors CYCLE with period {period}: "
+                        f"color at (r+c)%{period} maps as "
+                        + ", ".join(f"{i}→{c}" for i, c in enumerate(cycle))
+                        + f".  Hint: output[r][c] = cycle[(r+c - {k_min}) % {period}]."
+                    )
+                    break
+
     # Row-period detection: input rows cycle with period P; output extends that cycle.
     # Only when output has more rows than input (extension pattern).
     ir, ic = inp.shape
