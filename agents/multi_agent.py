@@ -98,6 +98,35 @@ def _diff_annotation(inp: np.ndarray, out: np.ndarray) -> str | None:
     return f"  ({n} cells changed: {', '.join(parts)}{suffix})"
 
 
+def _count_objects(grid: np.ndarray) -> dict[int, int]:
+    """Return {color: n_connected_components} for each foreground color."""
+    from collections import deque
+    result: dict[int, int] = {}
+    for color in np.unique(grid):
+        if color == 0:
+            continue
+        visited = np.zeros(grid.shape, dtype=bool)
+        n_comp = 0
+        positions = list(zip(*np.where(grid == color)))
+        pos_set = set(positions)
+        for start in positions:
+            if visited[start]:
+                continue
+            n_comp += 1
+            queue = deque([start])
+            while queue:
+                r, c = queue.popleft()
+                if visited[r, c]:
+                    continue
+                visited[r, c] = True
+                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    nr, nc = r+dr, c+dc
+                    if (nr, nc) in pos_set and not visited[nr, nc]:
+                        queue.append((nr, nc))
+        result[int(color)] = n_comp
+    return result
+
+
 def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
     """Detect and describe structural patterns in the pair (diagonal, periodic, etc.)."""
     notes = []
@@ -123,6 +152,24 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
             "possibly masked, filtered, or merged."
         )
 
+    # Object count per color (for multi-object tasks)
+    total_cells = inp.size
+    if total_cells <= 400:   # only for smaller grids where counting is meaningful
+        in_obj  = _count_objects(inp)
+        out_obj = _count_objects(out)
+        total_in_obj = sum(in_obj.values())
+        if total_in_obj > 1:
+            obj_desc = ", ".join(f"color {c}: {n}" for c, n in sorted(in_obj.items()))
+            notes.append(
+                f"  [Structural] Input has {total_in_obj} distinct connected objects ({obj_desc})."
+            )
+        # Note if object count changes
+        total_out_obj = sum(out_obj.values())
+        if total_in_obj > 0 and total_out_obj != total_in_obj:
+            notes.append(
+                f"  [Structural] Object count changes: {total_in_obj} → {total_out_obj} objects."
+            )
+
     # Shape change analysis
     ir, ic = inp.shape
     or_, oc = out.shape
@@ -138,6 +185,36 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
             notes.append(
                 f"  [Structural] Shape changes: ({ir}×{ic}) → ({or_}×{oc})."
             )
+
+    # Divider detection: a full column or row of a single unique color
+    ir, ic = inp.shape
+    for col in range(ic):
+        col_vals = set(inp[:, col].tolist())
+        if len(col_vals) == 1 and list(col_vals)[0] != 0:
+            div_color = list(col_vals)[0]
+            left  = inp[:, :col]
+            right = inp[:, col + 1:]
+            if left.size > 0 and right.size > 0:
+                notes.append(
+                    f"  [Structural] Input has a vertical DIVIDER at column {col} (all cells = {div_color}). "
+                    f"Left side is {ir}×{col}, right side is {ir}×{ic - col - 1}. "
+                    "Output may depend on comparing or combining the two halves."
+                )
+            break  # only report first divider
+
+    for row in range(ir):
+        row_vals = set(inp[row, :].tolist())
+        if len(row_vals) == 1 and list(row_vals)[0] != 0:
+            div_color = list(row_vals)[0]
+            top    = inp[:row, :]
+            bottom = inp[row + 1:, :]
+            if top.size > 0 and bottom.size > 0:
+                notes.append(
+                    f"  [Structural] Input has a horizontal DIVIDER at row {row} (all cells = {div_color}). "
+                    f"Top part is {row}×{ic}, bottom part is {ir - row - 1}×{ic}. "
+                    "Output may depend on comparing or combining the two halves."
+                )
+            break
 
     # Anti-diagonal groups in input (r+c = const): detect if non-zero cells share diagonals
     # Only report when there are multiple distinct colors (otherwise trivially true).
