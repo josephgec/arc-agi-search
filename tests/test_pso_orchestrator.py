@@ -303,6 +303,16 @@ class TestSolveImmediateSuccess:
 # Full solve() — converges during iteration loop
 # ---------------------------------------------------------------------------
 
+_HYP_RESPONSE = (
+    "1. The transformation copies each input cell to the output unchanged, "
+    "preserving all colours and the grid layout exactly as given in training.\n\n"
+    "2. The transformation rotates the grid 90 degrees counter-clockwise, "
+    "producing an output whose rows are the columns of the input in reverse order.\n\n"
+    "3. The transformation fills all background cells with the dominant foreground colour, "
+    "leaving non-background cells as they are and creating a fully filled output grid."
+)
+
+
 class TestSolveConvergesDuringIteration:
     """First particles are wrong; second iteration produces perfect code."""
 
@@ -313,8 +323,11 @@ class TestSolveConvergesDuringIteration:
 
         def generate_side_effect(system, messages, **kwargs):
             call_count["n"] += 1
-            # First 2 calls (init for 2 particles): wrong code
-            if call_count["n"] <= 2:
+            # Call 1: hypothesis generation (returns numbered hypotheses)
+            if call_count["n"] == 1:
+                return _HYP_RESPONSE
+            # Calls 2-3 (init for 2 particles): wrong code
+            if call_count["n"] <= 3:
                 return "```python\ndef transform(g):\n    return g * 0\n```"
             # Subsequent mutation calls: correct code
             return (
@@ -337,7 +350,10 @@ class TestSolveConvergesDuringIteration:
 
         def gen(system, messages, **kwargs):
             call_count["n"] += 1
-            if call_count["n"] <= 2:
+            # Call 1: hypothesis generation
+            if call_count["n"] == 1:
+                return _HYP_RESPONSE
+            if call_count["n"] <= 3:
                 return "```python\ndef transform(g):\n    return g * 0\n```"
             return (
                 "```python\ndef transform_1(input_grid):\n    return input_grid.copy()\n```\n"

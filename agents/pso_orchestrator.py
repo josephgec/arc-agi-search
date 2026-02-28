@@ -51,13 +51,14 @@ from arc import sandbox
 from arc.evaluate import calculate_continuous_fitness
 from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
-from agents.roles import PSOCoder
+from agents.roles import PSOCoder, Hypothesizer
 from agents.multi_agent import (
     _format_task_description,
     _format_training_examples,
     _format_eval_diff,
     _strip_thinking,
     _extract_code,
+    _parse_hypotheses,
 )
 
 # ---------------------------------------------------------------------------
@@ -236,7 +237,8 @@ class PSOOrchestrator:
             embed_timeout=embed_timeout,
             debug=debug,
         )
-        self._pso_coder = PSOCoder(self._llm, k=k_candidates)
+        self._pso_coder    = PSOCoder(self._llm, k=k_candidates)
+        self._hypothesizer = Hypothesizer(self._llm)
 
         # Expose for CLI / logging
         self.backend  = backend
@@ -287,9 +289,18 @@ class PSOOrchestrator:
         return fitness, result
 
     def _init_particle_code(
-        self, particle: Particle, task_description: str, training_examples: str
+        self,
+        particle:          Particle,
+        task_description:  str,
+        training_examples: str,
+        hypothesis:        str | None = None,
     ) -> tuple[str, bool]:
         """Ask the LLM to write an initial solution for this particle's role.
+
+        Args:
+            hypothesis: Optional natural-language rule hypothesis from Hypothesizer.
+                        When provided, STEP 1 is replaced by the given hypothesis so
+                        the LLM can focus entirely on implementing it.
 
         Returns:
             (code, generated) — generated=False when the LLM call failed so
@@ -299,7 +310,14 @@ class PSOOrchestrator:
             _INIT_CODER_SYSTEM
             + f"\n\nYour cognitive specialisation: {particle.role_name} — {particle.role_desc}"
         )
-        content = f"{task_description}\n\n{training_examples}\n\nWrite the `transform` function."
+        if hypothesis:
+            content = (
+                f"{task_description}\n\n{training_examples}\n\n"
+                f"Hypothesis (your STEP 1 reasoning is already done):\n{hypothesis}\n\n"
+                "Now implement STEP 2 — write the `transform` function that realises this hypothesis."
+            )
+        else:
+            content = f"{task_description}\n\n{training_examples}\n\nWrite the `transform` function."
         messages = [{"role": "user", "content": content}]
 
         try:
@@ -353,8 +371,24 @@ class PSOOrchestrator:
             for i in range(self.n_particles)
         ]
 
+        # Pre-generate diverse hypotheses to seed particles with different starting rules.
+        # This replaces STEP 1 (reasoning) in the init prompt so each particle implements
+        # a different hypothesis, maximising initial diversity.
+        hypotheses: list[str] = []
+        try:
+            hyp_raw  = self._hypothesizer.generate(task_description + "\n\n" + training_examples)
+            hypotheses = _parse_hypotheses(hyp_raw, max_n=max(3, self.n_particles))
+            if self.debug:
+                print(f"  [PSO] Generated {len(hypotheses)} seed hypotheses")
+        except Exception as exc:
+            if self.debug:
+                print(f"  [PSO] Hypothesis generation failed: {exc}")
+
         for p in swarm:
-            p.code, generated = self._init_particle_code(p, task_description, training_examples)
+            seed_hyp = hypotheses[p.particle_id % len(hypotheses)] if hypotheses else None
+            p.code, generated = self._init_particle_code(
+                p, task_description, training_examples, hypothesis=seed_hyp
+            )
             if generated:
                 p.pos = self._embed(p.code)
             else:
