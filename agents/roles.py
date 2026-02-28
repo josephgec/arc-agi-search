@@ -114,30 +114,43 @@ Rules:
 # ---------------------------------------------------------------------------
 
 class Hypothesizer:
-    """Generates 3 competing natural-language transformation hypotheses."""
+    """Generates competing natural-language transformation hypotheses."""
 
     def __init__(self, client: LLMClient) -> None:
         self._client = client
 
-    def generate(self, task_description: str, feedback: str | None = None) -> str:
-        """Return raw LLM response containing 3 numbered hypotheses.
+    def generate(
+        self,
+        task_description: str,
+        feedback: str | None = None,
+        n: int = 3,
+    ) -> str:
+        """Return raw LLM response containing n numbered hypotheses.
 
         Args:
             task_description: Formatted ARC task (training pairs + test input).
             feedback:         Optional Critic feedback from a previous attempt.
+            n:                Number of hypotheses to generate (default 3).
         """
+        # Build a system prompt that requests exactly n hypotheses
+        sys = _HYPOTHESIZER_SYSTEM.replace("exactly 3 distinct", f"exactly {n} distinct")
+        sys = sys.replace(
+            'Number them exactly: "1.", "2.", "3." on their own lines.',
+            f'Number them exactly: "1.", "2.", … "{n}." on their own lines.',
+        )
+
         content = task_description
         if feedback:
             content += (
                 "\n\n--- CRITIC FEEDBACK FROM PREVIOUS ATTEMPT ---\n"
                 + feedback
-                + "\n\nGenerate 3 NEW hypotheses that address the above feedback."
+                + f"\n\nGenerate {n} NEW hypotheses that address the above feedback."
             )
         else:
-            content += "\n\nGenerate 3 hypotheses for the transformation rule."
+            content += f"\n\nGenerate {n} hypotheses for the transformation rule."
 
         messages = [{"role": "user", "content": content}]
-        return self._client.generate(_HYPOTHESIZER_SYSTEM, messages)
+        return self._client.generate(sys, messages)
 
 
 # ---------------------------------------------------------------------------

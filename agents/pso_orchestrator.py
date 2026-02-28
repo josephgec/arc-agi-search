@@ -376,8 +376,11 @@ class PSOOrchestrator:
         # a different hypothesis, maximising initial diversity.
         hypotheses: list[str] = []
         try:
-            hyp_raw  = self._hypothesizer.generate(task_description + "\n\n" + training_examples)
-            hypotheses = _parse_hypotheses(hyp_raw, max_n=max(3, self.n_particles))
+            n_hyp = max(3, self.n_particles)
+            hyp_raw  = self._hypothesizer.generate(
+                task_description + "\n\n" + training_examples, n=n_hyp
+            )
+            hypotheses = _parse_hypotheses(hyp_raw, max_n=n_hyp)
             if self.debug:
                 print(f"  [PSO] Generated {len(hypotheses)} seed hypotheses")
         except Exception as exc:
