@@ -27,8 +27,8 @@ from agents.roles import Hypothesizer, Coder, Critic, ROUTE_HYPOTHESIZER
 # Shared constants
 # ---------------------------------------------------------------------------
 
-_LARGE_GRID_CELL_THRESHOLD = 300
-_LARGE_GRID_MAX_PAIRS      = 2
+_LARGE_GRID_CELL_THRESHOLD = 200   # grids with > this many cells use sparse repr
+_SPARSE_GRID_THRESHOLD     = 600   # grids with > this many cells are omitted entirely
 
 _COLOR_NAMES = {
     0: "black", 1: "blue",   2: "red",    3: "green",  4: "yellow",
@@ -46,6 +46,20 @@ def _grid_to_str(grid) -> str:
         + ", ".join("[" + ", ".join(str(v) for v in row) + "]" for row in grid.tolist())
         + "]"
     )
+
+
+def _grid_to_sparse(grid) -> str:
+    """Compact representation: list only non-zero (foreground) cells."""
+    rows, cols = grid.shape
+    cells = []
+    for r in range(rows):
+        for c in range(cols):
+            v = int(grid[r, c])
+            if v != 0:
+                cells.append(f"({r},{c})={v}")
+    if not cells:
+        return "(empty — all zeros)"
+    return "{" + ", ".join(cells) + "}"
 
 
 def _block_analysis(inp, out) -> str | None:
@@ -163,30 +177,54 @@ def _output_shape_constraint(task: dict) -> str:
 
 
 def _format_task_description(task: dict) -> str:
-    pairs    = task["train"]
-    max_cells = max(max(p["input"].size, p["output"].size) for p in pairs)
-    if max_cells > _LARGE_GRID_CELL_THRESHOLD:
-        pairs = pairs[:_LARGE_GRID_MAX_PAIRS]
-        note  = f"(Note: grids are large; showing {len(pairs)} of {len(task['train'])} training pairs.)\n"
-    else:
-        note = ""
+    """Format task description showing ALL training pairs.
 
-    lines = [f"Here is an ARC-AGI puzzle.\n{note}"]
-    for i, pair in enumerate(pairs):
+    Grids below _LARGE_GRID_CELL_THRESHOLD cells are shown in full.
+    Grids between threshold and _SPARSE_GRID_THRESHOLD use sparse notation.
+    Grids above _SPARSE_GRID_THRESHOLD are omitted (too large for context).
+    """
+    all_pairs = task["train"]
+    lines = ["Here is an ARC-AGI puzzle.\n"]
+
+    for i, pair in enumerate(all_pairs):
         inp, out = pair["input"], pair["output"]
         ih, iw   = inp.shape
         oh, ow   = out.shape
+        in_cells  = inp.size
+        out_cells = out.size
+
         lines.append(f"### Training pair {i + 1}")
-        lines.append(f"Input  ({ih}×{iw}):\n{_grid_to_str(inp)}")
-        lines.append(f"Output ({oh}×{ow}):\n{_grid_to_str(out)}")
-        ba = _block_analysis(inp, out)
-        if ba:
-            lines.append(ba)
+
+        if max(in_cells, out_cells) > _SPARSE_GRID_THRESHOLD:
+            lines.append(
+                f"Input  ({ih}×{iw}): [omitted — {in_cells} cells, too large to display]"
+            )
+            lines.append(
+                f"Output ({oh}×{ow}): [omitted — {out_cells} cells, too large to display]"
+            )
+        elif max(in_cells, out_cells) > _LARGE_GRID_CELL_THRESHOLD:
+            # Sparse format: list non-zero cells only
+            lines.append(f"Input  ({ih}×{iw}) sparse: {_grid_to_sparse(inp)}")
+            lines.append(f"Output ({oh}×{ow}) sparse: {_grid_to_sparse(out)}")
+        else:
+            lines.append(f"Input  ({ih}×{iw}):\n{_grid_to_str(inp)}")
+            lines.append(f"Output ({oh}×{ow}):\n{_grid_to_str(out)}")
+            ba = _block_analysis(inp, out)
+            if ba:
+                lines.append(ba)
         lines.append("")
 
     test_inp = task["test"][0]["input"]
     th, tw   = test_inp.shape
-    lines.append(f"### Test input ({th}×{tw}):\n{_grid_to_str(test_inp)}")
+    if test_inp.size > _SPARSE_GRID_THRESHOLD:
+        lines.append(
+            f"### Test input ({th}×{tw}) sparse:\n{_grid_to_sparse(test_inp)}"
+        )
+    elif test_inp.size > _LARGE_GRID_CELL_THRESHOLD:
+        lines.append(f"### Test input ({th}×{tw}) sparse:\n{_grid_to_sparse(test_inp)}")
+    else:
+        lines.append(f"### Test input ({th}×{tw}):\n{_grid_to_str(test_inp)}")
+
     lines.append(_output_shape_constraint(task))
     lines.append("\nStudy the training pairs and identify the transformation rule.")
     return "\n".join(lines)

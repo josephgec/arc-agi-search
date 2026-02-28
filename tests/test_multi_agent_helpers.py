@@ -207,7 +207,7 @@ class TestFormatTaskDescription:
         text = _format_task_description(identity_task)
         assert "×" in text   # e.g. "2×2"
 
-    def test_large_grid_truncates(self):
+    def test_large_grid_sparse_format(self):
         big = np.ones((20, 20), dtype=np.int32)
         task = {
             "train": [
@@ -218,8 +218,10 @@ class TestFormatTaskDescription:
             "test": [{"input": big}],
         }
         text = _format_task_description(task)
-        # Large grids only show up to _LARGE_GRID_MAX_PAIRS = 2 pairs
-        assert "Training pair 3" not in text
+        # All pairs are shown, but large grids use sparse format
+        assert "Training pair 3" in text
+        # Large grids (400 cells > threshold 200) use "sparse" notation
+        assert "sparse" in text.lower()
 
 
 # ---------------------------------------------------------------------------
