@@ -89,6 +89,9 @@ loop solving ARC-AGI puzzles.  You will be given two reference solutions
 must generate {k} DISTINCT Python `transform` functions that creatively
 recombine and improve upon both.
 
+Before generating each function, briefly reason about what the current
+solutions get right, what they get wrong, and how to fix the root cause.
+
 Available DSL primitives (already imported):
   crop, rotate, flip, translate, scale, tile,
   recolor, mask, overlay, flood_fill,
@@ -98,8 +101,9 @@ Rules:
 - Generate exactly {k} code blocks, each in its own ```python … ``` fence.
 - Name the functions `transform_1`, `transform_2`, … `transform_{k}`.
 - Each must be complete and executable (takes np.ndarray, returns np.ndarray).
-- Blend different aspects of both reference solutions; do NOT simply copy one.
-- Prefer solutions that are likely to fix the specific failures described.
+- Each variation should try a DIFFERENT strategy or fix — not minor wording tweaks.
+- Do NOT hardcode specific cell coordinates or shape-based if-else branches.
+- Prefer solutions that fix the systematic root cause of the listed failures.
 - No print, no I/O, no side effects.
 """
 
@@ -278,6 +282,32 @@ class PSOCoder:
                 + "\n\n"
             )
 
+        # Deduplicate when pbest == gbest (avoid confusing the LLM with duplicates)
+        if pbest_code.strip() == gbest_code.strip():
+            ref_section = (
+                f"Best code so far (fitness={gbest_fitness:.4f}):\n"
+                f"```python\n{gbest_code}\n```\n\n"
+            )
+        else:
+            ref_section = (
+                "Personal best code:\n"
+                f"```python\n{pbest_code}\n```\n\n"
+                "Global best code:\n"
+                f"```python\n{gbest_code}\n```\n\n"
+            )
+
+        # Generate diverse candidate descriptions based on k
+        strategies = [
+            "Fix the known failures in the best code above",
+            "Try a different algorithmic approach entirely (different DSL primitives or logic)",
+            "Combine the strongest elements of both reference codes",
+            "Simplify to the minimal correct solution",
+        ]
+        strategy_lines = "\n".join(
+            f"  transform_{i+1}: {strategies[i % len(strategies)]}"
+            for i in range(k)
+        )
+
         content = (
             f"{task_description}\n\n"
             f"{training_context}\n\n"
@@ -286,14 +316,11 @@ class PSOCoder:
             f"Personal best fitness: {pbest_fitness:.4f} / 1.0000\n"
             f"Global best fitness  : {gbest_fitness:.4f} / 1.0000\n\n"
             + diff_section
-            + "Personal best code:\n"
-            f"```python\n{pbest_code}\n```\n\n"
-            "Global best code:\n"
-            f"```python\n{gbest_code}\n```\n\n"
-            f"Generate {k} distinct variations that intelligently recombine "
-            "the logic from both solutions to improve correctness on ALL training pairs. "
-            "Think about what each solution gets right and wrong, then synthesise "
-            f"improvements.  Provide exactly {k} ```python``` blocks."
+            + ref_section
+            + f"Generate {k} distinct `transform` functions.  "
+            f"Use these {k} different strategies:\n"
+            + strategy_lines
+            + f"\n\nProvide exactly {k} ```python``` blocks (named transform_1 … transform_{k})."
         )
 
         messages = [{"role": "user", "content": content}]

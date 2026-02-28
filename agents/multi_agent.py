@@ -69,6 +69,21 @@ def _block_analysis(inp, out) -> str | None:
     return "\n".join(lines)
 
 
+def _diff_annotation(inp: np.ndarray, out: np.ndarray) -> str | None:
+    """For same-shape pairs, briefly describe which cells changed."""
+    if inp.shape != out.shape:
+        return None
+    diff = np.argwhere(inp != out)
+    n = len(diff)
+    if n == 0:
+        return "  (no cells changed)"
+    if n > 20:
+        return f"  ({n} cells changed)"
+    parts = [f"[{r},{c}] {inp[r,c]}→{out[r,c]}" for r, c in diff[:8]]
+    suffix = "…" if n > 8 else ""
+    return f"  ({n} cells changed: {', '.join(parts)}{suffix})"
+
+
 def _format_training_examples(task: dict) -> str:
     lines = ["Training examples (use these to verify your implementation):"]
     for i, pair in enumerate(task["train"]):
@@ -78,22 +93,39 @@ def _format_training_examples(task: dict) -> str:
         lines.append(f"Example {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
         lines.append(f"  Input:  {_grid_to_str(inp)}")
         lines.append(f"  Output: {_grid_to_str(out)}")
+        ann = _diff_annotation(inp, out)
+        if ann:
+            lines.append(ann)
     return "\n".join(lines)
 
 
 def _output_shape_constraint(task: dict) -> str:
-    """Return a hard-constraint string if all training outputs share the same shape."""
-    shapes = [tuple(p["output"].shape) for p in task["train"]]
-    if len(set(shapes)) == 1:
-        oh, ow = shapes[0]
+    """Return a shape hint for LLM: hard constraint when fixed, guidance when variable."""
+    pairs      = task["train"]
+    in_shapes  = [tuple(p["input"].shape)  for p in pairs]
+    out_shapes = [tuple(p["output"].shape) for p in pairs]
+
+    if len(set(out_shapes)) == 1:
+        oh, ow = out_shapes[0]
         return (
             f"\n⚠ HARD CONSTRAINT: transform() MUST return an array of shape "
             f"({oh}, {ow}) — i.e. exactly {oh} rows × {ow} columns.  "
             "Any other output size is WRONG regardless of content."
         )
-    # Variable output sizes: just summarise them
-    shape_strs = ", ".join(f"{h}×{w}" for h, w in shapes)
-    return f"\n(Output shapes per training pair: {shape_strs})"
+
+    # Variable output sizes — give rich guidance
+    lines = ["\n⚠ Note: output size VARIES across training pairs — it must be computed "
+             "dynamically from the input content, not hardcoded."]
+    for i, (ish, osh) in enumerate(zip(in_shapes, out_shapes)):
+        lines.append(f"  Pair {i+1}: input {ish[0]}×{ish[1]} → output {osh[0]}×{osh[1]}")
+        if ish == osh:
+            lines.append("    (same shape as input)")
+        elif osh[0] < ish[0] or osh[1] < ish[1]:
+            lines.append("    (output is SMALLER than input — likely a crop or selection)")
+        elif osh[0] > ish[0] or osh[1] > ish[1]:
+            lines.append("    (output is LARGER than input — likely expanded/tiled)")
+    lines.append("Study how each output size relates to what's in the corresponding input.")
+    return "\n".join(lines)
 
 
 def _format_task_description(task: dict) -> str:

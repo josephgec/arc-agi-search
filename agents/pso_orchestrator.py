@@ -123,9 +123,17 @@ def _random_unit_vec(rng: np.random.Generator | None = None) -> np.ndarray:
 
 
 _INIT_CODER_SYSTEM = """\
-You are an ARC-AGI puzzle solver.  Study the training pairs and write a Python
-function called `transform(input_grid: np.ndarray) -> np.ndarray` that correctly
-maps every input to its corresponding output.
+You are an ARC-AGI puzzle solver.  Follow these two steps:
+
+STEP 1 — REASON (write a short analysis before the code block):
+- Compare each input/output pair.  What changes and what stays the same?
+- Is this a geometric transform (rotate/flip/crop/tile), a colour operation, or object manipulation?
+- Does the output size depend on the input content?  If so, how is it computed?
+- What is the single abstract rule that generates ALL outputs from ALL inputs?
+Write 2-4 sentences summarising your conclusion.
+
+STEP 2 — CODE:
+Implement the rule as a Python function `transform(input_grid: np.ndarray) -> np.ndarray`.
 
 Available DSL (already imported — do NOT re-import):
   crop, rotate, flip, translate, scale, tile,
@@ -133,22 +141,13 @@ Available DSL (already imported — do NOT re-import):
   find_objects, bounding_box, crop_to_content, np
 
 Rules:
-- Return ONLY one ```python … ``` code block.
+- After your analysis, return EXACTLY one ```python … ``` code block.
 - The function must be named `transform`.
 - No print, no I/O, no side-effects.
-- The solution must generalise to all training pairs, not just the first one.
-- The output shape MUST match the training outputs exactly — check the dimensions!
-
-Strategy hints (think through these before coding):
-- Does each cell transform independently? → compute the rule (e.g. most-frequent value,
-  arithmetic on colors) rather than building a hardcoded input→output lookup table.
-- Is there a spatial transformation (rotate, flip, crop, tile)?
-- Are there discrete objects to detect and manipulate?
-- Does the output size differ from the input? → derive the output size from examples.
-
-⚠ IMPORTANT: Do NOT hardcode specific input-output value pairs from training.
-  Your function must work on ANY input following the same rule.
-  Discover the abstract rule; do not memorise the training examples.
+- The solution must generalise to ALL training pairs, not just the first one.
+- Output shape MUST match the training outputs (check every pair's dimensions).
+- Do NOT hardcode specific cell values or coordinates from training examples.
+  Discover the abstract rule; derive everything dynamically from the input.
 """
 
 
@@ -461,40 +460,44 @@ class PSOOrchestrator:
                     candidates = [p.pbest_code]
 
                 # ------------------------------------------------------------
-                # Step 3 — Generate-and-Project: hybrid selection
-                # Evaluate all candidates; pick by weighted combination of
-                # PSO proximity (embedding distance to target) and fitness.
+                # Step 3 — Generate-and-Project: fitness-first hybrid selection
+                # Evaluate all candidates in sandbox first (fast).
+                # If any improve, pick by fitness (skip most embeddings).
+                # Otherwise embed all and pick by PSO proximity.
                 # ------------------------------------------------------------
                 best_candidate = p.pbest_code  # safe fallback
                 best_emb       = p.pbest_pos.copy()
-                best_score     = -float("inf")
 
-                cand_results: list[tuple[str, np.ndarray, float, float]] = []
+                # (code, emb_or_None, dist_or_inf, fitness)
+                cand_results: list[tuple[str, np.ndarray | None, float, float]] = []
                 for cand in candidates:
                     if not cand or not cand.strip():
                         continue
-                    emb = self._embed(cand, fallback_random=False)
-                    if emb is None or len(emb) != len(target_pos):
-                        continue   # skip candidates whose embedding failed
-                    dist = cosine(emb, target_pos)
                     fit, _ = self._eval_fitness(cand, task)
-                    cand_results.append((cand, emb, dist, fit))
+                    cand_results.append((cand, None, float("inf"), fit))
 
                 if cand_results:
-                    # Priority 1: take the highest-fitness candidate if it strictly
-                    # improves over the current particle's fitness.
-                    improving = [
-                        (c, e, d, f) for c, e, d, f in cand_results
-                        if f > p.fitness + 1e-6
-                    ]
+                    # Priority 1: any candidate strictly improves → pick best fitness.
+                    # Only embed the winner (saves k-1 embedding calls).
+                    improving = [t for t in cand_results if t[3] > p.fitness + 1e-6]
                     if improving:
-                        best_cand_tuple = max(improving, key=lambda x: x[3])
+                        winner_code, _, _, _ = max(improving, key=lambda x: x[3])
+                        winner_emb = self._embed(winner_code)  # fallback_random=True
+                        best_candidate = winner_code
+                        best_emb       = winner_emb
                     else:
-                        # Priority 2: pure PSO exploration — pick by embedding proximity.
-                        best_cand_tuple = min(cand_results, key=lambda x: x[2])
-
-                    best_candidate = best_cand_tuple[0]
-                    best_emb       = best_cand_tuple[1]
+                        # Priority 2: no improvement — embed all for PSO exploration.
+                        enriched = []
+                        for c, _, _, f in cand_results:
+                            e = self._embed(c, fallback_random=False)
+                            if e is None or len(e) != len(target_pos):
+                                continue
+                            d = cosine(e, target_pos)
+                            enriched.append((c, e, d, f))
+                        if enriched:
+                            best_c, best_e, _, _ = min(enriched, key=lambda x: x[2])
+                            best_candidate = best_c
+                            best_emb       = best_e
 
                 # ------------------------------------------------------------
                 # Step 4 — Update particle state
@@ -535,14 +538,12 @@ class PSOOrchestrator:
                             f"{gbest_fitness:.4f} ***"
                         )
 
-                best_dist = min((r[2] for r in cand_results), default=None)
                 iter_log["particles"].append({
                     "particle_id":   p.particle_id,
                     "role":          p.role_name,
                     "fitness":       p.fitness,
                     "pbest_fitness": p.pbest_fitness,
                     "n_candidates":  len(cand_results),
-                    "best_dist":     round(best_dist, 5) if best_dist is not None else None,
                 })
 
             iter_log["gbest_fitness"] = gbest_fitness
