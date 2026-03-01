@@ -100,7 +100,10 @@ class LLMClient:
             "model":    self.model,
             "messages": [{"role": "system", "content": system}] + messages,
             "stream":   True,
-            "options":  {"temperature": temperature},
+            "options":  {
+                "temperature": temperature,
+                "num_predict": self.max_tokens,   # cap output length (Ollama param)
+            },
         }
         data    = json.dumps(payload).encode()
         request = urllib.request.Request(
