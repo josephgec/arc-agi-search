@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     # PSO-specific
     p.add_argument("--pso-n-particles",    type=int,   default=6)
     p.add_argument("--pso-max-iterations", type=int,   default=10)
-    p.add_argument("--pso-k-candidates",   type=int,   default=5)
+    p.add_argument("--pso-k-candidates",   type=int,   default=10)
     p.add_argument("--pso-w",              type=float, default=0.5)
     p.add_argument("--pso-c1",             type=float, default=1.5)
     p.add_argument("--pso-c2",             type=float, default=1.5)

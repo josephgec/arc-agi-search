@@ -714,3 +714,96 @@ class TestRefinementPhase:
         )
         captured = capsys.readouterr()
         assert "Refine" in captured.out or "refine" in captured.out.lower() or fitness >= 0.8
+
+
+# ---------------------------------------------------------------------------
+# TestCaching — sandbox_cache and behavior_cache
+# ---------------------------------------------------------------------------
+
+class TestCaching:
+    """Verify that _sandbox_cache and _behavior_cache deduplicate calls."""
+
+    TASK = {
+        "train": [
+            {"input":  np.array([[1, 0]], dtype=np.int32),
+             "output": np.array([[1, 0]], dtype=np.int32)},
+        ],
+        "test": [{"input": np.array([[1, 0]], dtype=np.int32)}],
+    }
+    CODE = "def transform(g):\n    return g.copy()"
+
+    def test_sandbox_cache_initialized_empty(self):
+        orch = make_orchestrator()
+        assert orch._sandbox_cache == {}
+        assert orch._behavior_cache == {}
+
+    def test_sandbox_cache_deduplicates(self):
+        orch = make_orchestrator()
+        with patch("agents.pso_orchestrator.sandbox.evaluate_code") as mock_eval:
+            mock_eval.return_value = {
+                "pairs": [{"correct": True, "predicted": np.array([[1, 0]], dtype=np.int32),
+                           "expected": np.array([[1, 0]], dtype=np.int32), "error": None}],
+                "n_correct": 1, "n_total": 1, "all_correct": True,
+            }
+            # Call twice with the same code
+            f1, r1 = orch._eval_fitness(self.CODE, self.TASK)
+            f2, r2 = orch._eval_fitness(self.CODE, self.TASK)
+
+        # sandbox.evaluate_code should only have been called once
+        assert mock_eval.call_count == 1
+        assert f1 == pytest.approx(1.0)
+        assert f2 == pytest.approx(1.0)
+
+    def test_sandbox_cache_cleared_on_solve(self):
+        orch = make_orchestrator()
+        # Pre-populate the cache as if a previous task was solved
+        orch._sandbox_cache["stale_key"] = {"n_total": 0}
+        orch._behavior_cache["stale_text"] = np.zeros(768, dtype=np.float32)
+
+        # solve() should clear both caches at the start
+        with patch.object(orch, "_init_particle_code", return_value=(self.CODE, True)), \
+             patch.object(orch, "_pos_from_eval",      return_value=unit_vec()), \
+             patch.object(orch, "_eval_fitness",       return_value=(1.0, {
+                 "pairs": [], "n_correct": 1, "n_total": 1, "all_correct": True,
+             })):
+            orch.solve(self.TASK)
+
+        assert "stale_key"  not in orch._sandbox_cache
+        assert "stale_text" not in orch._behavior_cache
+
+    def test_behavior_cache_deduplicates(self):
+        orch = make_orchestrator(embed_mode="behavioral")
+        task = self.TASK
+
+        # Pre-compute eval_result so _embed_behavior uses it directly
+        eval_result = {
+            "pairs": [{"correct": True,
+                       "predicted": np.array([[1, 0]], dtype=np.int32),
+                       "expected":  np.array([[1, 0]], dtype=np.int32),
+                       "error": None}],
+        }
+
+        with patch.object(orch._llm, "embed_code") as mock_embed:
+            mock_embed.return_value = unit_vec()
+            # Call twice with identical outputs → same behavior_text
+            v1 = orch._embed_behavior(self.CODE, task, eval_result=eval_result)
+            v2 = orch._embed_behavior(self.CODE, task, eval_result=eval_result)
+
+        # embed_code should only have been called once
+        assert mock_embed.call_count == 1
+        np.testing.assert_array_equal(v1, v2)
+
+    def test_sandbox_cache_different_code_runs_separately(self):
+        orch = make_orchestrator()
+        code_b = "def transform(g):\n    return g * 0"
+        with patch("agents.pso_orchestrator.sandbox.evaluate_code") as mock_eval:
+            mock_eval.return_value = {
+                "pairs": [{"correct": False, "predicted": np.array([[0, 0]], dtype=np.int32),
+                           "expected": np.array([[1, 0]], dtype=np.int32), "error": None}],
+                "n_correct": 0, "n_total": 1, "all_correct": False,
+            }
+            orch._eval_fitness(self.CODE, self.TASK)
+            orch._eval_fitness(code_b, self.TASK)
+
+        # Two distinct codes → two separate sandbox calls
+        assert mock_eval.call_count == 2

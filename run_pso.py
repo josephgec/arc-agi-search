@@ -8,7 +8,7 @@ python run_pso.py --task data/training/007bbfb7.json
 
 # Solve with custom swarm parameters:
 python run_pso.py --task data/training/007bbfb7.json \\
-    --n-particles 6 --max-iterations 12 --k-candidates 5 \\
+    --n-particles 6 --max-iterations 12 --k-candidates 10 \\
     --w 0.5 --c1 1.5 --c2 1.5 \\
     --temperature 0.7 --debug
 
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
                    help="Number of swarm particles (max 6).")
     p.add_argument("--max-iterations", type=int,   default=10,
                    help="PSO iteration budget.")
-    p.add_argument("--k-candidates",   type=int,   default=5,
+    p.add_argument("--k-candidates",   type=int,   default=10,
                    help="LLM mutation candidates per particle per iteration.")
     p.add_argument("--w",  type=float, default=0.5,
                    help="PSO inertia weight.")
