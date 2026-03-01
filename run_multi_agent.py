@@ -30,6 +30,7 @@ import sys
 import time
 from pathlib import Path
 
+from arc import sandbox
 from arc.grid import load_task, grid_to_list
 from agents.multi_agent import MultiAgent
 from agents.ensemble import Ensemble
@@ -146,13 +147,25 @@ def solve_task(solver, task_path: Path) -> dict:
     result  = solver.solve(task)
     elapsed = time.time() - t0
 
-    pred = result.get("prediction") or result.get("code")
     pred_list = None
     if result.get("prediction") is not None:
+        # PSO / Ensemble already executed the code and return a numpy array
         try:
             pred_list = grid_to_list(result["prediction"])
         except Exception:
             pass
+    elif result.get("code"):
+        # multi / single return code but no prediction — execute it now
+        test_input = task.get("test", [{}])[0].get("input")
+        if test_input is not None:
+            import numpy as np
+            grid = np.array(test_input, dtype=np.int32)
+            out, _ = sandbox.execute(result["code"], grid)
+            if out is not None:
+                try:
+                    pred_list = grid_to_list(out)
+                except Exception:
+                    pass
 
     return {
         "task":         str(task_path),

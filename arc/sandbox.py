@@ -20,7 +20,13 @@ DSL_NAMESPACE       The exec namespace seeded with DSL helpers and numpy.
 from __future__ import annotations
 
 import multiprocessing as mp
+import sys
 from typing import Any
+
+# Use "fork" on macOS/Linux so the child process inherits the parent's memory
+# without re-importing __main__.  "spawn" (macOS default) would re-run the
+# entire entry-point script on every sandbox call, which is both slow and wrong.
+_MP_CTX = mp.get_context("fork")
 
 import numpy as np
 
@@ -125,8 +131,8 @@ def execute(
     if "input(" in code or "sys.stdin" in code:
         return None, "Code uses input()/stdin — not allowed; grid is passed as argument."
 
-    out_queue: mp.Queue = mp.Queue()
-    proc = mp.Process(
+    out_queue: mp.Queue = _MP_CTX.Queue()
+    proc = _MP_CTX.Process(
         target=_subprocess_worker,
         args=(code, input_grid.tolist(), out_queue),
     )
