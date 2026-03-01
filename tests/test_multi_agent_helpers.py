@@ -209,7 +209,7 @@ class TestFormatTaskDescription:
         assert "×" in text   # e.g. "2×2"
 
     def test_large_grid_sparse_format(self):
-        big = np.ones((20, 20), dtype=np.int32)
+        big = np.ones((21, 21), dtype=np.int32)
         task = {
             "train": [
                 {"input": big, "output": big},
@@ -221,7 +221,7 @@ class TestFormatTaskDescription:
         text = _format_task_description(task)
         # All pairs are shown, but large grids use sparse format
         assert "Training pair 3" in text
-        # Large grids (400 cells > threshold 200) use "sparse" notation
+        # Large grids (441 cells > RLE threshold 400) use "sparse" notation
         assert "sparse" in text.lower()
 
 

@@ -269,3 +269,88 @@ def symmetrize(grid: Grid, axis: int = 1) -> Grid:
             result[mirror, :] = np.where(row_dest == 0, row_src, row_dest)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Object property helpers
+# ---------------------------------------------------------------------------
+
+def get_color(obj: Grid) -> int:
+    """Return the most common non-zero color in obj; 0 if obj is all-zero."""
+    flat = obj.flatten(); nz = flat[flat != 0]
+    if nz.size == 0: return 0
+    values, counts = np.unique(nz, return_counts=True)
+    return int(values[np.argmax(counts)])
+
+
+def get_size(obj: Grid) -> int:
+    """Return the count of non-zero cells in obj."""
+    return int(np.count_nonzero(obj))
+
+
+def get_centroid(obj: Grid) -> tuple:
+    """Return (row, col) centroid of non-zero cells; (0.0, 0.0) if all-zero."""
+    pos = np.argwhere(obj != 0)
+    if pos.size == 0: return (0.0, 0.0)
+    return (float(pos[:, 0].mean()), float(pos[:, 1].mean()))
+
+
+# ---------------------------------------------------------------------------
+# Grid structure analysis
+# ---------------------------------------------------------------------------
+
+def detect_grid_layout(grid: Grid) -> tuple | None:
+    """Detect sub-grid structure from row/col divider lines (full rows/cols of same non-zero value).
+    Returns (n_row_sections, n_col_sections) or None."""
+    rows, cols = grid.shape
+    def _dividers(n, get_line):
+        d = []
+        for i in range(n):
+            u = np.unique(get_line(i))
+            if u.size == 1 and u[0] != 0: d.append(i)
+        return len(d) + 1 if d else None
+    rs = _dividers(rows, lambda i: grid[i, :])
+    cs = _dividers(cols, lambda i: grid[:, i])
+    if rs is None and cs is None: return None
+    return (rs or 1, cs or 1)
+
+
+def find_periodicity(grid: Grid) -> tuple | None:
+    """Return the smallest (row_period, col_period) for exact tiling, or None.
+    Only periods strictly less than the full dimension are considered."""
+    rows, cols = grid.shape
+    def _min_period(n, get_slice):
+        for p in range(1, n):
+            if n % p != 0: continue
+            ref = [get_slice(i) for i in range(p)]
+            if all(np.array_equal(get_slice(i), ref[i % p]) for i in range(n)):
+                return p
+        return None
+    rp = _min_period(rows, lambda i: grid[i, :])
+    cp = _min_period(cols, lambda j: grid[:, j])
+    if rp is None and cp is None: return None
+    return (rp or rows, cp or cols)
+
+
+# ---------------------------------------------------------------------------
+# Gravity / physics
+# ---------------------------------------------------------------------------
+
+def gravity(grid: Grid, direction: str = "down") -> Grid:
+    """Slide all non-zero cells toward an edge; zeros fill the vacated side.
+    direction: "down" | "up" | "left" | "right". Each column/row slides independently."""
+    result = grid.copy()
+    rows, cols = result.shape
+    if direction in ("down", "up"):
+        for c in range(cols):
+            col = result[:, c]; nz = col[col != 0]
+            zeros = np.zeros(rows - len(nz), dtype=np.int32)
+            result[:, c] = np.concatenate([zeros, nz] if direction == "down" else [nz, zeros])
+    elif direction in ("left", "right"):
+        for r in range(rows):
+            row = result[r, :]; nz = row[row != 0]
+            zeros = np.zeros(cols - len(nz), dtype=np.int32)
+            result[r, :] = np.concatenate([nz, zeros] if direction == "left" else [zeros, nz])
+    else:
+        raise ValueError(f"direction must be up/down/left/right; got {direction!r}")
+    return result

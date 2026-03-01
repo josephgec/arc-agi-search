@@ -11,6 +11,8 @@ from agents.roles import (
     Hypothesizer,
     Coder,
     Critic,
+    Decomposer,
+    Verifier,
     PSOCoder,
     ROUTE_HYPOTHESIZER,
     ROUTE_CODER,
@@ -210,6 +212,83 @@ class TestCritic:
         content = messages[0]["content"]
         assert "def transform" in content
         assert "my_hypothesis" in content
+
+
+# ---------------------------------------------------------------------------
+# Decomposer
+# ---------------------------------------------------------------------------
+
+class TestDecomposer:
+    def test_calls_llm_with_task_and_examples(self):
+        llm = make_llm("1. Identify objects.\n2. Recolor them.\n3. Return result.")
+        dec = Decomposer(llm)
+        result = dec.decompose("task description", "training examples")
+        llm.generate.assert_called_once()
+        call_args = llm.generate.call_args
+        content = call_args[0][1][0]["content"]
+        assert "task description" in content
+        assert "training examples" in content
+        assert result == "1. Identify objects.\n2. Recolor them.\n3. Return result."
+
+    def test_stuck_approaches_included_when_given(self):
+        llm = make_llm("1. Try a different approach.")
+        dec = Decomposer(llm)
+        dec.decompose("task desc", "examples", stuck_approaches="rotation hypothesis")
+        call_args = llm.generate.call_args
+        content = call_args[0][1][0]["content"]
+        assert "rotation hypothesis" in content
+        assert "failed" in content.lower() or "avoid" in content.lower()
+
+    def test_stuck_approaches_absent_when_none(self):
+        llm = make_llm("1. Step one.")
+        dec = Decomposer(llm)
+        dec.decompose("task desc", "examples", stuck_approaches=None)
+        call_args = llm.generate.call_args
+        content = call_args[0][1][0]["content"]
+        assert "ALREADY FAILED" not in content
+
+
+# ---------------------------------------------------------------------------
+# Verifier
+# ---------------------------------------------------------------------------
+
+EVAL_RESULT_PASS = {"n_correct": 3, "n_total": 3, "all_correct": True, "pairs": []}
+
+VERIFIER_PASS_RESPONSE = "VERDICT: PASS\nISSUES: none\nSUGGESTION: none"
+VERIFIER_FAIL_RESPONSE = (
+    "VERDICT: FAIL\n"
+    "ISSUES: Hardcoded shape assumption at line 3.\n"
+    "SUGGESTION: Compute shape dynamically from input."
+)
+
+
+class TestVerifier:
+    def test_pass_verdict_returns_passes_true(self):
+        llm = make_llm(VERIFIER_PASS_RESPONSE)
+        ver = Verifier(llm)
+        result = ver.verify("def transform(g): return g", "task", "examples", EVAL_RESULT_PASS)
+        assert result["passes"] is True
+
+    def test_fail_verdict_returns_passes_false_with_details(self):
+        llm = make_llm(VERIFIER_FAIL_RESPONSE)
+        ver = Verifier(llm)
+        result = ver.verify("def transform(g): return g", "task", "examples", EVAL_RESULT_PASS)
+        assert result["passes"] is False
+        assert "Hardcoded" in result["issues"] or len(result["issues"]) > 0
+        assert "dynamically" in result["suggestion"] or len(result["suggestion"]) > 0
+
+    def test_malformed_response_defaults_to_passes_true(self):
+        llm = make_llm("I am not sure about this solution.")
+        ver = Verifier(llm)
+        result = ver.verify("def transform(g): return g", "task", "examples", EVAL_RESULT_PASS)
+        assert result["passes"] is True
+
+    def test_llm_exception_defaults_to_passes_true(self):
+        llm = make_llm("")
+        llm.generate.side_effect = ConnectionError("offline")
+        ver = Verifier(llm)
+        result = ver.verify("def transform(g): return g", "task", "examples", EVAL_RESULT_PASS)
+        assert result["passes"] is True
 
 
 # ---------------------------------------------------------------------------

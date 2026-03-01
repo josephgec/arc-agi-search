@@ -20,15 +20,17 @@ import numpy as np
 from arc import sandbox
 from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
-from agents.roles import Hypothesizer, Coder, Critic, ROUTE_HYPOTHESIZER
+from agents.roles import Hypothesizer, Coder, Critic, Decomposer, Verifier, ROUTE_HYPOTHESIZER
 
 
 # ---------------------------------------------------------------------------
 # Shared constants
 # ---------------------------------------------------------------------------
 
-_LARGE_GRID_CELL_THRESHOLD = 200   # grids with > this many cells use sparse repr
-_SPARSE_GRID_THRESHOLD     = 600   # grids with > this many cells are omitted entirely
+_DENSE_GRID_THRESHOLD  =  50   # <=50 cells: dense [[v,...],...]
+_RLE_GRID_THRESHOLD    = 400   # 51-400: RLE per row
+_SPARSE_GRID_THRESHOLD = 800   # 401-800: sparse {(r,c)=v,...}
+                                # >800: omitted
 
 _COLOR_NAMES = {
     0: "black", 1: "blue",   2: "red",    3: "green",  4: "yellow",
@@ -60,6 +62,37 @@ def _grid_to_sparse(grid) -> str:
     if not cells:
         return "(empty — all zeros)"
     return "{" + ", ".join(cells) + "}"
+
+
+def _grid_to_rle(grid) -> str:
+    """Encode grid as run-length encoding per row.
+
+    Each run encoded as 'value(colorname)xcount'; singletons omit 'xcount'.
+    Example: [0,0,2,2,0] -> '0(black)x3 2(red)x2 0(black)'
+    Rows separated by newline + two spaces for readability.
+    """
+    row_strs = []
+    for row in grid.tolist():
+        runs = []
+        if not row:
+            row_strs.append("")
+            continue
+        cur_val = row[0]
+        count = 1
+        for v in row[1:]:
+            if v == cur_val:
+                count += 1
+            else:
+                name = _COLOR_NAMES.get(cur_val, str(cur_val))
+                token = f"{cur_val}({name})" if count == 1 else f"{cur_val}({name})x{count}"
+                runs.append(token)
+                cur_val = v
+                count = 1
+        name = _COLOR_NAMES.get(cur_val, str(cur_val))
+        token = f"{cur_val}({name})" if count == 1 else f"{cur_val}({name})x{count}"
+        runs.append(token)
+        row_strs.append(" ".join(runs))
+    return "\n  ".join(row_strs)
 
 
 def _block_analysis(inp, out) -> str | None:
@@ -347,9 +380,11 @@ def _output_shape_constraint(task: dict) -> str:
 def _format_task_description(task: dict) -> str:
     """Format task description showing ALL training pairs.
 
-    Grids below _LARGE_GRID_CELL_THRESHOLD cells are shown in full.
-    Grids between threshold and _SPARSE_GRID_THRESHOLD use sparse notation.
-    Grids above _SPARSE_GRID_THRESHOLD are omitted (too large for context).
+    Dispatch by max cells in a pair:
+      >800  : omit both grids
+      >400  : sparse {(r,c)=v,...}
+      > 50  : RLE per row
+      <=50  : dense [[v,...],...]
     """
     all_pairs = task["train"]
     lines = ["Here is an ARC-AGI puzzle.\n"]
@@ -360,23 +395,28 @@ def _format_task_description(task: dict) -> str:
         oh, ow   = out.shape
         in_cells  = inp.size
         out_cells = out.size
+        max_cells = max(in_cells, out_cells)
 
         lines.append(f"### Training pair {i + 1}")
 
-        if max(in_cells, out_cells) > _SPARSE_GRID_THRESHOLD:
+        if max_cells > _SPARSE_GRID_THRESHOLD:
             lines.append(
-                f"Input  ({ih}×{iw}): [omitted — {in_cells} cells, too large to display]"
+                f"Input  ({ih}\u00d7{iw}): [omitted \u2014 {in_cells} cells, too large to display]"
             )
             lines.append(
-                f"Output ({oh}×{ow}): [omitted — {out_cells} cells, too large to display]"
+                f"Output ({oh}\u00d7{ow}): [omitted \u2014 {out_cells} cells, too large to display]"
             )
-        elif max(in_cells, out_cells) > _LARGE_GRID_CELL_THRESHOLD:
+        elif max_cells > _RLE_GRID_THRESHOLD:
             # Sparse format: list non-zero cells only
-            lines.append(f"Input  ({ih}×{iw}) sparse: {_grid_to_sparse(inp)}")
-            lines.append(f"Output ({oh}×{ow}) sparse: {_grid_to_sparse(out)}")
+            lines.append(f"Input  ({ih}\u00d7{iw}) sparse: {_grid_to_sparse(inp)}")
+            lines.append(f"Output ({oh}\u00d7{ow}) sparse: {_grid_to_sparse(out)}")
+        elif max_cells > _DENSE_GRID_THRESHOLD:
+            # RLE format: human-readable run-length encoding
+            lines.append(f"Input  ({ih}\u00d7{iw}) [RLE]:\n  {_grid_to_rle(inp)}")
+            lines.append(f"Output ({oh}\u00d7{ow}) [RLE]:\n  {_grid_to_rle(out)}")
         else:
-            lines.append(f"Input  ({ih}×{iw}):\n{_grid_to_str(inp)}")
-            lines.append(f"Output ({oh}×{ow}):\n{_grid_to_str(out)}")
+            lines.append(f"Input  ({ih}\u00d7{iw}):\n{_grid_to_str(inp)}")
+            lines.append(f"Output ({oh}\u00d7{ow}):\n{_grid_to_str(out)}")
             ba = _block_analysis(inp, out)
             if ba:
                 lines.append(ba)
@@ -384,14 +424,18 @@ def _format_task_description(task: dict) -> str:
 
     test_inp = task["test"][0]["input"]
     th, tw   = test_inp.shape
-    if test_inp.size > _SPARSE_GRID_THRESHOLD:
+    test_cells = test_inp.size
+
+    if test_cells > _SPARSE_GRID_THRESHOLD:
         lines.append(
-            f"### Test input ({th}×{tw}) sparse:\n{_grid_to_sparse(test_inp)}"
+            f"### Test input ({th}\u00d7{tw}): [omitted \u2014 {test_cells} cells, too large to display]"
         )
-    elif test_inp.size > _LARGE_GRID_CELL_THRESHOLD:
-        lines.append(f"### Test input ({th}×{tw}) sparse:\n{_grid_to_sparse(test_inp)}")
+    elif test_cells > _RLE_GRID_THRESHOLD:
+        lines.append(f"### Test input ({th}\u00d7{tw}) sparse:\n{_grid_to_sparse(test_inp)}")
+    elif test_cells > _DENSE_GRID_THRESHOLD:
+        lines.append(f"### Test input ({th}\u00d7{tw}) [RLE]:\n  {_grid_to_rle(test_inp)}")
     else:
-        lines.append(f"### Test input ({th}×{tw}):\n{_grid_to_str(test_inp)}")
+        lines.append(f"### Test input ({th}\u00d7{tw}):\n{_grid_to_str(test_inp)}")
 
     lines.append(_output_shape_constraint(task))
     lines.append("\nStudy the training pairs and identify the transformation rule.")
@@ -572,6 +616,21 @@ def _format_diff(eval_result: dict) -> str:
     return "\n\n".join(parts) if parts else "(all pairs correct)"
 
 
+def _format_spatial_diff(eval_result: dict) -> str:
+    """Use compute_spatial_diff for each failing pair, returning a combined description."""
+    parts = []
+    for i, pair in enumerate(eval_result.get("pairs", [])):
+        if pair.get("correct"):
+            continue
+        pred = pair.get("predicted")
+        exp  = pair.get("expected")
+        if exp is None:
+            continue
+        diff = sandbox.compute_spatial_diff(pred, exp)
+        parts.append(f"Pair {i + 1}:\n{diff}")
+    return "\n\n".join(parts) if parts else "(all pairs correct)"
+
+
 # ---------------------------------------------------------------------------
 # MultiAgent orchestrator
 # ---------------------------------------------------------------------------
@@ -584,15 +643,21 @@ class MultiAgent:
         hypothesizer_model:       str | None = None,
         coder_model:              str | None = None,
         critic_model:             str | None = None,
+        decomposer_model:         str | None = None,
+        verifier_model:           str | None = None,
         hypothesizer_temperature: float      = 0.6,
         coder_temperature:        float      = 0.1,
         critic_temperature:       float      = 0.2,
         hypothesizer_max_tokens:  int        = 32768,
         coder_max_tokens:         int        = 8192,
         critic_max_tokens:        int        = 16384,
+        decomposer_max_tokens:    int        = 4096,
+        verifier_max_tokens:      int        = 8192,
         timeout:                  float      = 120.0,
         debug:                    bool       = False,
         max_cycles:               int        = 9,
+        use_decomposer:           bool       = True,
+        use_verifier:             bool       = True,
     ) -> None:
         def _make_client(role_model: str | None, temperature: float, max_tokens: int) -> LLMClient:
             return LLMClient(
@@ -604,13 +669,19 @@ class MultiAgent:
                 debug=debug,
             )
 
-        hyp_client = _make_client(hypothesizer_model, hypothesizer_temperature, hypothesizer_max_tokens)
-        cod_client = _make_client(coder_model,        coder_temperature,        coder_max_tokens)
-        cri_client = _make_client(critic_model,       critic_temperature,       critic_max_tokens)
+        hyp_client   = _make_client(hypothesizer_model, hypothesizer_temperature, hypothesizer_max_tokens)
+        cod_client   = _make_client(coder_model,        coder_temperature,        coder_max_tokens)
+        cri_client   = _make_client(critic_model,       critic_temperature,       critic_max_tokens)
+        decomp_client = _make_client(decomposer_model,  0.3,                      decomposer_max_tokens)
+        verif_client  = _make_client(verifier_model,    0.1,                      verifier_max_tokens)
 
         self._hypothesizer            = Hypothesizer(hyp_client)
         self._coder                   = Coder(cod_client)
         self._critic                  = Critic(cri_client)
+        self._decomposer              = Decomposer(decomp_client)
+        self._verifier                = Verifier(verif_client)
+        self.use_decomposer           = use_decomposer
+        self.use_verifier             = use_verifier
         self.max_cycles               = max_cycles
         self.debug                    = debug
         self.backend                  = backend
@@ -643,6 +714,8 @@ class MultiAgent:
         prev_n_correct:    int        = -1
         no_improve_count:  int        = 0
         coder_attempt:     int        = 0
+        decomp_tried:      bool       = False
+        verifier_attempts: int        = 0
 
         while cycle < self.max_cycles:
 
@@ -696,6 +769,7 @@ class MultiAgent:
                 hyp_index     += 1
                 coder_feedback = None
                 coder_attempt  = 0
+                decomp_tried   = False
                 continue
 
             coder_feedback = None
@@ -714,7 +788,8 @@ class MultiAgent:
                     "cycle": cycle, "agent": "coder",
                     "hypothesis_index": hyp_index, "error": "no_code_block",
                 })
-                hyp_index += 1
+                hyp_index    += 1
+                decomp_tried  = False
                 continue
 
             eval_result = sandbox.evaluate_code(code, task)
@@ -734,6 +809,30 @@ class MultiAgent:
             })
 
             if eval_result["all_correct"]:
+                if self.use_verifier and verifier_attempts < 2:
+                    try:
+                        ver_result = self._verifier.verify(
+                            code, task_description, training_examples, eval_result
+                        )
+                    except Exception:
+                        ver_result = {"passes": True, "issues": "", "suggestion": ""}
+
+                    log.append({
+                        "cycle":   cycle,
+                        "agent":   "verifier",
+                        "verdict": "pass" if ver_result["passes"] else "fail",
+                    })
+
+                    if not ver_result["passes"]:
+                        verifier_attempts += 1
+                        coder_feedback = (
+                            f"The Verifier flagged potential issues:\n"
+                            f"ISSUES: {ver_result['issues']}\n"
+                            f"SUGGESTION: {ver_result['suggestion']}"
+                        )
+                        # Continue the loop so the Coder can fix the fragility
+                        continue
+
                 return {
                     "success":      True,
                     "test_correct": self._evaluate_test(best_code, test_pair) if has_test_ground_truth else None,
@@ -750,10 +849,31 @@ class MultiAgent:
 
             _hypothesis_stuck = (n_correct == 0 and no_improve_count >= 2)
             if _hypothesis_stuck:
-                if self.debug:
-                    print(f"[debug] Stuck at 0/{eval_result['n_total']} — skipping Critic, next hyp")
-                hyp_index    += 1
-                coder_attempt = 0
+                if self.use_decomposer and not decomp_tried:
+                    if self.debug:
+                        print(f"[debug] Stuck — invoking Decomposer")
+                    try:
+                        decomp_result = self._decomposer.decompose(
+                            task_description,
+                            training_examples,
+                            stuck_approaches=current_hypothesis,
+                        )
+                    except Exception:
+                        decomp_result = None
+
+                    if decomp_result:
+                        hypotheses[hyp_index] = decomp_result
+                        log.append({"cycle": cycle, "agent": "decomposer"})
+
+                    coder_attempt    = 0
+                    no_improve_count = 0
+                    decomp_tried     = True
+                else:
+                    if self.debug:
+                        print(f"[debug] Stuck at 0/{eval_result['n_total']} — skipping Critic, next hyp")
+                    hyp_index    += 1
+                    coder_attempt = 0
+                    decomp_tried  = False
                 continue
 
             cycle += 1
@@ -763,7 +883,7 @@ class MultiAgent:
                 critic_result = self._critic.analyze(
                     current_hypothesis, code,
                     _format_error_info(eval_result),
-                    _format_diff(eval_result),
+                    _format_spatial_diff(eval_result),
                 )
             except Exception as e:
                 log.append({"cycle": cycle, "agent": "critic", "error": str(e)})
@@ -784,6 +904,7 @@ class MultiAgent:
                 hyp_feedback  = critic_result["feedback"]
                 hyp_index    += 1
                 coder_attempt = 0
+                decomp_tried  = False
             else:
                 coder_feedback = critic_result["feedback"]
 

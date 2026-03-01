@@ -14,10 +14,39 @@ from typing import Callable
 
 import numpy as np
 
-from .grid import Grid, grids_equal, load_task, unique_colors
+from .grid import Grid, grids_equal, load_task, unique_colors, background_color
 
 
 TransformFn = Callable[[Grid], Grid]
+
+
+# ---------------------------------------------------------------------------
+# Object counting helper
+# ---------------------------------------------------------------------------
+
+def _count_objects_total(grid: Grid) -> int:
+    """Count 4-connected components of non-background cells."""
+    if grid.size == 0:
+        return 0
+    bg = background_color(grid)
+    rows, cols = grid.shape
+    visited = np.zeros((rows, cols), dtype=bool)
+    count = 0
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r, c] != bg and not visited[r, c]:
+                count += 1
+                color = grid[r, c]
+                stack = [(r, c)]
+                while stack:
+                    cr, cc = stack.pop()
+                    if cr < 0 or cr >= rows or cc < 0 or cc >= cols:
+                        continue
+                    if visited[cr, cc] or grid[cr, cc] != color:
+                        continue
+                    visited[cr, cc] = True
+                    stack.extend([(cr+1,cc),(cr-1,cc),(cr,cc+1),(cr,cc-1)])
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -97,20 +126,32 @@ def evaluate_directory(
 # Continuous fitness for PSO
 # ---------------------------------------------------------------------------
 
-def calculate_continuous_fitness(pred_grid: Grid | None, target_grid: Grid) -> float:
+def calculate_continuous_fitness(
+    pred_grid: Grid | None,
+    target_grid: Grid,
+    progress: float | None = None,
+) -> float:
     """Compute a smooth fitness score in [0.0, 1.0] comparing pred to target.
 
     Used by the PSO swarm to obtain a gradient signal beyond binary pass/fail.
 
-    Component weights:
+    When progress is None (default), uses fixed 3-component weights:
       - Dimension score  (20%): Does the output have the right shape?
       - Color palette    (30%): Jaccard index of unique colour sets.
       - Pixel accuracy   (50%): Fraction of correct pixels (or IoU overlap
                                 region score when dimensions differ).
 
+    When progress ∈ [0, 1], uses 4-component curriculum weights that
+    transition from shape/palette matching early to pixel exactness late:
+      - Dimension score  (30%→10%)
+      - Color palette    (30%→15%)
+      - Object count     (20%→10%)
+      - Pixel accuracy   (20%→65%)
+
     Args:
         pred_grid:   The predicted output grid (may be None on hard failure).
         target_grid: The ground-truth output grid.
+        progress:    Iteration progress in [0, 1], or None for fixed weights.
 
     Returns:
         Fitness in [0.0, 1.0].  Returns 0.0 if pred_grid is None.
@@ -155,4 +196,20 @@ def calculate_continuous_fitness(pred_grid: Grid | None, target_grid: Grid) -> f
         matches        = int(np.sum(overlap_pred == overlap_target))
         pixel_score    = matches / (tr * tc)   # denominator = full target area
 
-    return 0.20 * dim_score + 0.30 * color_score + 0.50 * pixel_score
+    if progress is None:
+        return 0.20 * dim_score + 0.30 * color_score + 0.50 * pixel_score
+
+    # -- Object count score (curriculum mode only) -----------------------
+    pred_count   = _count_objects_total(pred_grid)
+    target_count = _count_objects_total(target_grid)
+    if max(pred_count, target_count) == 0:
+        object_score = 1.0
+    else:
+        object_score = min(pred_count, target_count) / max(pred_count, target_count)
+
+    p = max(0.0, min(1.0, progress))
+    w_dim   = 0.30 - 0.20 * p   # 30%→10%
+    w_color = 0.30 - 0.15 * p   # 30%→15%
+    w_obj   = 0.20 - 0.10 * p   # 20%→10%
+    w_pixel = 0.20 + 0.45 * p   # 20%→65%
+    return w_dim * dim_score + w_color * color_score + w_obj * object_score + w_pixel * pixel_score

@@ -5,7 +5,14 @@ import numpy as np
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agents.ensemble import Ensemble, _majority_vote, _vote_summary, _grids_equal
+from agents.ensemble import (
+    Ensemble,
+    _majority_vote,
+    _pixel_majority_vote,
+    _vote_summary,
+    _grids_equal,
+    _check_prediction,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +120,11 @@ class TestEnsembleSolve:
         ens.hypothesizer_max_tokens  = 1024
         ens.coder_max_tokens         = 1024
         ens.critic_max_tokens        = 1024
+        ens.near_miss_threshold      = 0.85
+        ens.near_miss_weight         = 0.5
+        ens.max_corrections          = 2
+        ens.use_correction           = False   # disabled by default so existing tests pass
+        ens._correction_client       = MagicMock()
 
         mock_orch = MagicMock()
         mock_orch.solve.side_effect = orchestrator_results
@@ -131,10 +143,10 @@ class TestEnsembleSolve:
         ],
     }
 
-    def _orch_result(self, code: str | None) -> dict:
+    def _orch_result(self, code: str | None, fitness: float = 1.0, perfect: bool = True) -> dict:
         if code is None:
             return {"candidates": []}
-        return {"candidates": [{"code": code}]}
+        return {"candidates": [{"code": code, "fitness": fitness, "perfect": perfect}]}
 
     def _make_unique_codes(self, n: int) -> list[str]:
         """Return n syntactically valid but distinct transform functions."""
@@ -201,3 +213,205 @@ class TestEnsembleSolve:
         ens = self._make_ensemble([{"candidates": []}] * 5)
         pred = ens.predict(self.TASK)
         assert pred is None   # no candidates → None
+
+
+# ---------------------------------------------------------------------------
+# _pixel_majority_vote
+# ---------------------------------------------------------------------------
+
+class TestPixelMajorityVote:
+    def test_empty_returns_none(self):
+        assert _pixel_majority_vote([]) is None
+
+    def test_single_grid(self):
+        g = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        result = _pixel_majority_vote([g])
+        np.testing.assert_array_equal(result, g)
+
+    def test_pixel_majority(self):
+        a = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        b = np.array([[1, 0], [3, 4]], dtype=np.int32)
+        # a and b agree on all pixels except [0,1]; a wins 2-to-1 at [0,1]
+        result = _pixel_majority_vote([a, a, b])
+        np.testing.assert_array_equal(result, a)
+
+    def test_weighted_vote(self):
+        a = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        b = np.array([[1, 0], [3, 4]], dtype=np.int32)
+        # b has higher weight so wins at [0,1] even though a has more grids
+        result = _pixel_majority_vote([a, b], weights=[0.3, 1.0])
+        np.testing.assert_array_equal(result, b)
+
+    def test_different_shapes_uses_most_weighted_shape(self):
+        a = np.array([[1, 2], [3, 4]], dtype=np.int32)     # 2×2, weight=2.0
+        b = np.array([[9, 8, 7]], dtype=np.int32)          # 1×3, weight=0.5
+        # 2×2 shape has higher aggregate weight → b is ignored
+        result = _pixel_majority_vote([a, b, a], weights=[1.0, 0.5, 1.0])
+        np.testing.assert_array_equal(result, a)
+
+
+# ---------------------------------------------------------------------------
+# _check_prediction
+# ---------------------------------------------------------------------------
+
+class TestCheckPrediction:
+    TASK = {
+        "train": [
+            {"input":  np.array([[1, 2]], dtype=np.int32),
+             "output": np.array([[1, 2]], dtype=np.int32)},
+        ],
+        "test": [
+            {"input":  np.array([[3, 4]], dtype=np.int32)},
+        ],
+    }
+    PREDICTION = np.array([[3, 4]], dtype=np.int32)
+
+    def _make_client(self, response: str):
+        client = MagicMock()
+        client.generate.return_value = response
+        return client
+
+    def test_accept_response(self):
+        client = self._make_client("VERDICT: ACCEPT\nREASON: looks good")
+        result = _check_prediction(self.PREDICTION, self.TASK, client)
+        assert result["accept"] is True
+        assert result["reason"] == "looks good"
+
+    def test_reject_response(self):
+        client = self._make_client("VERDICT: REJECT\nREASON: wrong color")
+        result = _check_prediction(self.PREDICTION, self.TASK, client)
+        assert result["accept"] is False
+        assert result["reason"] == "wrong color"
+
+    def test_exception_is_fail_safe(self):
+        client = MagicMock()
+        client.generate.side_effect = RuntimeError("connection error")
+        result = _check_prediction(self.PREDICTION, self.TASK, client)
+        assert result["accept"] is True
+        assert result["reason"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Candidate filtering (perfect_pool vs near_miss_pool)
+# ---------------------------------------------------------------------------
+
+class TestCandidateFiltering(TestEnsembleSolve):
+    """Tests for near-miss threshold filtering in Ensemble.solve()."""
+
+    TASK = TestEnsembleSolve.TASK
+    IDENTITY_CODE = TestEnsembleSolve.IDENTITY_CODE
+
+    def test_perfect_candidate_in_perfect_pool(self):
+        results = [self._orch_result(self.IDENTITY_CODE, fitness=1.0, perfect=True)]
+        ens = self._make_ensemble(results)
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        assert result["success"] is True
+        assert result["candidates"][0]["weight"] == 1.0
+
+    def test_near_miss_included(self):
+        nm_code = "def transform(input_grid):\n    return input_grid.copy()  # near"
+        results = [self._orch_result(nm_code, fitness=0.9, perfect=False)]
+        ens = self._make_ensemble(results)
+        ens.near_miss_threshold = 0.85
+        ens.near_miss_weight    = 0.5
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        assert result["success"] is True
+        assert result["candidates"][0]["weight"] == 0.5
+
+    def test_low_fitness_excluded(self):
+        low_code = "def transform(input_grid):\n    return input_grid.copy()  # low"
+        results = [self._orch_result(low_code, fitness=0.5, perfect=False)]
+        ens = self._make_ensemble(results)
+        ens.near_miss_threshold = 0.85
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        assert result["success"] is False
+        assert result["candidates"] == []
+
+
+# ---------------------------------------------------------------------------
+# Self-correction loop
+# ---------------------------------------------------------------------------
+
+class TestSelfCorrectionLoop(TestEnsembleSolve):
+    """Tests for the critic-driven self-correction loop in Ensemble.solve()."""
+
+    TASK = TestEnsembleSolve.TASK
+
+    def _make_correction_ensemble(
+        self,
+        orchestrator_results: list[dict],
+        critic_responses: list[str],
+        max_corrections: int = 2,
+    ) -> Ensemble:
+        ens = self._make_ensemble(orchestrator_results)
+        ens.use_correction  = True
+        ens.max_corrections = max_corrections
+        mock_client = MagicMock()
+        mock_client.generate.side_effect = critic_responses
+        ens._correction_client = mock_client
+        return ens
+
+    def test_use_correction_false_skips_critic(self):
+        codes = self._make_unique_codes(1)
+        results = [self._orch_result(codes[0])]
+        ens = self._make_ensemble(results)
+        ens.use_correction = False
+        ens.max_runs = 1
+        ens.solve(self.TASK)
+        ens._correction_client.generate.assert_not_called()
+
+    def test_critic_accepts_first_prediction(self):
+        codes   = self._make_unique_codes(1)
+        results = [self._orch_result(codes[0])]
+        ens = self._make_correction_ensemble(
+            results,
+            critic_responses=["VERDICT: ACCEPT\nREASON: fine"],
+        )
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        assert result["success"] is True
+        assert result["corrections_done"] == 0
+
+    def test_critic_rejects_leading_group_revotes(self):
+        # Build two distinct codes that produce different outputs
+        code_a = "def transform(input_grid):\n    return input_grid.copy()  # A"
+        code_b = "def transform(input_grid):\n    import numpy as np; return np.zeros_like(input_grid)"
+
+        # code_a appears twice, code_b once
+        results = [
+            {"candidates": [
+                {"code": code_a, "fitness": 1.0, "perfect": True},
+                {"code": code_a + " ", "fitness": 1.0, "perfect": True},  # distinct code, same output
+                {"code": code_b, "fitness": 1.0, "perfect": True},
+            ]}
+        ]
+        ens = self._make_correction_ensemble(
+            results,
+            # first REJECT → exclude leading group, second ACCEPT
+            critic_responses=[
+                "VERDICT: REJECT\nREASON: inconsistent",
+                "VERDICT: ACCEPT\nREASON: ok",
+            ],
+            max_corrections=2,
+        )
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        assert result["corrections_done"] >= 1
+
+    def test_max_corrections_cap(self):
+        codes = self._make_unique_codes(3)
+        results = [{"candidates": [
+            {"code": c, "fitness": 1.0, "perfect": True} for c in codes
+        ]}]
+        # Critic always rejects
+        ens = self._make_correction_ensemble(
+            results,
+            critic_responses=["VERDICT: REJECT\nREASON: bad"] * 10,
+            max_corrections=2,
+        )
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        assert result["corrections_done"] <= 2

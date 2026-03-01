@@ -43,6 +43,7 @@ def make_orchestrator(**kwargs) -> PSOOrchestrator:
         temperature=0.5,
         max_tokens=512,
         timeout=10.0,
+        embed_mode="code",   # keep existing tests unaffected
         debug=False,
     )
     defaults.update(kwargs)
@@ -397,7 +398,7 @@ class TestSolveBudgetExhausted:
         orch._llm.embed_code = MagicMock(return_value=unit_vec(768, seed=31))
 
         result = orch.solve(SIMPLE_TASK)
-        iter_logs = [e for e in result["log"] if "iteration" in e]
+        iter_logs = [e for e in result["log"] if "particles" in e]
         assert len(iter_logs) == 2   # == max_iterations
 
 
@@ -458,3 +459,130 @@ class TestPredict:
         orch._llm.embed_code = MagicMock(return_value=unit_vec(768, seed=99))
         pred = orch.predict(SIMPLE_TASK)
         assert pred is None or isinstance(pred, np.ndarray)
+
+
+# ---------------------------------------------------------------------------
+# _embed_behavior and _pos_from_eval
+# ---------------------------------------------------------------------------
+
+class TestEmbedBehavior:
+    def test_returns_unit_norm_with_precomputed_eval(self):
+        """With a pre-computed eval_result, no sandbox call is needed."""
+        orch = make_orchestrator(embed_mode="behavioral")
+        emb  = unit_vec(768, seed=42)
+        orch._llm.embed_code = MagicMock(return_value=emb * 2.0)  # unnormalised
+
+        eval_result = {
+            "pairs": [
+                {
+                    "predicted": np.array([[1, 2], [3, 4]], dtype=np.int32),
+                    "expected":  np.array([[1, 2], [3, 4]], dtype=np.int32),
+                    "correct":   True,
+                    "error":     None,
+                }
+            ],
+            "n_correct": 1, "n_total": 1, "all_correct": True,
+        }
+        result = orch._embed_behavior(
+            IDENTITY_CODE, SIMPLE_TASK, eval_result=eval_result
+        )
+        assert result is not None
+        assert result.shape == (768,)
+        assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
+
+    def test_falls_back_to_code_embed_on_exception(self):
+        """If embed_code raises on first call, should fall back to _embed (code mode)."""
+        orch = make_orchestrator(embed_mode="behavioral")
+        fallback_vec = unit_vec(768, seed=7)
+        call_count = {"n": 0}
+
+        def embed_side_effect(text, model=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("embedding failed")
+            return fallback_vec
+
+        orch._llm.embed_code = MagicMock(side_effect=embed_side_effect)
+        result = orch._embed_behavior(IDENTITY_CODE, SIMPLE_TASK)
+        # Should return a unit vector from fallback code embedding
+        assert result is not None
+        assert result.shape == (768,)
+
+    def test_pos_from_eval_routes_code_mode(self):
+        """_pos_from_eval with embed_mode='code' routes through _embed, not _embed_behavior."""
+        orch = make_orchestrator(embed_mode="code")
+        emb  = unit_vec(768, seed=5)
+        orch._llm.embed_code = MagicMock(return_value=emb)
+
+        eval_result = {"pairs": [], "n_correct": 0, "n_total": 0, "all_correct": False}
+        result = orch._pos_from_eval(IDENTITY_CODE, SIMPLE_TASK, eval_result)
+        assert result is not None
+        # embed_code called once (from _embed, not _embed_behavior)
+        assert orch._llm.embed_code.call_count == 1
+
+    def test_all_none_predictions_uses_zero_grids(self):
+        """When all predicted outputs are None, zero-grids are substituted."""
+        orch = make_orchestrator(embed_mode="behavioral")
+        emb  = unit_vec(768, seed=3)
+        orch._llm.embed_code = MagicMock(return_value=emb)
+
+        eval_result = {
+            "pairs": [
+                {
+                    "predicted": None,
+                    "expected":  np.array([[1, 2], [3, 4]], dtype=np.int32),
+                    "correct":   False,
+                    "error":     "RuntimeError: boom",
+                }
+            ],
+            "n_correct": 0, "n_total": 1, "all_correct": False,
+        }
+        result = orch._embed_behavior(
+            IDENTITY_CODE, SIMPLE_TASK, eval_result=eval_result
+        )
+        assert result is not None
+        assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# _crossover
+# ---------------------------------------------------------------------------
+
+class TestCrossover:
+    _TASK_DESC = "Test task"
+    _TRAIN_EX  = "Pair 1: input=[[1]] output=[[2]]"
+    _CODE_A    = "def transform(g):\n    return g + 1"
+    _CODE_B    = "def transform(g):\n    return g * 2"
+
+    def test_valid_llm_response_returns_code(self):
+        orch = make_orchestrator()
+        orch._llm.generate = MagicMock(
+            return_value=(
+                "Here is my combined solution:\n"
+                "```python\n"
+                "def transform(input_grid):\n"
+                "    return input_grid + 1\n"
+                "```"
+            )
+        )
+        result = orch._crossover(
+            self._CODE_A, self._CODE_B, self._TASK_DESC, self._TRAIN_EX
+        )
+        assert result is not None
+        assert "def transform" in result
+
+    def test_empty_llm_response_returns_none(self):
+        orch = make_orchestrator()
+        orch._llm.generate = MagicMock(return_value="No code here at all.")
+        result = orch._crossover(
+            self._CODE_A, self._CODE_B, self._TASK_DESC, self._TRAIN_EX
+        )
+        assert result is None
+
+    def test_llm_exception_returns_none(self):
+        orch = make_orchestrator()
+        orch._llm.generate = MagicMock(side_effect=RuntimeError("network error"))
+        result = orch._crossover(
+            self._CODE_A, self._CODE_B, self._TASK_DESC, self._TRAIN_EX
+        )
+        assert result is None

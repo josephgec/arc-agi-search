@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arc.sandbox import execute, evaluate_code, EXECUTION_TIMEOUT, DSL_NAMESPACE
+from arc.sandbox import execute, evaluate_code, compute_spatial_diff, EXECUTION_TIMEOUT, DSL_NAMESPACE
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +134,59 @@ class TestEvaluateCode:
 # DSL_NAMESPACE contents
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# compute_spatial_diff()
+# ---------------------------------------------------------------------------
+
+class TestComputeSpatialDiff:
+    def test_none_predicted(self):
+        exp  = np.array([[1, 0], [0, 1]], dtype=np.int32)
+        result = compute_spatial_diff(None, exp)
+        assert "no output" in result.lower()
+
+    def test_perfect_match(self):
+        grid   = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        result = compute_spatial_diff(grid, grid)
+        assert "match perfectly" in result.lower()
+
+    def test_shape_mismatch_mentions_dimensions(self):
+        pred = np.array([[1, 2, 3]], dtype=np.int32)      # 1×3
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)  # 2×2
+        result = compute_spatial_diff(pred, exp)
+        assert "1" in result and "3" in result or "shape" in result.lower() or "wrong" in result.lower()
+        # Must mention dimensions
+        assert any(char.isdigit() for char in result)
+
+    def test_same_shape_wrong_cells_mentions_region(self):
+        pred = np.array([[1, 0, 2], [0, 0, 0], [0, 0, 0]], dtype=np.int32)
+        exp  = np.array([[1, 0, 2], [0, 0, 0], [1, 0, 2]], dtype=np.int32)
+        result = compute_spatial_diff(pred, exp)
+        assert "wrong" in result.lower() or "cell" in result.lower()
+        # Should mention a region
+        assert any(word in result.lower() for word in ["top", "bottom", "left", "right", "middle", "center"])
+
+    def test_shift_detection_mentions_direction(self):
+        # Blue object at top of expected, at bottom in predicted → shifted down
+        pred = np.array([[0, 0, 0], [0, 0, 0], [1, 1, 0]], dtype=np.int32)
+        exp  = np.array([[1, 1, 0], [0, 0, 0], [0, 0, 0]], dtype=np.int32)
+        result = compute_spatial_diff(pred, exp)
+        assert any(d in result.lower() for d in ["down", "up", "shifted", "rows"])
+
+    def test_1d_array(self):
+        pred = np.array([1, 2, 3], dtype=np.int32)
+        exp  = np.array([[1, 2, 3]], dtype=np.int32)
+        result = compute_spatial_diff(pred, exp)
+        assert "non-2d" in result.lower()
+
+
 class TestDSLNamespace:
     def test_required_functions_present(self):
         required = [
             "np", "numpy", "crop", "rotate", "flip", "translate",
             "scale", "tile", "recolor", "mask", "overlay",
             "flood_fill", "find_objects", "bounding_box", "crop_to_content",
+            "pad", "symmetrize", "get_color", "get_size", "get_centroid",
+            "detect_grid_layout", "find_periodicity", "gravity",
         ]
         for name in required:
             assert name in DSL_NAMESPACE, f"Missing '{name}' from DSL_NAMESPACE"

@@ -31,7 +31,7 @@ import numpy as np
 
 OLLAMA_CHAT_URL       = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL      = "http://localhost:11434/api/embeddings"
-DEFAULT_OLLAMA_MODEL  = "qwen2.5-coder:14b"
+DEFAULT_OLLAMA_MODEL  = "deepseek-r1:14b"
 DEFAULT_EMBED_MODEL   = "nomic-embed-text"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 

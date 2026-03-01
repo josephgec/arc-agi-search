@@ -11,6 +11,7 @@ Extends MultiAgent with two additions needed by the Ensemble layer:
 from __future__ import annotations
 
 from arc import sandbox
+from arc.evaluate import calculate_continuous_fitness
 from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
 from agents.roles import Hypothesizer, Coder, Critic, ROUTE_HYPOTHESIZER
@@ -83,15 +84,26 @@ class Orchestrator(MultiAgent):
         # Monkey-patch: run base solve and capture every correct code via log
         result = super().solve(task)
 
-        # The base solve already returns the best code; add it as a candidate
+        # The base solve already returns the best code; always add it as a candidate
         if result.get("code"):
             code = result["code"].strip()
             if code not in seen:
                 seen.add(code)
-                # Verify it's actually correct (in case best_code isn't perfect)
                 eval_res = sandbox.evaluate_code(code, task)
-                if eval_res["all_correct"]:
-                    candidates.append({"code": code})
+                pairs    = eval_res.get("pairs", [])
+                fitness  = (
+                    sum(
+                        calculate_continuous_fitness(p["predicted"], p["expected"])
+                        if p.get("predicted") is not None else 0.0
+                        for p in pairs if p.get("expected") is not None
+                    ) / len(pairs)
+                    if pairs else 0.0
+                )
+                candidates.append({
+                    "code":    code,
+                    "fitness": round(fitness, 6),
+                    "perfect": eval_res["all_correct"],
+                })
 
         result["candidates"] = candidates
         return result

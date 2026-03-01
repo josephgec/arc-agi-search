@@ -45,7 +45,11 @@ def make_agent(
     hyp_responses=None,
     code_responses=None,
     critic_responses=None,
+    decomposer_responses=None,
+    verifier_responses=None,
     max_cycles: int = 9,
+    use_decomposer: bool = True,
+    use_verifier: bool = True,
 ) -> MultiAgent:
     agent = MultiAgent.__new__(MultiAgent)
     agent.max_cycles               = max_cycles
@@ -61,6 +65,8 @@ def make_agent(
     agent.hypothesizer_max_tokens  = 1024
     agent.coder_max_tokens         = 1024
     agent.critic_max_tokens        = 1024
+    agent.use_decomposer           = use_decomposer
+    agent.use_verifier             = use_verifier
 
     hyp = MagicMock()
     if hyp_responses:
@@ -85,9 +91,25 @@ def make_agent(
             "feedback": "fix the code",
         }
 
+    decomposer = MagicMock()
+    if decomposer_responses:
+        decomposer.decompose.side_effect = decomposer_responses
+    else:
+        decomposer.decompose.return_value = (
+            "1. Identify the pattern.\n2. Apply the transformation.\n3. Return result."
+        )
+
+    verifier = MagicMock()
+    if verifier_responses:
+        verifier.verify.side_effect = verifier_responses
+    else:
+        verifier.verify.return_value = {"passes": True, "issues": "", "suggestion": ""}
+
     agent._hypothesizer = hyp
     agent._coder        = coder
     agent._critic       = critic
+    agent._decomposer   = decomposer
+    agent._verifier     = verifier
     return agent
 
 
@@ -237,6 +259,8 @@ class TestOrchestratorSolve:
         orch.hypothesizer_max_tokens  = 1024
         orch.coder_max_tokens         = 1024
         orch.critic_max_tokens        = 1024
+        orch.use_decomposer           = False
+        orch.use_verifier             = False
 
         hyp = MagicMock()
         hyp.generate.return_value = THREE_HYPS
@@ -247,9 +271,17 @@ class TestOrchestratorSolve:
         critic = MagicMock()
         critic.analyze.return_value = {"route": ROUTE_CODER, "feedback": "fix"}
 
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = "1. Step one.\n2. Step two."
+
+        verifier = MagicMock()
+        verifier.verify.return_value = {"passes": True, "issues": "", "suggestion": ""}
+
         orch._hypothesizer = hyp
         orch._coder        = coder
         orch._critic       = critic
+        orch._decomposer   = decomposer
+        orch._verifier     = verifier
         return orch
 
     def test_candidates_key_present(self):
@@ -287,3 +319,123 @@ class TestResultSchema:
         result = agent.solve(SIMPLE_TASK)
         for entry in result["log"]:
             assert "cycle" in entry or "phase" in entry
+
+
+# ---------------------------------------------------------------------------
+# TestDecomposerIntegration
+# ---------------------------------------------------------------------------
+
+class TestDecomposerIntegration:
+    def test_decomposer_called_when_stuck_at_zero(self):
+        """Decomposer invoked after stagnation (n_correct=0, no_improve_count>=2).
+
+        The stagnation state can only accumulate at hyp_index > 0, because the
+        loop resets prev_n_correct / no_improve_count when hyp_index == 0.
+        We therefore route the first Critic call to HYPOTHESIZER (advancing
+        hyp_index to 1), then route subsequent calls to CODER so stagnation
+        can accumulate.
+        """
+        call_count = {"n": 0}
+
+        def code_side_effect(*a, **kw):
+            call_count["n"] += 1
+            # First 5 calls produce wrong code; from 6th onward produce correct code
+            if call_count["n"] <= 5:
+                return "```python\n" + WRONG_CODE + "\n```"
+            return "```python\n" + IDENTITY_CODE + "\n```"
+
+        critic_seq = (
+            [{"route": ROUTE_HYPOTHESIZER, "feedback": "wrong hypothesis"}]  # advance hyp_index→1
+            + [{"route": ROUTE_CODER, "feedback": "fix"}] * 10
+        )
+
+        agent = make_agent(
+            code_responses=code_side_effect,
+            critic_responses=critic_seq,
+            max_cycles=20,
+            use_decomposer=True,
+            use_verifier=False,
+        )
+        agent.solve(SIMPLE_TASK)
+        # Decomposer must have been called at least once
+        assert agent._decomposer.decompose.called
+
+    def test_decomposer_skipped_when_use_decomposer_false(self):
+        """When use_decomposer=False, Decomposer is never called."""
+        agent = make_agent(
+            code_responses=["```python\n" + WRONG_CODE + "\n```"] * 20,
+            critic_responses=[{"route": ROUTE_CODER, "feedback": "fix"}] * 20,
+            max_cycles=8,
+            use_decomposer=False,
+            use_verifier=False,
+        )
+        agent.solve(SIMPLE_TASK)
+        agent._decomposer.decompose.assert_not_called()
+
+    def test_decomposer_replaces_hypothesis_and_loop_continues(self):
+        """After Decomposer runs, the loop should continue with the new hypothesis."""
+        call_count = {"n": 0}
+
+        def code_side_effect(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] <= 3:
+                return "```python\n" + WRONG_CODE + "\n```"
+            return "```python\n" + IDENTITY_CODE + "\n```"
+
+        agent = make_agent(
+            code_responses=code_side_effect,
+            max_cycles=15,
+            use_decomposer=True,
+            use_verifier=False,
+        )
+        result = agent.solve(SIMPLE_TASK)
+        # Loop must continue after decomposer (eventually succeeds)
+        assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# TestVerifierIntegration
+# ---------------------------------------------------------------------------
+
+class TestVerifierIntegration:
+    def test_verifier_called_when_all_correct(self):
+        """Verifier should be invoked when all training pairs pass."""
+        agent = make_agent(use_verifier=True)
+        agent.solve(SIMPLE_TASK)
+        assert agent._verifier.verify.called
+
+    def test_verifier_pass_accepts_solution(self):
+        """When Verifier passes, solve() returns success."""
+        agent = make_agent(
+            verifier_responses=[{"passes": True, "issues": "", "suggestion": ""}],
+            use_verifier=True,
+        )
+        result = agent.solve(SIMPLE_TASK)
+        assert result["success"] is True
+
+    def test_verifier_fail_sends_feedback_to_coder(self):
+        """When Verifier fails, the loop continues and Coder gets the verifier feedback."""
+        call_count = {"n": 0}
+
+        def verifier_side_effect(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return {"passes": False, "issues": "Hardcoded shape", "suggestion": "Use dynamic shape"}
+            return {"passes": True, "issues": "", "suggestion": ""}
+
+        agent = make_agent(
+            verifier_responses=verifier_side_effect,
+            max_cycles=15,
+            use_verifier=True,
+            use_decomposer=False,
+        )
+        result = agent.solve(SIMPLE_TASK)
+        # Verifier called at least twice (fail then pass)
+        assert agent._verifier.verify.call_count >= 2
+        assert result["success"] is True
+
+    def test_verifier_skipped_when_use_verifier_false(self):
+        """When use_verifier=False, Verifier is never called."""
+        agent = make_agent(use_verifier=False, use_decomposer=False)
+        agent.solve(SIMPLE_TASK)
+        agent._verifier.verify.assert_not_called()

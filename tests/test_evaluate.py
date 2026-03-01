@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arc.evaluate import calculate_continuous_fitness, evaluate_task, evaluate_directory
+from arc.evaluate import calculate_continuous_fitness, evaluate_task, evaluate_directory, _count_objects_total
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +126,78 @@ class TestEvaluateTask:
 # ---------------------------------------------------------------------------
 # evaluate_directory
 # ---------------------------------------------------------------------------
+
+class TestCountObjectsTotal:
+    def test_empty_grid(self):
+        g = np.zeros((0, 0), dtype=np.int32)
+        assert _count_objects_total(g) == 0
+
+    def test_single_blob(self):
+        # One connected region of color 1 against background 0
+        g = np.array([[0, 1, 1],
+                      [0, 1, 0],
+                      [0, 0, 0]], dtype=np.int32)
+        assert _count_objects_total(g) == 1
+
+    def test_two_disjoint_same_color_blobs(self):
+        g = np.array([[1, 0, 1],
+                      [0, 0, 0],
+                      [0, 0, 0]], dtype=np.int32)
+        assert _count_objects_total(g) == 2
+
+    def test_two_adjacent_different_colors(self):
+        # Colors 1 and 2 touching against zero background — each is its own component
+        g = np.array([[0, 1, 2, 0]], dtype=np.int32)
+        assert _count_objects_total(g) == 2
+
+
+class TestDynamicFitnessWeighting:
+    def test_perfect_match_progress_none(self):
+        g = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        assert calculate_continuous_fitness(g, g) == pytest.approx(1.0)
+
+    def test_color_jaccard_formula_unchanged_with_progress_none(self):
+        # Reproduce existing test_color_jaccard_partial with progress=None
+        pred   = np.array([[0, 1]], dtype=np.int32)
+        target = np.array([[0, 2]], dtype=np.int32)
+        f = calculate_continuous_fitness(pred, target, progress=None)
+        expected = 0.20 * 1.0 + 0.30 * (1/3) + 0.50 * 0.5
+        assert f == pytest.approx(expected, abs=0.01)
+
+    def test_progress_values_in_unit_interval(self):
+        pred   = np.array([[1, 0]], dtype=np.int32)
+        target = np.array([[1, 2]], dtype=np.int32)
+        for p in [0.0, 0.25, 0.5, 0.75, 1.0]:
+            f = calculate_continuous_fitness(pred, target, progress=p)
+            assert 0.0 <= f <= 1.0, f"progress={p} gave f={f}"
+
+    def test_early_vs_late_pixel_weight(self):
+        # Pixel-perfect but object count mismatch: at progress=1.0 pixel dominates
+        # so the score should be higher (pixel accuracy=1.0 gets 65% weight late)
+        pred   = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        target = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        early  = calculate_continuous_fitness(pred, target, progress=0.0)
+        late   = calculate_continuous_fitness(pred, target, progress=1.0)
+        # Both should be 1.0 for perfect match
+        assert early == pytest.approx(1.0)
+        assert late  == pytest.approx(1.0)
+
+    def test_object_count_mismatch_reduces_score(self):
+        # pred has 1 object, target has 3; otherwise same palette & shape
+        pred   = np.array([[1, 0, 0],
+                           [0, 0, 0]], dtype=np.int32)
+        target = np.array([[1, 0, 1],
+                           [0, 0, 1]], dtype=np.int32)
+        f_mismatch = calculate_continuous_fitness(pred, target, progress=0.5)
+        # Compare against perfect object match (same grids)
+        f_perfect  = calculate_continuous_fitness(target, target, progress=0.5)
+        assert f_mismatch < f_perfect
+
+    def test_perfect_match_late_progress(self):
+        g = np.array([[1, 2, 3]], dtype=np.int32)
+        f = calculate_continuous_fitness(g, g, progress=1.0)
+        assert f == pytest.approx(1.0)
+
 
 class TestEvaluateDirectory:
     def test_single_file(self, tmp_task_file):

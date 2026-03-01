@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 
 from agents.llm_client import LLMClient
+from agents.dsl_reference import _DSL_REFERENCE
 
 # ---------------------------------------------------------------------------
 # Routing constants
@@ -45,24 +46,18 @@ Rules:
 - Do NOT repeat the same idea with minor wording changes.
 """
 
-_CODER_SYSTEM = """\
-You are an expert Python programmer solving ARC-AGI grid transformations.
-Translate the given hypothesis into a Python function called `transform` that
-takes `input_grid: np.ndarray` and returns `np.ndarray`.
-
-Available DSL primitives (already imported — do NOT re-import):
-  crop, rotate, flip, translate, scale, tile,
-  recolor, mask, overlay, flood_fill,
-  find_objects, bounding_box, crop_to_content,
-  pad, symmetrize, np
-
-Rules:
-- Return ONLY a single ```python … ``` code block.
-- The function must be called `transform`.
-- Use only the DSL primitives listed above plus plain Python/numpy.
-- The function must handle every training example shown.
-- No print statements, no side effects, no I/O.
-"""
+_CODER_SYSTEM = (
+    "You are an expert Python programmer solving ARC-AGI grid transformations.\n"
+    "Translate the given hypothesis into a Python function called `transform` that\n"
+    "takes `input_grid: np.ndarray` and returns `np.ndarray`.\n\n"
+    + _DSL_REFERENCE
+    + "\nRules:\n"
+    "- Return ONLY a single ```python \u2026 ``` code block.\n"
+    "- The function must be called `transform`.\n"
+    "- Use only the DSL primitives listed above plus plain Python/numpy.\n"
+    "- The function must handle every training example shown.\n"
+    "- No print statements, no side effects, no I/O.\n"
+)
 
 _CRITIC_SYSTEM = """\
 You are an expert ARC-AGI code debugger.  Analyse why the current Python
@@ -81,33 +76,30 @@ Rules:
 - ROUTE must be exactly "hypothesizer" or "coder" (lowercase).
 - FEEDBACK must immediately follow on the next line.
 - Be specific: quote actual cell values, mention which pairs fail, suggest fixes.
+
+You will receive a spatial diff describing WHERE errors occur geometrically.
+Use spatially-grounded language in your feedback: reference directions
+(left/right/up/down), color names, and object positions rather than raw cell coordinates.
 """
 
-_PSO_CODER_SYSTEM = """\
-You are a specialised code-mutation agent in a Particle Swarm Optimization
-loop solving ARC-AGI puzzles.  You will be given two reference solutions
-(personal best and global best) together with their fitness scores, and you
-must generate {k} DISTINCT Python `transform` functions that creatively
-recombine and improve upon both.
-
-Before generating each function, briefly reason about what the current
-solutions get right, what they get wrong, and how to fix the root cause.
-
-Available DSL primitives (already imported):
-  crop, rotate, flip, translate, scale, tile,
-  recolor, mask, overlay, flood_fill,
-  find_objects, bounding_box, crop_to_content,
-  pad, symmetrize, np
-
-Rules:
-- Generate exactly {k} code blocks, each in its own ```python … ``` fence.
-- Name the functions `transform_1`, `transform_2`, … `transform_{k}`.
-- Each must be complete and executable (takes np.ndarray, returns np.ndarray).
-- Each variation should try a DIFFERENT strategy or fix — not minor wording tweaks.
-- Do NOT hardcode specific cell coordinates or shape-based if-else branches.
-- Prefer solutions that fix the systematic root cause of the listed failures.
-- No print, no I/O, no side effects.
-"""
+_PSO_CODER_SYSTEM = (
+    "You are a specialised code-mutation agent in a Particle Swarm Optimization\n"
+    "loop solving ARC-AGI puzzles.  You will be given two reference solutions\n"
+    "(personal best and global best) together with their fitness scores, and you\n"
+    "must generate {k} DISTINCT Python `transform` functions that creatively\n"
+    "recombine and improve upon both.\n\n"
+    "Before generating each function, briefly reason about what the current\n"
+    "solutions get right, what they get wrong, and how to fix the root cause.\n\n"
+    + _DSL_REFERENCE
+    + "\nRules:\n"
+    "- Generate exactly {k} code blocks, each in its own ```python \u2026 ``` fence.\n"
+    "- Name the functions `transform_1`, `transform_2`, \u2026 `transform_{k}`.\n"
+    "- Each must be complete and executable (takes np.ndarray, returns np.ndarray).\n"
+    "- Each variation should try a DIFFERENT strategy or fix \u2014 not minor wording tweaks.\n"
+    "- Do NOT hardcode specific cell coordinates or shape-based if-else branches.\n"
+    "- Prefer solutions that fix the systematic root cause of the listed failures.\n"
+    "- No print, no I/O, no side effects.\n"
+)
 
 # ---------------------------------------------------------------------------
 # Hypothesizer
@@ -245,6 +237,149 @@ class Critic:
             feedback = feedback_match.group(1).strip()
 
         return {"route": route, "feedback": feedback}
+
+
+# ---------------------------------------------------------------------------
+# Decomposer
+# ---------------------------------------------------------------------------
+
+_DECOMPOSER_SYSTEM = """\
+You are an expert ARC-AGI task analyst specialising in breaking down complex
+transformations that have resisted previous solution attempts.
+
+Given the task and failed approaches, decompose the transformation into 2–4
+numbered, concrete sub-steps in plain English.  Do NOT write any Python code.
+
+Rules:
+- Each sub-step must be actionable and specific (not vague).
+- Number them 1., 2., 3., (4.) and keep each to 1–3 sentences.
+- Refer to spatial positions (top-left, bottom-right), colors by name, and
+  object counts rather than raw coordinates.
+- If stuck approaches are given, avoid those directions entirely.
+"""
+
+
+class Decomposer:
+    """Breaks a stuck ARC task into explicit sub-steps for the swarm to solve."""
+
+    def __init__(self, client: LLMClient) -> None:
+        self._client = client
+
+    def decompose(
+        self,
+        task_description: str,
+        training_examples: str,
+        stuck_approaches: str | None = None,
+    ) -> str:
+        """Return a numbered decomposition of the transformation.
+
+        Args:
+            task_description:  Formatted ARC task (all training pairs + test input).
+            training_examples: Additional formatted training examples.
+            stuck_approaches:  Description of approaches already tried (to avoid).
+        """
+        content = f"{task_description}\n\n{training_examples}"
+        if stuck_approaches:
+            content += (
+                "\n\n--- APPROACHES THAT HAVE ALREADY FAILED ---\n"
+                + stuck_approaches
+                + "\n\nAvoid these directions. Decompose the problem differently."
+            )
+        else:
+            content += "\n\nDecompose the transformation into 2–4 concrete sub-steps."
+
+        messages = [{"role": "user", "content": content}]
+        return self._client.generate(_DECOMPOSER_SYSTEM, messages)
+
+
+# ---------------------------------------------------------------------------
+# Verifier
+# ---------------------------------------------------------------------------
+
+_VERIFIER_SYSTEM = """\
+You are a QA agent for ARC-AGI solutions.  Your job is to probe a solution for
+edge-case fragility BEFORE it is accepted as correct.
+
+Common failure modes to check:
+- Hardcoded grid shapes or specific coordinate values
+- Assumptions about input size that may not hold for unseen examples
+- Off-by-one errors at grid boundaries
+- Color assumptions (e.g. background = 0) that may not generalise
+- Logic that only works because all training examples happen to share a property
+
+Respond in EXACTLY this format:
+
+VERDICT: PASS
+ISSUES: none
+SUGGESTION: none
+
+  or
+
+VERDICT: FAIL
+ISSUES: <concise description of the fragility found>
+SUGGESTION: <concrete fix to make the code more robust>
+"""
+
+
+class Verifier:
+    """QA agent that gates acceptance of solutions by probing for fragility."""
+
+    def __init__(self, client: LLMClient) -> None:
+        self._client = client
+
+    def verify(
+        self,
+        code: str,
+        task_description: str,
+        training_examples: str,
+        eval_result: dict,
+    ) -> dict:
+        """Return {'passes': bool, 'issues': str, 'suggestion': str}.
+
+        Defaults to passes=True on malformed response or exception (fail-safe).
+
+        Args:
+            code:              The Python solution to verify.
+            task_description:  Formatted ARC task.
+            training_examples: Formatted training examples.
+            eval_result:       Result dict from sandbox.evaluate_code.
+        """
+        n_correct = eval_result.get("n_correct", 0)
+        n_total   = eval_result.get("n_total",   0)
+        content = (
+            f"{task_description}\n\n{training_examples}\n\n"
+            f"Solution code:\n```python\n{code}\n```\n\n"
+            f"Evaluation: {n_correct}/{n_total} training pairs pass.\n\n"
+            "Check for hardcoded values, size assumptions, off-by-ones, and other "
+            "edge-case fragilities.  Respond in the required format."
+        )
+        messages = [{"role": "user", "content": content}]
+        try:
+            response = self._client.generate(_VERIFIER_SYSTEM, messages)
+        except Exception:
+            return {"passes": True, "issues": "", "suggestion": ""}
+
+        try:
+            verdict_match = re.search(
+                r"VERDICT\s*:\s*(PASS|FAIL)", response, re.IGNORECASE
+            )
+            issues_match = re.search(
+                r"ISSUES\s*:\s*(.+?)(?=SUGGESTION\s*:|$)", response,
+                re.DOTALL | re.IGNORECASE,
+            )
+            suggest_match = re.search(
+                r"SUGGESTION\s*:\s*(.+)", response, re.DOTALL | re.IGNORECASE
+            )
+
+            if verdict_match is None:
+                return {"passes": True, "issues": "", "suggestion": ""}
+
+            passes     = verdict_match.group(1).upper() == "PASS"
+            issues     = issues_match.group(1).strip()  if issues_match  else ""
+            suggestion = suggest_match.group(1).strip() if suggest_match else ""
+            return {"passes": passes, "issues": issues, "suggestion": suggestion}
+        except Exception:
+            return {"passes": True, "issues": "", "suggestion": ""}
 
 
 # ---------------------------------------------------------------------------

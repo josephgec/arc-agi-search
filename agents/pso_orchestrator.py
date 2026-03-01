@@ -52,6 +52,7 @@ from arc.evaluate import calculate_continuous_fitness
 from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
 from agents.roles import PSOCoder, Hypothesizer
+from agents.dsl_reference import _DSL_REFERENCE
 from agents.multi_agent import (
     _format_task_description,
     _format_training_examples,
@@ -125,34 +126,26 @@ def _random_unit_vec(rng: np.random.Generator | None = None) -> np.ndarray:
     return v / norm if norm > 0 else v
 
 
-_INIT_CODER_SYSTEM = """\
-You are an ARC-AGI puzzle solver.  Follow these two steps:
-
-STEP 1 — REASON (write a short analysis before the code block):
-- Compare each input/output pair.  What changes and what stays the same?
-- Is this a geometric transform (rotate/flip/crop/tile), a colour operation, or object manipulation?
-- Does the output size depend on the input content?  If so, how is it computed?
-- What is the single abstract rule that generates ALL outputs from ALL inputs?
-Write 2-4 sentences summarising your conclusion.
-
-STEP 2 — CODE:
-Implement the rule as a Python function `transform(input_grid: np.ndarray) -> np.ndarray`.
-
-Available DSL (already imported — do NOT re-import):
-  crop, rotate, flip, translate, scale, tile,
-  recolor, mask, overlay, flood_fill,
-  find_objects, bounding_box, crop_to_content,
-  pad, symmetrize, np
-
-Rules:
-- After your analysis, return EXACTLY one ```python … ``` code block.
-- The function must be named `transform`.
-- No print, no I/O, no side-effects.
-- The solution must generalise to ALL training pairs, not just the first one.
-- Output shape MUST match the training outputs (check every pair's dimensions).
-- Do NOT hardcode specific cell values or coordinates from training examples.
-  Discover the abstract rule; derive everything dynamically from the input.
-"""
+_INIT_CODER_SYSTEM = (
+    "You are an ARC-AGI puzzle solver.  Follow these two steps:\n\n"
+    "STEP 1 \u2014 REASON (write a short analysis before the code block):\n"
+    "- Compare each input/output pair.  What changes and what stays the same?\n"
+    "- Is this a geometric transform (rotate/flip/crop/tile), a colour operation, or object manipulation?\n"
+    "- Does the output size depend on the input content?  If so, how is it computed?\n"
+    "- What is the single abstract rule that generates ALL outputs from ALL inputs?\n"
+    "Write 2-4 sentences summarising your conclusion.\n\n"
+    "STEP 2 \u2014 CODE:\n"
+    "Implement the rule as a Python function `transform(input_grid: np.ndarray) -> np.ndarray`.\n\n"
+    + _DSL_REFERENCE
+    + "\nRules:\n"
+    "- After your analysis, return EXACTLY one ```python \u2026 ``` code block.\n"
+    "- The function must be named `transform`.\n"
+    "- No print, no I/O, no side-effects.\n"
+    "- The solution must generalise to ALL training pairs, not just the first one.\n"
+    "- Output shape MUST match the training outputs (check every pair's dimensions).\n"
+    "- Do NOT hardcode specific cell values or coordinates from training examples.\n"
+    "  Discover the abstract rule; derive everything dynamically from the input.\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +211,7 @@ class PSOOrchestrator:
         timeout:        float      = 180.0,
         embed_timeout:  float      = 60.0,
         fitness_alpha:  float      = 0.4,
+        embed_mode:     str        = "behavioral",
         debug:          bool       = False,
     ) -> None:
         self.n_particles    = min(n_particles, len(PARTICLE_ROLES))
@@ -227,6 +221,7 @@ class PSOOrchestrator:
         self.c1             = c1
         self.c2             = c2
         self.fitness_alpha  = fitness_alpha
+        self.embed_mode     = embed_mode
         self.debug          = debug
         self.embed_model    = embed_model
 
@@ -269,7 +264,7 @@ class PSOOrchestrator:
         norm = np.linalg.norm(vec)
         return vec / norm if norm > 0 else (_random_unit_vec() if fallback_random else None)
 
-    def _eval_fitness(self, code: str, task: dict) -> tuple[float, dict]:
+    def _eval_fitness(self, code: str, task: dict, progress: float | None = None) -> tuple[float, dict]:
         """Evaluate code; return (continuous_fitness, sandbox_result)."""
         if not code or not code.strip():
             empty = {"pairs": [], "n_correct": 0, "n_total": 0, "all_correct": False}
@@ -285,10 +280,75 @@ class PSOOrchestrator:
                 total += 0.0
             else:
                 total += calculate_continuous_fitness(
-                    pair_res["predicted"], pair_res["expected"]
+                    pair_res["predicted"], pair_res["expected"], progress
                 )
         fitness = total / result["n_total"] if result["n_total"] > 0 else 0.0
         return fitness, result
+
+    def _embed_behavior(
+        self,
+        code: str,
+        task: dict,
+        eval_result: dict | None = None,
+        fallback_random: bool = True,
+    ) -> np.ndarray | None:
+        """Embed the *behavioral output* of code rather than its text.
+
+        Formats each training pair's predicted output as plain text and
+        embeds that text, so the PSO navigates a landscape of visual
+        behavior rather than textual syntax.
+
+        When eval_result is provided (pre-computed), uses it directly.
+        Otherwise runs the sandbox per pair.  Falls back to code embedding
+        on any exception.
+        """
+        try:
+            pair_texts = []
+            for i, pair in enumerate(task["train"]):
+                # Use pre-computed result if available
+                if eval_result is not None:
+                    pairs_list = eval_result.get("pairs", [])
+                    if i < len(pairs_list):
+                        pred = pairs_list[i].get("predicted")
+                    else:
+                        pred = None
+                else:
+                    pred, _ = sandbox.execute(code, pair["input"], timeout=5.0)
+
+                expected = pair["output"]
+                if pred is None:
+                    # Substitute zero grid of same shape as expected
+                    pred = np.zeros_like(np.array(expected))
+
+                pred_arr = np.array(pred)
+                exp_arr  = np.array(expected)
+                pred_text = "\n".join(" ".join(str(v) for v in row) for row in pred_arr)
+                exp_text  = "\n".join(" ".join(str(v) for v in row) for row in exp_arr)
+                pair_texts.append(f"{exp_text}\n---\n{pred_text}")
+
+            behavior_text = "\n===\n".join(pair_texts)
+            vec = self._llm.embed_code(behavior_text, model=self.embed_model)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                return (vec / norm).astype(np.float32)
+            return _random_unit_vec() if fallback_random else None
+        except Exception as exc:
+            if self.debug:
+                print(f"[PSO] Behavioral embedding error: {exc}")
+            return self._embed(code, fallback_random=fallback_random)
+
+    def _pos_from_eval(
+        self,
+        code: str,
+        task: dict,
+        eval_result: dict,
+        fallback_random: bool = True,
+    ) -> np.ndarray | None:
+        """Return a position vector after sandbox eval, using embed_mode."""
+        if self.embed_mode == "behavioral":
+            return self._embed_behavior(code, task, eval_result=eval_result,
+                                        fallback_random=fallback_random)
+        return self._embed(code, fallback_random=fallback_random)
 
     def _init_particle_code(
         self,
@@ -402,7 +462,11 @@ class PSOOrchestrator:
                 p.pos = _random_unit_vec()
                 time.sleep(10)  # backoff so Ollama can drain the timed-out request
             p.velocity = np.zeros_like(p.pos)
-            p.fitness, p.last_eval = self._eval_fitness(p.code, task)
+            p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=0.0)
+            if self.embed_mode == "behavioral":
+                beh_pos = self._embed_behavior(p.code, task, eval_result=p.last_eval)
+                if beh_pos is not None:
+                    p.pos = beh_pos
             p.update_pbest(p.code, p.pos, p.fitness)
             if self.debug:
                 print(f"  Particle {p.particle_id} ({p.role_name}): fitness={p.fitness:.4f}")
@@ -513,28 +577,27 @@ class PSOOrchestrator:
                 best_candidate = p.pbest_code  # safe fallback
                 best_emb       = p.pbest_pos.copy()
 
-                # (code, emb_or_None, dist_or_inf, fitness)
-                cand_results: list[tuple[str, np.ndarray | None, float, float]] = []
+                # (code, emb_or_None, dist_or_inf, fitness, eval_result)
+                cand_results: list[tuple[str, np.ndarray | None, float, float, dict]] = []
                 for cand in candidates:
                     if not cand or not cand.strip():
                         continue
-                    fit, _ = self._eval_fitness(cand, task)
-                    cand_results.append((cand, None, float("inf"), fit))
+                    fit, eval_res = self._eval_fitness(cand, task, progress=progress)
+                    cand_results.append((cand, None, float("inf"), fit, eval_res))
 
                 if cand_results:
                     # Priority 1: any candidate strictly improves → pick best fitness.
                     # Only embed the winner (saves k-1 embedding calls).
                     improving = [t for t in cand_results if t[3] > p.fitness + 1e-6]
                     if improving:
-                        winner_code, _, _, _ = max(improving, key=lambda x: x[3])
-                        winner_emb = self._embed(winner_code)  # fallback_random=True
+                        winner_code, _, _, _, winner_eval = max(improving, key=lambda x: x[3])
+                        best_emb = self._pos_from_eval(winner_code, task, winner_eval)
                         best_candidate = winner_code
-                        best_emb       = winner_emb
                     else:
                         # Priority 2: no improvement — embed all for PSO exploration.
                         enriched = []
-                        for c, _, _, f in cand_results:
-                            e = self._embed(c, fallback_random=False)
+                        for c, _, _, f, eval_res in cand_results:
+                            e = self._pos_from_eval(c, task, eval_res, fallback_random=False)
                             if e is None or len(e) != len(target_pos):
                                 continue
                             d = cosine(e, target_pos)
@@ -557,7 +620,7 @@ class PSOOrchestrator:
                 # ------------------------------------------------------------
                 # Step 5 — Evaluate in sandbox
                 # ------------------------------------------------------------
-                p.fitness, p.last_eval = self._eval_fitness(p.code, task)
+                p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=progress)
 
                 # ------------------------------------------------------------
                 # Step 6 — Update personal best
@@ -613,38 +676,80 @@ class PSOOrchestrator:
                 if self.debug:
                     print(
                         f"  [PSO] Stagnation ({stagnation_count} iters) — "
-                        f"reinitialising particle {worst.particle_id} ({worst.role_name})"
+                        f"trying crossover then reinitialising particle "
+                        f"{worst.particle_id} ({worst.role_name})"
                     )
-                # Use a divergence hypothesis: ask the Hypothesizer for fresh ideas
-                # explicitly different from the current best solution.
-                diverge_hyp: str | None = None
-                try:
-                    diverge_raw = self._hypothesizer.generate(
-                        task_description + "\n\n" + training_examples,
-                        feedback=(
-                            f"The current best approach (fitness={gbest_fitness:.3f}) "
-                            f"still fails.  Generate 3 COMPLETELY DIFFERENT hypotheses "
-                            f"that try different strategies — avoid the same approach."
-                        ),
+
+                # 1. Try LLM crossover between the two best particles
+                sorted_swarm = sorted(swarm, key=lambda pp: pp.pbest_fitness, reverse=True)
+                if len(sorted_swarm) >= 2:
+                    cross_code = self._crossover(
+                        sorted_swarm[0].pbest_code, sorted_swarm[1].pbest_code,
+                        task_description, training_examples,
                     )
-                    diverge_hyps = _parse_hypotheses(diverge_raw, max_n=3)
-                    if diverge_hyps:
-                        # Pick one that's different from what was used at init
-                        diverge_hyp = diverge_hyps[worst.particle_id % len(diverge_hyps)]
-                except Exception:
-                    pass
-                worst.code, generated = self._init_particle_code(
-                    worst, task_description, training_examples, hypothesis=diverge_hyp
-                )
-                if generated:
-                    worst.pos = self._embed(worst.code)
-                else:
-                    worst.pos = _random_unit_vec()
-                worst.velocity     = np.zeros_like(worst.pos)
-                worst.fitness, worst.last_eval = self._eval_fitness(worst.code, task)
-                worst.pbest_fitness = -1.0   # reset personal best to explore fresh
-                worst.update_pbest(worst.code, worst.pos, worst.fitness)
-                stagnation_count   = 0
+                    if cross_code:
+                        cross_fit, cross_eval = self._eval_fitness(
+                            cross_code, task, progress=progress
+                        )
+                        log.append({
+                            "phase": "crossover",
+                            "iteration": iteration + 1,
+                            "fitness": cross_fit,
+                        })
+                        if cross_fit > worst.pbest_fitness:
+                            worst.code      = cross_code
+                            worst.fitness   = cross_fit
+                            worst.last_eval = cross_eval
+                            worst.pos       = self._pos_from_eval(cross_code, task, cross_eval)
+                            worst.velocity  = np.zeros_like(worst.pos)
+                            worst.pbest_fitness = -1.0
+                            worst.update_pbest(worst.code, worst.pos, worst.fitness)
+                            if worst.fitness > gbest_fitness:
+                                gbest_code, gbest_pos, gbest_fitness = (
+                                    worst.code, worst.pos.copy(), worst.fitness
+                                )
+                            stagnation_count = 0
+
+                # 2. If crossover did not resolve stagnation, fall through to existing reinit
+                if stagnation_count >= stagnation_limit:
+                    # Use a divergence hypothesis: ask the Hypothesizer for fresh ideas
+                    # explicitly different from the current best solution.
+                    diverge_hyp: str | None = None
+                    try:
+                        diverge_raw = self._hypothesizer.generate(
+                            task_description + "\n\n" + training_examples,
+                            feedback=(
+                                f"The current best approach (fitness={gbest_fitness:.3f}) "
+                                f"still fails.  Generate 3 COMPLETELY DIFFERENT hypotheses "
+                                f"that try different strategies — avoid the same approach."
+                            ),
+                        )
+                        diverge_hyps = _parse_hypotheses(diverge_raw, max_n=3)
+                        if diverge_hyps:
+                            # Pick one that's different from what was used at init
+                            diverge_hyp = diverge_hyps[worst.particle_id % len(diverge_hyps)]
+                    except Exception:
+                        pass
+                    worst.code, generated = self._init_particle_code(
+                        worst, task_description, training_examples, hypothesis=diverge_hyp
+                    )
+                    if generated:
+                        worst.pos = self._embed(worst.code)
+                    else:
+                        worst.pos = _random_unit_vec()
+                    worst.velocity     = np.zeros_like(worst.pos)
+                    worst.fitness, worst.last_eval = self._eval_fitness(
+                        worst.code, task, progress=progress
+                    )
+                    if self.embed_mode == "behavioral":
+                        beh_pos = self._embed_behavior(
+                            worst.code, task, eval_result=worst.last_eval
+                        )
+                        if beh_pos is not None:
+                            worst.pos = beh_pos
+                    worst.pbest_fitness = -1.0   # reset personal best to explore fresh
+                    worst.update_pbest(worst.code, worst.pos, worst.fitness)
+                    stagnation_count = 0
 
         if self.debug:
             print(f"\n[PSO] Budget exhausted.  Best fitness: {gbest_fitness:.4f}")
@@ -664,22 +769,53 @@ class PSOOrchestrator:
     # Refinement helpers
     # ------------------------------------------------------------------
 
-    _REFINEMENT_SYSTEM = """\
-You are an expert ARC-AGI code debugger.  The provided `transform` function
-is ALMOST correct but has a systematic bug.  You will be shown which cells
-are wrong — your job is to find and fix the ROOT CAUSE in the logic.
+    _CROSSOVER_SYSTEM = (
+        "You are an expert at combining two partial ARC-AGI solutions.\n"
+        "Parent A gets some things right; Parent B gets other things right.\n"
+        "Study what each does correctly, then write a single `transform` that\n"
+        "actively merges the strongest logic from both — do NOT just pick one parent.\n\n"
+        + _DSL_REFERENCE
+        + "\nRules:\n"
+        "- Return EXACTLY one ```python \u2026 ``` code block named `transform`.\n"
+        "- Combine actual logic fragments (loops, conditions, DSL calls), not just comments.\n"
+        "- No print, no I/O, no side effects.\n"
+    )
 
-Available DSL (already imported): crop, rotate, flip, translate, scale, tile,
-recolor, mask, overlay, flood_fill, find_objects, bounding_box, crop_to_content,
-pad, symmetrize, np
+    def _crossover(
+        self,
+        code_a: str,
+        code_b: str,
+        task_description: str,
+        training_examples: str,
+    ) -> str | None:
+        """Ask the LLM to splice two parent solutions into a hybrid child."""
+        content = (
+            f"{task_description}\n\n{training_examples}\n\n"
+            f"Parent A:\n```python\n{code_a}\n```\n\n"
+            f"Parent B:\n```python\n{code_b}\n```\n\n"
+            "Write a hybrid `transform` that combines the best logic from both parents."
+        )
+        try:
+            response = self._llm.generate(
+                self._CROSSOVER_SYSTEM, [{"role": "user", "content": content}]
+            )
+            clean = _strip_thinking(response)
+            return _extract_code(clean) or _extract_code(response)
+        except Exception:
+            return None
 
-Rules:
-- Return ONLY one ```python … ``` code block named `transform`.
-- Identify the SYSTEMATIC error pattern (e.g. wrong index, off-by-one, wrong axis).
-- Fix the underlying logic — do NOT hardcode specific coordinates or add shape-based if-else.
-- The fixed function must generalise to ALL training pairs, not just patch specific cells.
-- The output shape MUST remain the same as in the training examples.
-"""
+    _REFINEMENT_SYSTEM = (
+        "You are an expert ARC-AGI code debugger.  The provided `transform` function\n"
+        "is ALMOST correct but has a systematic bug.  You will be shown which cells\n"
+        "are wrong \u2014 your job is to find and fix the ROOT CAUSE in the logic.\n\n"
+        + _DSL_REFERENCE
+        + "\nRules:\n"
+        "- Return ONLY one ```python \u2026 ``` code block named `transform`.\n"
+        "- Identify the SYSTEMATIC error pattern (e.g. wrong index, off-by-one, wrong axis).\n"
+        "- Fix the underlying logic \u2014 do NOT hardcode specific coordinates or add shape-based if-else.\n"
+        "- The fixed function must generalise to ALL training pairs, not just patch specific cells.\n"
+        "- The output shape MUST remain the same as in the training examples.\n"
+    )
 
     def _refinement_phase(
         self,

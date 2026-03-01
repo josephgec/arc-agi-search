@@ -30,6 +30,8 @@ from arc.dsl import (
     recolor, mask, overlay, flood_fill,
     find_objects, bounding_box, crop_to_content,
     pad, symmetrize,
+    get_color, get_size, get_centroid,
+    detect_grid_layout, find_periodicity, gravity,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,8 +56,14 @@ DSL_NAMESPACE: dict[str, Any] = {
     "find_objects":    find_objects,
     "bounding_box":    bounding_box,
     "crop_to_content": crop_to_content,
-    "pad":             pad,
-    "symmetrize":      symmetrize,
+    "pad":                 pad,
+    "symmetrize":          symmetrize,
+    "get_color":           get_color,
+    "get_size":            get_size,
+    "get_centroid":        get_centroid,
+    "detect_grid_layout":  detect_grid_layout,
+    "find_periodicity":    find_periodicity,
+    "gravity":             gravity,
 }
 
 
@@ -173,3 +181,152 @@ def evaluate_code(
         "n_total":     len(pairs),
         "all_correct": n_correct == len(pairs),
     }
+
+
+# ---------------------------------------------------------------------------
+# Spatial diff helpers
+# ---------------------------------------------------------------------------
+
+_SPATIAL_COLOR_NAMES: dict[int, str] = {
+    0: "black", 1: "blue",    2: "red",    3: "green",  4: "yellow",
+    5: "grey",  6: "fuschia", 7: "orange", 8: "azure",  9: "maroon",
+}
+
+
+def _bbox_str(positions: np.ndarray) -> str:
+    """Return a human-readable bounding-box string for a set of (row, col) positions."""
+    if len(positions) == 1:
+        r, c = int(positions[0, 0]), int(positions[0, 1])
+        return f"({r},{c})"
+    r1 = int(positions[:, 0].min())
+    r2 = int(positions[:, 0].max())
+    c1 = int(positions[:, 1].min())
+    c2 = int(positions[:, 1].max())
+    return f"rows {r1}–{r2}, cols {c1}–{c2}"
+
+
+def compute_spatial_diff(predicted, expected) -> str:
+    """Return a spatially-grounded natural-language description of prediction errors.
+
+    Args:
+        predicted: The predicted output grid (np.ndarray or None).
+        expected:  The expected output grid (np.ndarray or list).
+
+    Returns:
+        A string describing the spatial nature of the error.
+    """
+    expected = np.asarray(expected, dtype=np.int32)
+
+    if predicted is None:
+        return "The transform produced no output (code crashed or timed out)."
+
+    predicted = np.asarray(predicted, dtype=np.int32)
+
+    if predicted.ndim != 2:
+        return "The transform returned a non-2D array."
+
+    er, ec = expected.shape
+    pr, pc = predicted.shape
+
+    if (pr, pc) != (er, ec):
+        parts: list[str] = []
+        if pr == ec and pc == er and (pr, pc) != (er, ec):
+            parts.append(
+                f"The output appears transposed: got {pr}×{pc} but expected {er}×{ec}."
+            )
+        elif pr == er and pc != ec:
+            parts.append(
+                f"Height is correct ({pr} rows), but width is wrong: "
+                f"got {pc} cols, expected {ec} cols."
+            )
+            if ec != 0 and pc % ec == 0:
+                parts.append(f"Width is {pc // ec}× expected.")
+            elif ec != 0 and ec % pc == 0:
+                parts.append(f"Width is 1/{ec // pc} of expected.")
+        elif pc == ec and pr != er:
+            parts.append(
+                f"Width is correct ({pc} cols), but height is wrong: "
+                f"got {pr} rows, expected {er} rows."
+            )
+            if er != 0 and pr % er == 0:
+                parts.append(f"Height is {pr // er}× expected.")
+            elif er != 0 and er % pr == 0:
+                parts.append(f"Height is 1/{er // pr} of expected.")
+        else:
+            parts.append(f"Wrong shape: got {pr}×{pc}, expected {er}×{ec}.")
+
+        # Check if the overlapping region matches perfectly
+        min_r = min(pr, er)
+        min_c = min(pc, ec)
+        if min_r > 0 and min_c > 0:
+            if (predicted[:min_r, :min_c] == expected[:min_r, :min_c]).all():
+                parts.append(
+                    f"However, the overlapping {min_r}×{min_c} region matches perfectly."
+                )
+
+        return " ".join(parts)
+
+    # Same shape — find wrong cells
+    wrong_mask  = predicted != expected
+    wrong_cells = np.argwhere(wrong_mask)
+
+    if len(wrong_cells) == 0:
+        return "The prediction and expected output match perfectly."
+
+    bbox = _bbox_str(wrong_cells)
+
+    # Determine spatial quadrant of the errors
+    r_mid_lo = er // 3
+    r_mid_hi = 2 * er // 3
+    c_mid_lo = ec // 3
+    c_mid_hi = 2 * ec // 3
+
+    r_center = float(wrong_cells[:, 0].mean())
+    c_center = float(wrong_cells[:, 1].mean())
+
+    v_pos = "top" if r_center < r_mid_lo else ("bottom" if r_center > r_mid_hi else "middle")
+    h_pos = "left" if c_center < c_mid_lo else ("right" if c_center > c_mid_hi else "center")
+    quadrant = f"{v_pos}-{h_pos}"
+
+    parts = [
+        f"{len(wrong_cells)} cell(s) are wrong in the {quadrant} region (at {bbox})."
+    ]
+
+    # Per-color shift / absence detection
+    wrong_exp_colors = np.unique(expected[wrong_mask])
+    for color in wrong_exp_colors:
+        color_name    = _SPATIAL_COLOR_NAMES.get(int(color), str(color))
+        pred_positions = np.argwhere(predicted == color)
+
+        if len(pred_positions) == 0:
+            # Color absent from predicted output
+            absent_positions = np.argwhere((expected == color) & wrong_mask)
+            absent_bbox      = _bbox_str(absent_positions)
+            rep_colors       = np.unique(
+                predicted[absent_positions[:, 0], absent_positions[:, 1]]
+            )
+            rep_names = [_SPATIAL_COLOR_NAMES.get(int(c), str(c)) for c in rep_colors]
+            parts.append(
+                f"  - {color_name} region (at {absent_bbox}) is absent; "
+                f"predicted has {'/'.join(rep_names)} there."
+            )
+        else:
+            # Compare expected vs predicted centroids
+            exp_positions   = np.argwhere(expected == color)
+            exp_r = float(exp_positions[:, 0].mean())
+            exp_c = float(exp_positions[:, 1].mean())
+            pred_r = float(pred_positions[:, 0].mean())
+            pred_c = float(pred_positions[:, 1].mean())
+
+            dr = pred_r - exp_r
+            dc = pred_c - exp_c
+
+            if abs(dr) > 0.1 or abs(dc) > 0.1:
+                row_dir = "down" if dr > 0 else "up"
+                col_dir = "right" if dc > 0 else "left"
+                parts.append(
+                    f"  - {color_name} object shifted {abs(dr):.1f} rows {row_dir} "
+                    f"and {abs(dc):.1f} cols {col_dir}."
+                )
+
+    return "\n".join(parts)
