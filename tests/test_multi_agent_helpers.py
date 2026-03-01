@@ -17,9 +17,15 @@ from agents.multi_agent import (
     _format_training_examples,
     _format_error_info,
     _format_diff,
+    _format_spatial_diff,
+    _format_eval_diff,
     _grid_to_str,
+    _grid_to_rle,
+    _grid_to_sparse,
     _diff_summary,
+    _diff_annotation,
     _structural_note,
+    _output_shape_constraint,
 )
 
 
@@ -416,3 +422,257 @@ class TestStructuralNote:
         note = _structural_note(inp, out)
         assert note is not None
         assert "CYCLE" in note.upper() or "cycle" in note.lower()
+
+
+# ---------------------------------------------------------------------------
+# _grid_to_rle
+# ---------------------------------------------------------------------------
+
+class TestGridToRle:
+    def test_run_encoded_with_count(self):
+        g = np.array([[1, 1, 1]], dtype=np.int32)
+        result = _grid_to_rle(g)
+        assert "x3" in result
+
+    def test_singleton_has_no_count(self):
+        g = np.array([[5]], dtype=np.int32)
+        result = _grid_to_rle(g)
+        assert "x" not in result
+
+    def test_mixed_row(self):
+        g = np.array([[0, 0, 1]], dtype=np.int32)
+        result = _grid_to_rle(g)
+        assert "x2" in result
+
+    def test_empty_row_handled(self):
+        # 0-column grid → each row is an empty list → the `if not row:` path
+        g = np.zeros((2, 0), dtype=np.int32)
+        result = _grid_to_rle(g)
+        assert isinstance(result, str)
+
+    def test_multi_row_grid(self):
+        g = np.array([[1, 1], [2, 2]], dtype=np.int32)
+        result = _grid_to_rle(g)
+        assert "x2" in result
+
+
+# ---------------------------------------------------------------------------
+# _grid_to_sparse
+# ---------------------------------------------------------------------------
+
+class TestGridToSparse:
+    def test_all_zeros_returns_empty_message(self):
+        g = np.zeros((3, 3), dtype=np.int32)
+        result = _grid_to_sparse(g)
+        assert "empty" in result.lower()
+
+    def test_nonzero_cells_listed(self):
+        g = np.array([[0, 1, 0], [0, 0, 2]], dtype=np.int32)
+        result = _grid_to_sparse(g)
+        assert "(0,1)=1" in result
+        assert "(1,2)=2" in result
+
+
+# ---------------------------------------------------------------------------
+# _diff_annotation
+# ---------------------------------------------------------------------------
+
+class TestDiffAnnotation:
+    def test_no_changes(self):
+        g = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        result = _diff_annotation(g, g)
+        assert "no cells changed" in result
+
+    def test_many_changes_truncated(self):
+        # 5×5 all different → 25 changes > 20 → short message
+        pred = np.zeros((5, 5), dtype=np.int32)
+        out  = np.ones((5, 5), dtype=np.int32)
+        result = _diff_annotation(pred, out)
+        assert "25" in result
+
+    def test_few_changes_listed(self):
+        pred = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        out  = np.array([[1, 9], [3, 4]], dtype=np.int32)
+        result = _diff_annotation(pred, out)
+        assert "[0,1]" in result
+
+    def test_shape_mismatch_returns_none(self):
+        a = np.array([[1, 2]], dtype=np.int32)
+        b = np.array([[1], [2]], dtype=np.int32)
+        assert _diff_annotation(a, b) is None
+
+    def test_more_than_8_changes_has_ellipsis(self):
+        pred = np.zeros((3, 4), dtype=np.int32)   # 12 cells
+        out  = np.ones((3, 4), dtype=np.int32)
+        result = _diff_annotation(pred, out)
+        assert "…" in result or "12" in result
+
+
+# ---------------------------------------------------------------------------
+# _format_task_description — size dispatch paths
+# ---------------------------------------------------------------------------
+
+def _make_task(train_shape, test_shape):
+    t = np.zeros(train_shape, dtype=np.int32)
+    s = np.zeros(test_shape,  dtype=np.int32)
+    return {"train": [{"input": t, "output": t}], "test": [{"input": s}]}
+
+
+class TestFormatTaskDescriptionSizes:
+    def test_very_large_train_grid_omitted(self):
+        # >800 cells triggers "omitted" path for training pair
+        task = _make_task((30, 30), (2, 2))   # 900 train cells
+        desc = _format_task_description(task)
+        assert "omitted" in desc.lower()
+
+    def test_rle_train_grid(self):
+        # 64 cells (8×8) > 50 → RLE for training pair
+        task = _make_task((8, 8), (2, 2))
+        desc = _format_task_description(task)
+        assert "[RLE]" in desc
+
+    def test_very_large_test_input_omitted(self):
+        # Training pair tiny, test input >800 cells → omit test input
+        task = _make_task((2, 2), (30, 30))
+        desc = _format_task_description(task)
+        assert "omitted" in desc.lower()
+
+    def test_rle_test_input(self):
+        # Training pair tiny, test input 8×8=64 cells > 50 → RLE for test
+        task = _make_task((2, 2), (8, 8))
+        desc = _format_task_description(task)
+        assert "[RLE]" in desc
+
+
+# ---------------------------------------------------------------------------
+# _output_shape_constraint — variable output sizes
+# ---------------------------------------------------------------------------
+
+class TestOutputShapeConstraintVariable:
+    def test_variable_sizes_shows_guidance(self):
+        # Two training pairs with different output shapes → variable guidance
+        inp1 = np.zeros((2, 2), dtype=np.int32)
+        out1 = np.zeros((2, 2), dtype=np.int32)
+        out2 = np.zeros((3, 3), dtype=np.int32)
+        task = {"train": [
+            {"input": inp1, "output": out1},
+            {"input": inp1, "output": out2},
+        ]}
+        result = _output_shape_constraint(task)
+        assert "varies" in result.lower() or "variable" in result.lower() or "dynamically" in result.lower()
+
+    def test_variable_larger_output_noted(self):
+        inp = np.zeros((2, 2), dtype=np.int32)
+        out = np.zeros((4, 4), dtype=np.int32)
+        task = {"train": [
+            {"input": inp, "output": out},
+            {"input": inp, "output": np.zeros((3, 3), dtype=np.int32)},
+        ]}
+        result = _output_shape_constraint(task)
+        assert "larger" in result.lower() or "expanded" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# _format_eval_diff
+# ---------------------------------------------------------------------------
+
+class TestFormatEvalDiff:
+    def test_error_pair_reported(self):
+        eval_res = {"pairs": [
+            {"error": "RuntimeError: boom", "predicted": None, "expected": None, "correct": False}
+        ]}
+        result = _format_eval_diff(eval_res)
+        assert "runtime error" in result.lower()
+
+    def test_no_prediction_pair(self):
+        exp = np.array([[1, 2]], dtype=np.int32)
+        eval_res = {"pairs": [
+            {"error": None, "predicted": None, "expected": exp, "correct": False}
+        ]}
+        result = _format_eval_diff(eval_res)
+        assert "no prediction" in result.lower()
+
+    def test_shape_mismatch_pair(self):
+        pred = np.array([[1, 2, 3]], dtype=np.int32)   # 1×3
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)  # 2×2
+        eval_res = {"pairs": [
+            {"error": None, "predicted": pred, "expected": exp, "correct": False}
+        ]}
+        result = _format_eval_diff(eval_res)
+        assert "wrong shape" in result.lower() or "shape" in result.lower()
+
+    def test_excess_wrongs_truncated(self):
+        pred = np.zeros((5, 5), dtype=np.int32)
+        exp  = np.ones((5, 5), dtype=np.int32)
+        eval_res = {"pairs": [
+            {"error": None, "predicted": pred, "expected": exp, "correct": False}
+        ]}
+        result = _format_eval_diff(eval_res, max_mismatches=3)
+        assert "more wrong" in result.lower() or "…" in result
+
+    def test_empty_pairs_returns_no_diff_message(self):
+        result = _format_eval_diff({"pairs": []})
+        assert result == "No diff available"
+
+
+# ---------------------------------------------------------------------------
+# _format_diff
+# ---------------------------------------------------------------------------
+
+class TestFormatDiff:
+    def test_failing_pair_shows_diff_section(self):
+        pred = np.array([[1, 2], [3, 0]], dtype=np.int32)
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        eval_result = {"pairs": [
+            {"correct": False, "predicted": pred, "expected": exp, "error": None}
+        ]}
+        result = _format_diff(eval_result)
+        assert "Pair 1" in result
+
+    def test_all_correct_returns_short_message(self):
+        g = np.array([[1]], dtype=np.int32)
+        eval_result = {"pairs": [
+            {"correct": True, "predicted": g, "expected": g, "error": None}
+        ]}
+        result = _format_diff(eval_result)
+        assert "all pairs correct" in result.lower()
+
+    def test_failing_pair_includes_full_grids_for_small_exp(self):
+        # exp.size = 4 ≤ 200 → full grids appended to section
+        pred = np.array([[1, 2], [3, 0]], dtype=np.int32)
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        eval_result = {"pairs": [
+            {"correct": False, "predicted": pred, "expected": exp, "error": None}
+        ]}
+        result = _format_diff(eval_result)
+        assert "Full expected" in result or "Full predicted" in result
+
+
+# ---------------------------------------------------------------------------
+# _format_spatial_diff
+# ---------------------------------------------------------------------------
+
+class TestFormatSpatialDiff:
+    def test_failing_pair_described(self):
+        pred = np.array([[1, 0]], dtype=np.int32)
+        exp  = np.array([[1, 2]], dtype=np.int32)
+        eval_result = {"pairs": [
+            {"correct": False, "predicted": pred, "expected": exp, "error": None}
+        ]}
+        result = _format_spatial_diff(eval_result)
+        assert "Pair 1" in result
+
+    def test_none_expected_skipped(self):
+        eval_result = {"pairs": [
+            {"correct": False, "predicted": None, "expected": None}
+        ]}
+        result = _format_spatial_diff(eval_result)
+        assert result == "(all pairs correct)"
+
+    def test_correct_pair_skipped(self):
+        g = np.array([[1]], dtype=np.int32)
+        eval_result = {"pairs": [
+            {"correct": True, "predicted": g, "expected": g}
+        ]}
+        result = _format_spatial_diff(eval_result)
+        assert result == "(all pairs correct)"

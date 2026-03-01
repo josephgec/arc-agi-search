@@ -178,6 +178,48 @@ class TestComputeSpatialDiff:
         result = compute_spatial_diff(pred, exp)
         assert "non-2d" in result.lower()
 
+    def test_transposed_shape_detected(self):
+        # pr==ec and pc==er: 2×3 vs 3×2 → transposed message
+        pred = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)     # 2×3
+        exp  = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.int32)   # 3×2
+        result = compute_spatial_diff(pred, exp)
+        assert "transposed" in result.lower()
+
+    def test_wrong_width_double(self):
+        # pr==er, pc==2*ec: "Width is 2× expected"
+        pred = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.int32)  # 2×4
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)               # 2×2
+        result = compute_spatial_diff(pred, exp)
+        assert "width" in result.lower() or "col" in result.lower()
+
+    def test_wrong_width_fraction(self):
+        # pr==er, ec==2*pc: "Width is 1/2 of expected"
+        pred = np.array([[1], [2]], dtype=np.int32)              # 2×1
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)        # 2×2
+        result = compute_spatial_diff(pred, exp)
+        assert "width" in result.lower() or "col" in result.lower()
+
+    def test_wrong_height_double(self):
+        # pc==ec, pr==2*er: "Height is 2× expected"
+        pred = np.array([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=np.int32)  # 4×2
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)                   # 2×2
+        result = compute_spatial_diff(pred, exp)
+        assert "height" in result.lower() or "row" in result.lower()
+
+    def test_wrong_height_fraction(self):
+        # pc==ec, er==2*pr: "Height is 1/2 of expected"
+        pred = np.array([[1, 2]], dtype=np.int32)                    # 1×2
+        exp  = np.array([[1, 2], [3, 4]], dtype=np.int32)            # 2×2
+        result = compute_spatial_diff(pred, exp)
+        assert "height" in result.lower() or "row" in result.lower()
+
+    def test_overlapping_region_matches_noted(self):
+        # Top-left 2×2 of pred matches top-left 2×2 of a 3×3 exp
+        pred = np.array([[1, 2], [3, 4]], dtype=np.int32)               # 2×2
+        exp  = np.array([[1, 2, 0], [3, 4, 0], [0, 0, 0]], dtype=np.int32)  # 3×3
+        result = compute_spatial_diff(pred, exp)
+        assert "overlap" in result.lower() or "match" in result.lower()
+
 
 class TestDSLNamespace:
     def test_required_functions_present(self):

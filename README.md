@@ -54,14 +54,15 @@ arc-agi-search/
 │
 ├── agents/                     ← Agent layer
 │   ├── llm_client.py           ← Unified LLM + embedding API
-│   ├── roles.py                ← Hypothesizer, Coder, Critic, PSOCoder
-│   ├── multi_agent.py          ← Hypothesizer → Coder → Critic loop
-│   ├── orchestrator.py         ← Candidate-pooling wrapper
-│   ├── ensemble.py             ← Majority-vote ensemble
+│   ├── roles.py                ← Hypothesizer, Coder, Critic, Decomposer, Verifier, PSOCoder
+│   ├── dsl_reference.py        ← DSL primitives reference injected into LLM context
+│   ├── multi_agent.py          ← Hypothesizer → Coder → Critic loop (with Decomposer + Verifier)
+│   ├── orchestrator.py         ← Candidate-pooling wrapper (exposes fitness/perfect fields)
+│   ├── ensemble.py             ← Pixel-weighted majority-vote ensemble with self-correction
 │   ├── single_agent.py         ← Single-agent baseline
 │   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
 │
-├── tests/                      ← 254 tests, 86% coverage
+├── tests/                      ← 433 tests, 90% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -69,7 +70,7 @@ arc-agi-search/
 │
 ├── run_pso.py                  ← CLI entry point for PSO solver
 ├── run_multi_agent.py          ← Unified CLI (--strategy flag)
-├── start_ollama.sh             ← Launch Ollama with optimal settings
+├── start_ollama.sh             ← Launch Ollama with tiered model selection
 └── requirements.txt
 ```
 
@@ -233,7 +234,7 @@ After retrieval: vec = vec / ||vec||₂     # L2 normalise to unit sphere
 
 #### `agents/roles.py` — Agent Roles
 
-Four role classes, each wrapping an `LLMClient` with a purpose-built system prompt:
+Six role classes, each wrapping an `LLMClient` with a purpose-built system prompt:
 
 ```
 Hypothesizer   generates 3 competing natural-language hypotheses
@@ -246,6 +247,14 @@ Critic         reads the error diff and decides:
                ROUTE: hypothesizer  ← hypothesis is fundamentally wrong
                ROUTE: coder         ← implementation bug, same hypothesis
 
+Decomposer     fires on stagnation (≥2 consecutive non-improving cycles);
+               decomposes the task into sub-goals to break the agent out
+               of a local-minimum hypothesis
+
+Verifier       gates success — re-reads the code and training pairs and
+               confirms all_correct before the loop exits; fail-safe
+               (returns passes=True) on any malformed or missing response
+
 PSOCoder       generates K distinct Python functions that blend the
                logic of pbest and gbest to move toward the PSO target
 ```
@@ -254,7 +263,7 @@ PSOCoder       generates K distinct Python functions that blend the
 
 #### `agents/multi_agent.py` — Multi-Agent Orchestrator
 
-A **state machine** that runs up to `max_cycles` total LLM calls:
+A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 added Decomposer, Verifier, spatial diffs, and near-miss candidate collection:
 
 ```
 ┌────────────────┐
@@ -265,16 +274,23 @@ A **state machine** that runs up to `max_cycles` total LLM calls:
         │ hyp[0]
         ▼
 ┌────────────────┐     all correct?
-│     Coder      │────────────────► SUCCESS
+│     Coder      │────────────────► Verifier ──► DONE (or Coder retries)
 │  writes code   │
 └───────┬────────┘
         │ fails
         ▼
 ┌────────────────┐     ROUTE=hypothesizer ──► advance hyp index
-│     Critic     │
+│     Critic     │     (uses spatial diff: direction, region, color names)
 │  diagnoses     │     ROUTE=coder ──────────► Coder retries with feedback
+└───────┬────────┘
+        │ stagnation (≥2 non-improving cycles)
+        ▼
+┌────────────────┐
+│  Decomposer    │──── breaks task into sub-goals ──► Hypothesizer restart
 └────────────────┘
 ```
+
+`compute_spatial_diff()` produces natural-language feedback (e.g. *"object shifted 2 rows down"*, *"bottom-right region: 3 wrong cells (expected blue, got red)"*) that the Critic uses to generate targeted fix instructions.
 
 ---
 
@@ -284,20 +300,37 @@ The core contribution. See [The PSO Algorithm in Detail](#the-pso-algorithm-in-d
 
 ---
 
-#### `agents/ensemble.py` — Majority-Vote Ensemble
+#### `agents/ensemble.py` — Pixel-Weighted Majority-Vote Ensemble
 
-Runs `Orchestrator` up to `max_runs` times, pools all programs that achieve 100% on training pairs, then runs all of them on the test input and selects the **most-agreed-upon output**:
+Runs `Orchestrator` up to `max_runs` times, pools **perfect** and **near-miss** programs, then resolves the test prediction via per-pixel weighted voting and an optional Critic self-correction loop:
+
+**Candidate pools:**
+
+| Pool | Condition | Vote weight |
+|---|---|---|
+| `perfect_pool` | `all_correct == True` on training pairs | `1.0` |
+| `near_miss_pool` | fitness ≥ `near_miss_threshold` (default 0.85) | `near_miss_weight` (default 0.5) |
+
+**Pixel-level voting** (`_pixel_majority_vote`): at each `(row, col)` position, the colour with the highest total weight wins. Grids whose shape differs from the majority shape are ignored.
+
+**Self-correction loop** (`use_correction=True`, up to `max_corrections=2` rounds):
 
 ```
-Run 1 → code_A (correct) ─────────┐
-Run 2 → code_B (correct) ──────────►  execute all on test_input
-Run 3 → code_A (duplicate, skip)  │
-Run 4 → code_C (correct) ─────────┘
-
-Outputs: [grid_X, grid_Y, grid_X]
-Vote:     grid_X = 2 votes  ← WINNER
-          grid_Y = 1 vote
+Run 1 → code_A (perfect,  weight=1.0) ──┐
+Run 2 → code_B (near-miss, weight=0.5) ──┤  pixel-weighted vote per cell
+Run 3 → code_A (duplicate — skip)       │
+Run 4 → code_C (perfect,  weight=1.0) ──┘
+                                          │
+              Prediction = pixel majority vote
+                                          │
+              Critic LLM: "Is this consistent with the training rule?"
+                                          │
+           ACCEPT ──► return prediction   │   REJECT ──► exclude matching
+                                              outputs, re-vote (capped at
+                                              max_corrections iterations)
 ```
+
+Outputs the final grid along with a `corrections_done` count and `vote_summary`.
 
 ---
 
@@ -535,17 +568,23 @@ Iteration 4  fitness=1.00  (solved ✓)
 ### Ensemble Workflow
 
 ```
-          ┌─ Run 1: Orchestrator ──► correct code A ─────┐
-          ├─ Run 2: Orchestrator ──► correct code B ──────┤
-          ├─ Run 3: Orchestrator ──► correct code A ──────┤  deduplicate
-          │              (duplicate — skip)               │
-          └─ Run 4: Orchestrator ──► correct code C ─────┘
-                                                          │
-                    execute A, B, C on test_input         │
-                                                          ▼
-                    outputs:  [grid_X, grid_Y, grid_X]
-                    votes:     grid_X: 2  ◄── winner
-                               grid_Y: 1
+  ┌─ Run 1: Orchestrator ──► perfect code A    (weight=1.0) ──┐
+  ├─ Run 2: Orchestrator ──► near-miss code B  (weight=0.5) ───┤
+  ├─ Run 3: Orchestrator ──► perfect code A    (duplicate—skip) │
+  └─ Run 4: Orchestrator ──► perfect code C    (weight=1.0) ──┘
+                                                                │
+              execute A, B, C on test_input                     │
+              A→grid_X  B→grid_Y  C→grid_X                      │
+                                                                ▼
+              pixel-weighted vote per cell:
+                cell (0,0): X=2.0, Y=0.5  ──► colour from grid_X
+                cell (1,2): X=1.0, Y=1.5  ──► colour from grid_Y
+
+              prediction = assembled grid
+                                                                │
+              Critic: "Consistent with training rule?"          ▼
+                ACCEPT ──► final answer
+                REJECT ──► exclude matching outputs, re-vote (max 2×)
 ```
 
 ---
@@ -700,9 +739,12 @@ USER:
 # Install dependencies
 pip install -r requirements.txt
 
-# Start Ollama (downloads required models on first run)
-./start_ollama.sh
-# Pulls: nomic-embed-text (embeddings) + deepseek-r1:32b (generation)
+# Start Ollama — tiered model selection based on available VRAM
+TIER=medium ./start_ollama.sh      # default — deepseek-r1:14b + qwen2.5-coder:14b (~16 GB)
+TIER=small  ./start_ollama.sh      # ~8 GB  — deepseek-r1:8b  + qwen2.5-coder:7b
+TIER=large  ./start_ollama.sh      # ~32 GB — deepseek-r1:32b + qwen2.5-coder:32b
+# Also pulls: nomic-embed-text (embeddings, 274 MB)
+# Prints ready-to-paste CLI invocations for each strategy after startup
 ```
 
 ### PSO Solver
@@ -773,7 +815,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy single
 ## Running Tests
 
 ```bash
-# Run all 254 tests
+# Run all 433 tests
 python -m pytest
 
 # With coverage report
@@ -784,6 +826,10 @@ python -m pytest tests/test_pso_orchestrator.py -v
 
 # Run a specific test
 python -m pytest tests/test_evaluate.py::TestContinuousFitness::test_perfect_match_is_one -v
+
+# Run only Phase 4 ensemble tests
+python -m pytest tests/test_ensemble.py -v \
+  -k "PixelMajority or CheckPrediction or CandidateFiltering or SelfCorrection"
 ```
 
 Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Ollama server required to run the test suite.
@@ -792,16 +838,20 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 
 | Module | Coverage |
 |---|---|
-| `arc/evaluate.py` | 100% |
+| `arc/evaluate.py` | 98% |
 | `arc/grid.py` | 100% |
 | `arc/dsl.py` | 99% |
 | `agents/roles.py` | 97% |
+| `agents/ensemble.py` | 99% |
 | `agents/single_agent.py` | 95% |
-| `agents/pso_orchestrator.py` | 88% |
+| `agents/multi_agent.py` | 89% |
+| `agents/pso_orchestrator.py` | 81% |
 | `agents/llm_client.py` | 85% |
-| **Total** | **86%** |
+| `agents/orchestrator.py` | 85% |
+| `arc/sandbox.py` | 80% |
+| **Total** | **90%** |
 
-> `arc/sandbox.py` sits at 56% because `_subprocess_worker` executes in a child process and is not traceable by the coverage tool. Its behaviour is verified indirectly through `execute()` and `evaluate_code()` tests.
+> `arc/sandbox.py` has uncovered lines inside `_subprocess_worker`, which executes in a child process and is not traceable by the coverage tool. Its behaviour is verified indirectly through `execute()` and `evaluate_code()` tests.
 
 ---
 

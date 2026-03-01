@@ -9,6 +9,7 @@ from agents.ensemble import (
     Ensemble,
     _majority_vote,
     _pixel_majority_vote,
+    _avg_fitness,
     _vote_summary,
     _grids_equal,
     _check_prediction,
@@ -415,3 +416,176 @@ class TestSelfCorrectionLoop(TestEnsembleSolve):
         ens.max_runs = 1
         result = ens.solve(self.TASK)
         assert result["corrections_done"] <= 2
+
+    @patch("agents.ensemble.sandbox.execute")
+    def test_fallback_leader_exclusion_triggers(self, mock_execute):
+        """When pixel vote produces a grid matching no candidate, the leader group
+        is excluded instead (lines 371-375).  With max_corrections=1 the loop
+        also hits the corrections_done >= max_corrections break (line 358)."""
+        # 4 outputs, each with a 1 in a different corner.
+        # Pixel vote at each position: 0 wins with 3 votes → [[0,0],[0,0]]
+        # which matches NONE of the 4 candidates → fallback path fires.
+        A = np.array([[1, 0], [0, 0]], dtype=np.int32)
+        B = np.array([[0, 1], [0, 0]], dtype=np.int32)
+        C = np.array([[0, 0], [1, 0]], dtype=np.int32)
+        D = np.array([[0, 0], [0, 1]], dtype=np.int32)
+        mock_execute.side_effect = [(A, None), (B, None), (C, None), (D, None)]
+
+        codes = [f"def transform(g):\n    return g  # v{i}" for i in range(4)]
+        result_dict = {"candidates": [
+            {"code": codes[i], "fitness": 1.0, "perfect": True} for i in range(4)
+        ]}
+        ens = self._make_correction_ensemble(
+            [result_dict],
+            critic_responses=["VERDICT: REJECT\nREASON: wrong"] * 10,
+            max_corrections=1,
+        )
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        # Fallback exclusion ran (corrections_done==1) then max_corrections break fired
+        assert result["corrections_done"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _avg_fitness
+# ---------------------------------------------------------------------------
+
+class TestCheckPredictionNoVerdict:
+    """Cover the `if verdict_match is None` fail-safe branch (line 195)."""
+    TASK = {
+        "train": [{"input": np.array([[1]], dtype=np.int32),
+                   "output": np.array([[1]], dtype=np.int32)}],
+        "test":  [{"input": np.array([[2]], dtype=np.int32)}],
+    }
+
+    def test_no_verdict_in_response_returns_accept(self):
+        client = MagicMock()
+        client.generate.return_value = "I cannot determine the answer."
+        pred = np.array([[2]], dtype=np.int32)
+        result = _check_prediction(pred, self.TASK, client)
+        assert result["accept"] is True
+        assert result["reason"] == ""
+
+
+class TestMaxCorrectionsBroken:
+    """Cover corrections_done >= max_corrections break (line 358)."""
+
+    TASK = TestSelfCorrectionLoop.TASK
+
+    def test_second_iteration_hits_max_corrections_break(self):
+        """Two distinct outputs; critic rejects first prediction (identity wins),
+        zeros remains, second loop iteration hits corrections_done >= max_corrections."""
+        ens = TestSelfCorrectionLoop()._make_correction_ensemble(
+            [{"candidates": [
+                {"code": "def transform(g):\n    return g.copy()  # id",
+                 "fitness": 1.0, "perfect": True},
+                {"code": "def transform(g):\n    import numpy as np; return np.zeros_like(g)",
+                 "fitness": 1.0, "perfect": True},
+            ]}],
+            critic_responses=["VERDICT: REJECT\nREASON: bad"] * 5,
+            max_corrections=1,
+        )
+        ens.max_runs = 1
+        result = ens.solve(self.TASK)
+        # First iteration: identity wins, critic rejects, zeros remain.
+        # Second iteration: corrections_done(1) >= max_corrections(1) → break.
+        assert result["corrections_done"] == 1
+
+
+class TestAvgFitness:
+    def test_empty_pairs_returns_zero(self):
+        assert _avg_fitness([]) == 0.0
+
+    def test_pairs_with_no_expected_returns_zero(self):
+        pairs = [{"predicted": np.array([[1]], dtype=np.int32)}]
+        assert _avg_fitness(pairs) == 0.0
+
+    def test_perfect_match_returns_one(self):
+        g = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        pairs = [{"predicted": g, "expected": g}]
+        assert _avg_fitness(pairs) == pytest.approx(1.0)
+
+    def test_averages_across_pairs(self):
+        g = np.array([[1]], dtype=np.int32)
+        h = np.array([[2]], dtype=np.int32)
+        pairs = [
+            {"predicted": g, "expected": g},   # fitness=1.0
+            {"predicted": g, "expected": h},   # fitness<1.0
+        ]
+        result = _avg_fitness(pairs)
+        assert 0.0 < result < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Ensemble.__init__ constructor
+# ---------------------------------------------------------------------------
+
+class TestEnsembleConstructor:
+    def test_real_init_sets_new_params(self):
+        with patch("agents.ensemble.Orchestrator") as MockOrch, \
+             patch("agents.ensemble.LLMClient"):
+            mock_orch_inst = MagicMock(
+                backend="ollama", model="m",
+                hypothesizer_model="m", coder_model="m", critic_model="m",
+                hypothesizer_temperature=0.6, coder_temperature=0.1,
+                critic_temperature=0.2,
+                hypothesizer_max_tokens=32768, coder_max_tokens=8192,
+                critic_max_tokens=16384,
+            )
+            MockOrch.return_value = mock_orch_inst
+            ens = Ensemble(backend="ollama", model="test-model")
+            assert ens.target_candidates == 3
+            assert ens.near_miss_threshold == 0.85
+            assert ens.near_miss_weight == 0.5
+            assert ens.max_corrections == 2
+            assert ens.use_correction is True
+
+    def test_custom_params_stored(self):
+        with patch("agents.ensemble.Orchestrator") as MockOrch, \
+             patch("agents.ensemble.LLMClient"):
+            mock_orch_inst = MagicMock(
+                backend="ollama", model="m",
+                hypothesizer_model="m", coder_model="m", critic_model="m",
+                hypothesizer_temperature=0.6, coder_temperature=0.1,
+                critic_temperature=0.2,
+                hypothesizer_max_tokens=32768, coder_max_tokens=8192,
+                critic_max_tokens=16384,
+            )
+            MockOrch.return_value = mock_orch_inst
+            ens = Ensemble(
+                near_miss_threshold=0.7,
+                near_miss_weight=0.3,
+                max_corrections=5,
+                use_correction=False,
+                target_candidates=7,
+                max_runs=10,
+            )
+            assert ens.near_miss_threshold == 0.7
+            assert ens.near_miss_weight == 0.3
+            assert ens.max_corrections == 5
+            assert ens.use_correction is False
+            assert ens.target_candidates == 7
+            assert ens.max_runs == 10
+
+
+# ---------------------------------------------------------------------------
+# Ensemble.solve() debug output
+# ---------------------------------------------------------------------------
+
+class TestEnsembleSolveDebug(TestEnsembleSolve):
+    def test_debug_prints_run_info(self, capsys):
+        ens = self._make_ensemble([{"candidates": []}] * 5)
+        ens.debug = True
+        ens.solve(self.TASK)
+        captured = capsys.readouterr()
+        assert "[ensemble]" in captured.out
+
+    def test_debug_prints_after_vote(self, capsys):
+        codes = self._make_unique_codes(1)
+        results = [self._orch_result(codes[0])]
+        ens = self._make_ensemble(results)
+        ens.debug = True
+        ens.max_runs = 1
+        ens.solve(self.TASK)
+        captured = capsys.readouterr()
+        assert "[ensemble]" in captured.out

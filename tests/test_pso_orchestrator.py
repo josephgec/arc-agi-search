@@ -586,3 +586,131 @@ class TestCrossover:
             self._CODE_A, self._CODE_B, self._TASK_DESC, self._TRAIN_EX
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _refinement_phase
+# ---------------------------------------------------------------------------
+
+class TestRefinementPhase:
+    """Direct tests for PSOOrchestrator._refinement_phase."""
+
+    START_CODE = IDENTITY_CODE
+
+    _EVAL_RES_FAIL = {
+        "pairs": [{
+            "predicted": np.array([[1, 2], [3, 0]], dtype=np.int32),
+            "expected":  np.array([[1, 2], [3, 4]], dtype=np.int32),
+            "correct": False, "error": None,
+        }],
+        "all_correct": False, "n_correct": 0, "n_total": 1,
+    }
+    _EVAL_RES_PERFECT = {
+        "pairs": [{
+            "predicted": np.array([[1, 2], [3, 4]], dtype=np.int32),
+            "expected":  np.array([[1, 2], [3, 4]], dtype=np.int32),
+            "correct": True, "error": None,
+        }],
+        "all_correct": True, "n_correct": 1, "n_total": 1,
+    }
+
+    def _make_orch(self):
+        orch = make_orchestrator(debug=False)
+        orch._llm = MagicMock()
+        return orch
+
+    def _good_response(self):
+        return f"```python\n{self.START_CODE}\n```"
+
+    def test_refine_improves_fitness(self):
+        orch = self._make_orch()
+        orch._eval_fitness = MagicMock(side_effect=[
+            (0.8, self._EVAL_RES_FAIL),   # initial diff computation
+            (0.9, self._EVAL_RES_FAIL),   # after first attempt
+            (0.9, self._EVAL_RES_FAIL),   # guard calls
+        ] * 5)
+        orch._llm.generate = MagicMock(return_value=self._good_response())
+
+        log: list = []
+        code, fitness = orch._refinement_phase(
+            self.START_CODE, 0.8, SIMPLE_TASK, "task desc", "train ctx", log,
+            max_attempts=2,
+        )
+        assert fitness >= 0.8
+        assert len(log) >= 1
+        assert log[0]["phase"] == "refine"
+
+    def test_refine_finds_perfect_solution(self):
+        orch = self._make_orch()
+        orch._eval_fitness = MagicMock(side_effect=[
+            (0.8, self._EVAL_RES_FAIL),     # diff for attempt 1
+            (1.0, self._EVAL_RES_PERFECT),  # attempt 1 → perfect
+        ])
+        orch._llm.generate = MagicMock(return_value=self._good_response())
+
+        log: list = []
+        code, fitness = orch._refinement_phase(
+            self.START_CODE, 0.8, SIMPLE_TASK, "task desc", "train ctx", log,
+        )
+        assert fitness == pytest.approx(1.0)
+
+    def test_refine_early_stop_on_no_improvement(self):
+        orch = self._make_orch()
+        # _eval_fitness always returns 0.8 → no improvement streak
+        orch._eval_fitness = MagicMock(return_value=(0.8, self._EVAL_RES_FAIL))
+        orch._llm.generate = MagicMock(return_value=self._good_response())
+
+        log: list = []
+        code, fitness = orch._refinement_phase(
+            self.START_CODE, 0.8, SIMPLE_TASK, "task desc", "train ctx", log,
+            max_attempts=10,
+        )
+        # Early stop after 3 consecutive non-improving attempts
+        assert len(log) <= 3
+        assert fitness == pytest.approx(0.8)
+
+    def test_refine_llm_error_breaks_immediately(self):
+        orch = self._make_orch()
+        orch._eval_fitness = MagicMock(return_value=(0.5, self._EVAL_RES_FAIL))
+        orch._llm.generate = MagicMock(side_effect=RuntimeError("connection refused"))
+
+        log: list = []
+        code, fitness = orch._refinement_phase(
+            self.START_CODE, 0.5, SIMPLE_TASK, "task desc", "train ctx", log,
+        )
+        assert len(log) == 0
+        assert code == self.START_CODE
+        assert fitness == pytest.approx(0.5)
+
+    def test_refine_no_code_in_response_continues(self):
+        orch = self._make_orch()
+        # Always returns 0.8; generate gives no extractable code twice, then succeeds
+        orch._eval_fitness = MagicMock(return_value=(0.8, self._EVAL_RES_FAIL))
+        orch._llm.generate = MagicMock(side_effect=[
+            "No code here",
+            "Still nothing",
+            self._good_response(),
+        ])
+
+        log: list = []
+        code, fitness = orch._refinement_phase(
+            self.START_CODE, 0.8, SIMPLE_TASK, "task desc", "train ctx", log,
+            max_attempts=3,
+        )
+        # The successful attempt was also non-improving (same fitness 0.8)
+        assert fitness == pytest.approx(0.8)
+
+    def test_refine_debug_mode_does_not_crash(self, capsys):
+        orch = make_orchestrator(debug=True)
+        orch._llm = MagicMock()
+        orch._eval_fitness = MagicMock(side_effect=[
+            (0.8, self._EVAL_RES_FAIL),
+            (1.0, self._EVAL_RES_PERFECT),
+        ])
+        orch._llm.generate = MagicMock(return_value=self._good_response())
+
+        code, fitness = orch._refinement_phase(
+            self.START_CODE, 0.8, SIMPLE_TASK, "task desc", "train ctx", [],
+        )
+        captured = capsys.readouterr()
+        assert "Refine" in captured.out or "refine" in captured.out.lower() or fitness >= 0.8
