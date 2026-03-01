@@ -238,3 +238,60 @@ class TestBatchGenerate:
         client = LLMClient()
         results = client.batch_generate([])
         assert results == []
+
+
+class TestAnthropicBackend:
+    def test_import_error_raised_clearly(self):
+        import sys
+        # Temporarily hide the anthropic module
+        with patch.dict(sys.modules, {"anthropic": None}):
+            with pytest.raises(ImportError, match="anthropic"):
+                LLMClient(backend="anthropic")
+
+    def test_default_anthropic_model(self):
+        mock_client = MagicMock()
+        mock_module = MagicMock()
+        mock_module.Anthropic.return_value = mock_client
+        import sys
+        with patch.dict(sys.modules, {"anthropic": mock_module}):
+            client = LLMClient(backend="anthropic", model=None)
+        assert "claude" in client.model.lower()
+
+
+class TestOllamaThinkingFilter:
+    """Test that <think> blocks are separated from regular content."""
+
+    def _make_stream(self, chunks):
+        import json
+        lines = [json.dumps(c).encode() for c in chunks]
+        return BytesIO(b"\n".join(lines))
+
+    def test_think_tags_in_separate_chunks(self):
+        # Each chunk is a separate token — <think> opens, </think> closes,
+        # "answer" arrives after closing and lands in content.
+        client = LLMClient(debug=False)
+        chunks = [
+            {"message": {"content": "<think>"}, "done": False},
+            {"message": {"content": "reasoning..."}, "done": False},
+            {"message": {"content": "</think>"}, "done": False},
+            {"message": {"content": "answer"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ]
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_open.return_value.__enter__.return_value = self._make_stream(chunks)
+            result = client.generate("sys", [{"role": "user", "content": "q"}])
+        assert "answer" in result
+
+    def test_explicit_thinking_field_captured(self):
+        # deepseek-r1 style: explicit "thinking" field separate from "content"
+        client = LLMClient(debug=False)
+        chunks = [
+            {"message": {"thinking": "think step", "content": "answer"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ]
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_open.return_value.__enter__.return_value = self._make_stream(chunks)
+            result = client.generate("sys", [{"role": "user", "content": "q"}])
+        # thinking prepended as <think>...</think>, followed by content
+        assert "answer" in result
+        assert "think step" in result

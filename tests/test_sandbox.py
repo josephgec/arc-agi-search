@@ -295,3 +295,104 @@ def transform(grid, src=0, dst=0):
                                        max_combinations=1, timeout=10.0)
         assert isinstance(params, dict)
         assert 0.0 <= fitness <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# _subprocess_worker direct call tests (no forking — covers subprocess body)
+# ---------------------------------------------------------------------------
+
+from arc.sandbox import _subprocess_worker, _param_search_worker
+from queue import Queue as ThreadQueue   # threading queue — works in-process without fork
+
+
+class TestSubprocessWorkerDirect:
+    """Call _subprocess_worker directly in-process to get line coverage.
+
+    Uses a threading.Queue (not multiprocessing.Queue) because the fork-context
+    Queue uses pipes that require a real subprocess to function correctly.
+    """
+
+    def _q(self):
+        return ThreadQueue()
+
+    def test_compile_error_reports_error(self):
+        q = self._q()
+        _subprocess_worker("def f(: pass", [[1, 0]], q)
+        status, msg = q.get_nowait()
+        assert status == "error"
+        assert "Compile error" in msg
+
+    def test_no_transform_function_reports_error(self):
+        q = self._q()
+        _subprocess_worker("x = 42", [[1, 0]], q)
+        status, msg = q.get_nowait()
+        assert status == "error"
+        assert "transform" in msg.lower()
+
+    def test_runtime_error_reports_error(self):
+        q = self._q()
+        code = "def transform(g):\n    raise ValueError('boom')\n"
+        _subprocess_worker(code, [[1, 0]], q)
+        status, msg = q.get_nowait()
+        assert status == "error"
+        assert "Runtime error" in msg
+
+    def test_non_ndarray_result_converted(self):
+        q = self._q()
+        code = "def transform(g):\n    return g.tolist()\n"
+        _subprocess_worker(code, [[1, 2]], q)
+        status, val = q.get_nowait()
+        assert status == "ok"
+        assert val == [[1, 2]]
+
+    def test_non_transform_user_function_used(self):
+        # If no 'transform' found, the last user-defined callable is used
+        q = self._q()
+        code = "def my_fn(g):\n    return g.copy()\n"
+        _subprocess_worker(code, [[5]], q)
+        status, val = q.get_nowait()
+        assert status == "ok"
+
+
+class TestParamSearchWorkerDirect:
+    """Call _param_search_worker directly in-process."""
+
+    TASK_PAIRS = [
+        ([[1, 0]], [[2, 0]]),
+    ]
+
+    def _q(self):
+        return ThreadQueue()
+
+    def test_no_param_grid_error(self):
+        q = self._q()
+        code = "def transform(g):\n    return g.copy()\n"
+        _param_search_worker(code, self.TASK_PAIRS, q, max_combinations=10)
+        status, _ = q.get_nowait()
+        assert status == "error"
+
+    def test_compile_error(self):
+        q = self._q()
+        _param_search_worker("def f(: pass", self.TASK_PAIRS, q, max_combinations=10)
+        status, _ = q.get_nowait()
+        assert status == "error"
+
+    def test_finds_best_params(self):
+        q = self._q()
+        code = "PARAM_GRID = dict(v=list(range(5)))\ndef transform(g, v=0):\n    r = g.copy(); r[r==1]=v; return r\n"
+        _param_search_worker(code, self.TASK_PAIRS, q, max_combinations=100)
+        status, (best_params, best_fitness) = q.get_nowait()
+        assert status == "ok"
+        assert best_params.get("v") == 2
+        assert best_fitness == pytest.approx(1.0, abs=0.01)
+
+
+class TestParamSearchStdinGuard:
+    def test_stdin_code_blocked(self):
+        task = {"train": [
+            {"input":  np.array([[1]], dtype=np.int32),
+             "output": np.array([[1]], dtype=np.int32)},
+        ]}
+        params, fitness = param_search("x = input('hi')", task)
+        assert params == {}
+        assert fitness == pytest.approx(0.0)

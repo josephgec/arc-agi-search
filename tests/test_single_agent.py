@@ -109,3 +109,31 @@ class TestSingleAgentSolve:
         agent = self._make_agent(THREE_HYPOTHESES, "no code here")
         pred = agent.predict(SIMPLE_TASK)
         assert pred is None
+
+
+class TestSingleAgentCoderException:
+    """Cover coder exception path (lines 72-73 in single_agent.py)."""
+
+    def _make_agent_with_coder_error(self) -> "SingleAgent":
+        from agents.single_agent import SingleAgent
+        from unittest.mock import MagicMock
+        agent = SingleAgent.__new__(SingleAgent)
+        agent.debug = False
+
+        hyp = MagicMock()
+        hyp.generate.return_value = (
+            "1. Identity transform — output equals input.\n\n"
+            "2. Rotate 90 degrees CCW.\n\n"
+            "3. Flip horizontally."
+        )
+        coder = MagicMock()
+        coder.generate.side_effect = Exception("timeout")
+        agent._hypothesizer = hyp
+        agent._coder = coder
+        return agent
+
+    def test_coder_exception_returns_failure(self):
+        from tests.test_single_agent import SIMPLE_TASK
+        agent = self._make_agent_with_coder_error()
+        result = agent.solve(SIMPLE_TASK)
+        assert result["success"] is False

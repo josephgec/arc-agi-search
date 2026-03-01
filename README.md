@@ -62,7 +62,7 @@ arc-agi-search/
 │   ├── single_agent.py         ← Single-agent baseline
 │   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
 │
-├── tests/                      ← 433 tests, 90% coverage
+├── tests/                      ← 496 tests, 94% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -180,6 +180,16 @@ Security guards:
 - Hard timeout → process killed if exceeded
 - No network, no file-write access (subprocess isolation)
 
+**Parameterized CPU Search** (`param_search`): if generated code defines a `PARAM_GRID = dict(...)` mapping parameter names to lists of values, `param_search` sweeps all combinations (up to 1,000) in a single sandboxed subprocess, returning the best `(params, fitness)` pair — offloading constant-guessing from the LLM to the CPU:
+
+```python
+# LLM writes this pattern; CPU sweeps all 100 combinations automatically
+PARAM_GRID = dict(target_color=list(range(10)), fill_color=list(range(10)))
+
+def transform(grid, target_color=0, fill_color=1):
+    return recolor(grid, target_color, fill_color)
+```
+
 ---
 
 #### `arc/evaluate.py` — Fitness Functions
@@ -205,6 +215,14 @@ pixel_score = correct_cells / total_target_cells
 | Right colours, wrong positions | `0.2–0.5` |
 | Wrong shape | `< 0.5` |
 
+**AST Complexity Penalty** (`calculate_complexity_penalty`): deducted from fitness to penalise memorisation code. Penalises `If` nodes (+0.005 each), large literals with >5 elements (+0.02 each), and `Compare` nodes (+0.002 each), capped at 0.15. A `SyntaxError` returns a flat 0.10 penalty.
+
+```
+final_fitness = max(0.0, raw_fitness - complexity_penalty)
+```
+
+**8-Way Connectivity**: Object counting (`_count_objects_total`) uses all 8 neighbours (4 cardinal + 4 diagonal), so cross-shaped and X-shaped objects are correctly counted as a single connected component.
+
 ---
 
 ### agents/ — Agent Layer
@@ -216,9 +234,12 @@ Supports two backends behind a single `generate()` call:
 ```
 LLMClient(backend="ollama"|"anthropic", model=..., temperature=..., ...)
 
-  .generate(system, messages) → str       # text completion
-  .embed_code(code_str)       → np.ndarray  # L2-normalised float32 vector
+  .generate(system, messages)             → str         # text completion
+  .embed_code(code_str)                   → np.ndarray  # L2-normalised float32 vector
+  .batch_generate(requests, max_workers)  → list[str]   # parallel completions
 ```
+
+`batch_generate` uses `ThreadPoolExecutor` to fire N completions in parallel, saturating all `OLLAMA_NUM_PARALLEL` slots simultaneously:
 
 **Embedding** always uses Ollama's `/api/embeddings` endpoint regardless of which chat backend is selected:
 
@@ -740,11 +761,18 @@ USER:
 pip install -r requirements.txt
 
 # Start Ollama — tiered model selection based on available VRAM
-TIER=medium ./start_ollama.sh      # default — deepseek-r1:14b + qwen2.5-coder:14b (~16 GB)
 TIER=small  ./start_ollama.sh      # ~8 GB  — deepseek-r1:8b  + qwen2.5-coder:7b
+TIER=medium ./start_ollama.sh      # ~16 GB — deepseek-r1:14b + qwen2.5-coder:14b (default)
 TIER=large  ./start_ollama.sh      # ~32 GB — deepseek-r1:32b + qwen2.5-coder:32b
+TIER=ultra  ./start_ollama.sh      # ~25 GB — deepseek-r1:32b (reasoner) + qwen2.5-coder:7b (fast coder)
+                                   #          optimal for 64 GB machines — 39 GB KV cache headroom
 # Also pulls: nomic-embed-text (embeddings, 274 MB)
 # Prints ready-to-paste CLI invocations for each strategy after startup
+
+# Performance flags (set automatically by start_ollama.sh):
+#   OLLAMA_FLASH_ATTENTION=1     — fused attention kernel for Apple Silicon
+#   OLLAMA_KV_CACHE_TYPE=f16    — optimal KV cache precision for M-series bandwidth
+#   OLLAMA_NUM_PARALLEL=4       — concurrent request slots (set to batch_generate workers)
 ```
 
 ### PSO Solver
@@ -815,7 +843,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy single
 ## Running Tests
 
 ```bash
-# Run all 433 tests
+# Run all 496 tests
 python -m pytest
 
 # With coverage report
@@ -838,20 +866,20 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 
 | Module | Coverage |
 |---|---|
-| `arc/evaluate.py` | 98% |
+| `arc/evaluate.py` | 100% |
 | `arc/grid.py` | 100% |
 | `arc/dsl.py` | 99% |
 | `agents/roles.py` | 97% |
 | `agents/ensemble.py` | 99% |
 | `agents/single_agent.py` | 95% |
-| `agents/multi_agent.py` | 89% |
-| `agents/pso_orchestrator.py` | 81% |
-| `agents/llm_client.py` | 85% |
-| `agents/orchestrator.py` | 85% |
-| `arc/sandbox.py` | 80% |
-| **Total** | **90%** |
+| `agents/orchestrator.py` | 100% |
+| `agents/multi_agent.py` | 97% |
+| `agents/pso_orchestrator.py` | 82% |
+| `agents/llm_client.py` | 91% |
+| `arc/sandbox.py` | 96% |
+| **Total** | **94%** |
 
-> `arc/sandbox.py` has uncovered lines inside `_subprocess_worker`, which executes in a child process and is not traceable by the coverage tool. Its behaviour is verified indirectly through `execute()` and `evaluate_code()` tests.
+> `arc/sandbox.py` subprocess worker bodies are tested by calling them directly in-process with a threading `Queue`, giving full line coverage without requiring a real child process.
 
 ---
 

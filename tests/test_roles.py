@@ -376,3 +376,49 @@ class TestPSOCoder:
             role_name="r", role_description="d",
         )
         assert len(results) <= 3
+
+
+class TestVerifierExceptionSafety:
+    """Verifier._parse_verify_output exception path (line 381-382)."""
+
+    def test_exception_in_parse_returns_passes_true(self):
+        from agents.roles import Verifier
+        from unittest.mock import MagicMock, patch
+        client = MagicMock()
+        # Return malformed text that triggers regex matches but no exception normally;
+        # we force an exception by patching re.search to raise.
+        client.generate.return_value = "VERDICT: PASS\nISSUES: none\nSUGGESTION: none"
+        verifier = Verifier(client)
+        task = {"train": [], "test": [{"input": []}]}
+
+        with patch("agents.roles.re.search", side_effect=RuntimeError("regex boom")):
+            result = verifier.verify("code", "desc", "examples", {})
+
+        assert result["passes"] is True
+
+
+class TestPSOCoderFallbackFence:
+    """PSOCoder extracts single-fence code blocks (lines 493-494)."""
+
+    def test_single_fence_with_def_extracted(self):
+        from agents.roles import PSOCoder
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        # Response has only a single-fence block (not transform_1 format)
+        client.generate.return_value = (
+            "Here's my solution:\n"
+            "```python\n"
+            "def transform(g):\n"
+            "    return g[::-1]\n"
+            "```\n"
+        )
+        pso_coder = PSOCoder(client, k=1)
+        results = pso_coder.generate_mutations(
+            task_description="test task", training_context="examples",
+            current_code="def transform(g): return g", current_fitness=0.0,
+            pbest_code="def transform(g): return g", pbest_fitness=0.0,
+            gbest_code="def transform(g): return g", gbest_fitness=0.0,
+            role_name="r", role_description="d",
+        )
+        assert len(results) >= 1
+        assert "def transform" in results[0]

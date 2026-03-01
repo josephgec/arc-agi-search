@@ -439,3 +439,73 @@ class TestVerifierIntegration:
         agent = make_agent(use_verifier=False, use_decomposer=False)
         agent.solve(SIMPLE_TASK)
         agent._verifier.verify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# MultiAgent.predict() and _evaluate_test() (lines 949-960)
+# ---------------------------------------------------------------------------
+
+class TestMultiAgentPredictAndEvaluate:
+    def test_predict_returns_grid_on_success(self):
+        agent  = make_agent()
+        result = agent.predict(SIMPLE_TASK)
+        assert result is not None
+        assert isinstance(result, np.ndarray)
+
+    def test_predict_returns_none_when_no_code(self):
+        agent = make_agent(code_responses=["no code here"] * 20,
+                           max_cycles=9, use_decomposer=False)
+        result = agent.predict(SIMPLE_TASK)
+        assert result is None
+
+    def test_evaluate_test_correct(self):
+        agent = make_agent()
+        test_pair = SIMPLE_TASK["test"][0]
+        assert agent._evaluate_test(IDENTITY_CODE, test_pair) is True
+
+    def test_evaluate_test_wrong_code(self):
+        agent = make_agent()
+        test_pair = SIMPLE_TASK["test"][0]
+        assert agent._evaluate_test(WRONG_CODE, test_pair) is False
+
+    def test_evaluate_test_sandbox_error(self):
+        agent     = make_agent()
+        test_pair = SIMPLE_TASK["test"][0]
+        assert agent._evaluate_test("def f(: pass", test_pair) is False
+
+
+# ---------------------------------------------------------------------------
+# Exception paths in solve() (lines 791-800, 915-919)
+# ---------------------------------------------------------------------------
+
+class TestSolveExceptionPaths:
+    def test_coder_exception_advances_hypothesis(self):
+        # Coder raises on first call, then returns valid code
+        agent = make_agent(
+            code_responses=[
+                Exception("LLM timeout"),
+                "```python\n" + IDENTITY_CODE + "\n```",
+            ],
+            max_cycles=9,
+        )
+        result = agent.solve(SIMPLE_TASK)
+        # Should still succeed on the second attempt
+        assert result.get("code") is not None
+
+    def test_critic_exception_advances_hypothesis(self):
+        # Critic raises → should advance hypothesis index, not crash
+        critic_resp = [
+            Exception("critic down"),
+            {"route": ROUTE_CODER, "feedback": "ok"},
+        ]
+        agent = make_agent(
+            code_responses=[
+                "```python\n" + WRONG_CODE + "\n```",
+                "```python\n" + IDENTITY_CODE + "\n```",
+            ],
+            critic_responses=critic_resp,
+            max_cycles=9,
+        )
+        result = agent.solve(SIMPLE_TASK)
+        # Loop continues after critic exception
+        assert "log" in result

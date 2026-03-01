@@ -273,3 +273,18 @@ class TestComplexityPenalty:
         # Regardless of how bad the code is, penalty never exceeds 0.15
         code = "\n".join(["if x: pass"] * 100 + ["y = [1,2,3,4,5,6,7,8,9,10]"] * 20)
         assert calculate_complexity_penalty(code) <= 0.15
+
+
+class TestEdgeCaseFitness:
+    def test_1d_pred_returns_zero(self):
+        # Guard against malformed 1-D transform outputs
+        pred   = np.array([1, 2, 3], dtype=np.int32)      # 1-D, not 2-D
+        target = np.array([[1, 2, 3]], dtype=np.int32)
+        assert calculate_continuous_fitness(pred, target) == pytest.approx(0.0)
+
+    def test_all_zero_grids_with_progress_object_score_one(self):
+        # Both pred and target are all-zero → both have 0 objects → score = 1.0
+        pred   = np.zeros((3, 3), dtype=np.int32)
+        target = np.zeros((3, 3), dtype=np.int32)
+        f = calculate_continuous_fitness(pred, target, progress=0.5)
+        assert f == pytest.approx(1.0)

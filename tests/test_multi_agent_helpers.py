@@ -676,3 +676,124 @@ class TestFormatSpatialDiff:
         ]}
         result = _format_spatial_diff(eval_result)
         assert result == "(all pairs correct)"
+
+
+# ---------------------------------------------------------------------------
+# _structural_note — downscale branch (lines 215-216)
+# ---------------------------------------------------------------------------
+
+class TestStructuralNoteDownscale:
+    def test_downscale_detected(self):
+        # 4×4 input → 2×2 output is a 1/2 downscale
+        inp = np.ones((4, 4), dtype=np.int32)
+        out = np.ones((2, 2), dtype=np.int32)
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "1/2" in note
+
+
+# ---------------------------------------------------------------------------
+# _format_training_examples — adaptive grid format (lines 342-349)
+# ---------------------------------------------------------------------------
+
+class TestFormatTrainingExamplesAdaptive:
+    def _make_task(self, inp, out):
+        return {"train": [{"input": inp, "output": out}],
+                "test":  [{"input": inp}]}
+
+    def test_large_grid_omitted(self):
+        # >800 cells each → omit message
+        big = np.zeros((30, 30), dtype=np.int32)
+        task = self._make_task(big, big)
+        result = _format_training_examples(task)
+        assert "large grid" in result
+
+    def test_medium_sparse_grid(self):
+        # 401-800 cells → sparse format
+        med = np.zeros((25, 20), dtype=np.int32)  # 500 cells
+        med[0, 0] = 3
+        task = self._make_task(med, med)
+        result = _format_training_examples(task)
+        assert "[sparse]" in result
+        assert "(0,0)=3" in result
+
+    def test_rle_grid_range(self):
+        # 51-400 cells → RLE format
+        rle_grid = np.zeros((8, 8), dtype=np.int32)  # 64 cells
+        rle_grid[0, :] = 1
+        task = self._make_task(rle_grid, rle_grid)
+        result = _format_training_examples(task)
+        assert "[RLE]" in result
+
+    def test_small_grid_dense(self):
+        # ≤50 cells → dense [[v,...]] format
+        small = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        task = self._make_task(small, small)
+        result = _format_training_examples(task)
+        assert "1" in result
+        assert "[RLE]" not in result
+        assert "[sparse]" not in result
+
+
+# ---------------------------------------------------------------------------
+# _format_task_description — large test input (line 384)
+# ---------------------------------------------------------------------------
+
+class TestFormatTaskDescLargeTest:
+    def test_large_test_input_omitted(self):
+        # test input >800 cells → omit branch
+        small  = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        big    = np.zeros((30, 30), dtype=np.int32)
+        task   = {"train": [{"input": small, "output": small}],
+                  "test":  [{"input": big}]}
+        result = _format_task_description(task)
+        assert "too large to display" in result
+
+
+# ---------------------------------------------------------------------------
+# MultiAgent.__init__ (lines 673-708)
+# ---------------------------------------------------------------------------
+
+class TestMultiAgentInit:
+    def test_init_sets_attributes(self):
+        from unittest.mock import patch, MagicMock
+        from agents.multi_agent import MultiAgent
+
+        with patch("agents.multi_agent.LLMClient") as MockClient:
+            MockClient.return_value = MagicMock(model="mock-model")
+            agent = MultiAgent(backend="ollama", model="test-model",
+                               max_cycles=5, debug=False)
+
+        assert agent.max_cycles == 5
+        assert agent.debug is False
+        assert agent.backend == "ollama"
+
+    def test_init_role_models_default_to_model(self):
+        from unittest.mock import patch, MagicMock
+        from agents.multi_agent import MultiAgent
+
+        with patch("agents.multi_agent.LLMClient") as MockClient:
+            MockClient.return_value = MagicMock(model="default-model")
+            agent = MultiAgent(model="default-model")
+
+        # All role clients default to the base model
+        assert agent.model == "default-model"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.__init__ (orchestrator.py lines 53-71)
+# ---------------------------------------------------------------------------
+
+class TestOrchestratorInit:
+    def test_init_computes_max_cycles(self):
+        from unittest.mock import patch, MagicMock
+        from agents.orchestrator import Orchestrator
+
+        with patch("agents.multi_agent.LLMClient") as MockClient:
+            MockClient.return_value = MagicMock(model="m")
+            orch = Orchestrator(n_hypotheses=3, max_retries=2)
+
+        # max_cycles = 1 + 3*(1 + 2*2) = 1 + 15 = 16
+        assert orch.max_cycles == 16
+        assert orch.n_hypotheses == 3
+        assert orch.max_retries == 2
