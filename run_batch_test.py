@@ -1,6 +1,7 @@
 """Quick batch tester: run 5 tasks and report results."""
 from __future__ import annotations
 import json, time, traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from arc.grid import load_task
 from agents.multi_agent import MultiAgent
@@ -13,22 +14,24 @@ TASKS = [
     "data/training/6150a2bd.json",
 ]
 
+TASK_TIMEOUT = 240  # seconds per task
+
 
 def main() -> None:
-    # Use role-specific models: reasoning for Hypothesizer/Critic,
-    # coding for Coder (faster, no huge thinking overhead)
+    # Use qwen2.5-coder:14b for ALL roles — ~10-20s/call vs 60-70s for deepseek-r1
+    # This is for iterative testing/bug-finding, not peak accuracy.
     solver = MultiAgent(
         backend="ollama",
-        model="deepseek-r1:14b",        # default fallback
-        hypothesizer_model="deepseek-r1:14b",
+        model="qwen2.5-coder:14b",
+        hypothesizer_model="qwen2.5-coder:14b",
         coder_model="qwen2.5-coder:14b",
-        critic_model="deepseek-r1:14b",
-        hypothesizer_max_tokens=4096,   # trim thinking overhead
-        coder_max_tokens=2048,          # code is short
+        critic_model="qwen2.5-coder:14b",
+        hypothesizer_max_tokens=4096,
+        coder_max_tokens=2048,
         critic_max_tokens=2048,
-        timeout=120.0,
+        timeout=60.0,
         debug=True,
-        max_cycles=12,
+        max_cycles=8,
     )
 
     results = []
@@ -39,7 +42,12 @@ def main() -> None:
         task = load_task(task_path)
         t0 = time.time()
         try:
-            result = solver.solve(task)
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(solver.solve, task)
+                try:
+                    result = fut.result(timeout=TASK_TIMEOUT)
+                except FuturesTimeoutError:
+                    result = {"success": False, "error": f"task_timeout>{TASK_TIMEOUT}s"}
         except Exception as e:
             traceback.print_exc()
             result = {"success": False, "error": str(e)}

@@ -25,10 +25,6 @@ htmlcov/
 .vscode/
 *.swp
 
-# Data (large — not committed to repo; download via start_ollama.sh or README)
-data/training/
-data/evaluation/
-
 # Results / outputs
 results/
 *.json.bak

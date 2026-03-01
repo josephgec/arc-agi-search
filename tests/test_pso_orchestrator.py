@@ -22,6 +22,7 @@ from agents.pso_orchestrator import (
     PSOOrchestrator,
     Particle,
     PARTICLE_ROLES,
+    _compress_grid,
 )
 from arc.evaluate import calculate_continuous_fitness
 
@@ -807,3 +808,49 @@ class TestCaching:
 
         # Two distinct codes → two separate sandbox calls
         assert mock_eval.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _compress_grid
+# ---------------------------------------------------------------------------
+
+class TestCompressGrid:
+    def test_small_grid_full_matrix(self):
+        g = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        result = _compress_grid(g)
+        assert "1 2" in result
+        assert "3 4" in result
+
+    def test_large_empty_grid(self):
+        g = np.zeros((20, 20), dtype=np.int32)
+        result = _compress_grid(g)
+        assert "Empty" in result
+        assert "(20, 20)" in result
+
+    def test_large_sparse_grid_uses_coord_format(self):
+        g = np.zeros((20, 20), dtype=np.int32)
+        g[0, 0] = 5
+        g[10, 15] = 3
+        result = _compress_grid(g)
+        assert "(0,0)=5" in result
+        assert "(10,15)=3" in result
+
+    def test_large_dense_grid_summarises(self):
+        # >50 active pixels → summary format
+        g = np.ones((15, 15), dtype=np.int32)
+        result = _compress_grid(g)
+        assert "active pixels" in result
+
+    def test_boundary_exactly_100_cells_is_full_matrix(self):
+        # 10×10 = 100 cells → full matrix (size <= 100)
+        g = np.arange(100, dtype=np.int32).reshape(10, 10)
+        result = _compress_grid(g)
+        # Should contain raw numbers, not coord format
+        assert "(0,0)=" not in result
+
+    def test_boundary_101_cells_uses_compact(self):
+        # 11×11 grid with one active pixel → coord format
+        g = np.zeros((11, 11), dtype=np.int32)
+        g[5, 5] = 7
+        result = _compress_grid(g)
+        assert "(5,5)=7" in result

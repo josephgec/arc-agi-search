@@ -48,7 +48,7 @@ import numpy as np
 from scipy.spatial.distance import cosine
 
 from arc import sandbox
-from arc.evaluate import calculate_continuous_fitness
+from arc.evaluate import calculate_continuous_fitness, calculate_complexity_penalty
 from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
 from agents.roles import PSOCoder, Hypothesizer
@@ -114,6 +114,21 @@ _ROLE_FALLBACK: dict[str, str] = {
 _IDENTITY_FALLBACK = "def transform(input_grid):\n    return input_grid.copy()"
 
 _EMBED_DIM = 768  # nomic-embed-text output dimension
+
+
+def _compress_grid(g: np.ndarray) -> str:
+    """Compact a grid for embedding — full matrix for small grids, sparse
+    active-coordinate format for large ones (avoids token blowout)."""
+    if g.size <= 100:  # 10×10 or smaller: full matrix
+        return "\n".join(" ".join(str(v) for v in row) for row in g)
+    coords = np.argwhere(g != 0)
+    if len(coords) == 0:
+        return f"Empty {g.shape} grid"
+    if len(coords) > 50:
+        return f"Grid {g.shape} with {len(coords)} active pixels"
+    return f"Grid {g.shape} active coords: " + "; ".join(
+        f"({r},{c})={g[r, c]}" for r, c in coords
+    )
 
 
 def _random_unit_vec(rng: np.random.Generator | None = None) -> np.ndarray:
@@ -292,8 +307,12 @@ class PSOOrchestrator:
             result = sandbox.evaluate_code(code, task)
             self._sandbox_cache[cache_key] = result
 
+        penalty = calculate_complexity_penalty(code)
+
         if result["all_correct"]:
-            return 1.0, result
+            # Perfect code still incurs complexity penalty so memorised
+            # solutions cap below 1.0 and stay in the Refinement Phase.
+            return max(0.0, 1.0 - penalty), result
 
         total = 0.0
         for pair_res in result["pairs"]:
@@ -303,7 +322,8 @@ class PSOOrchestrator:
                 total += calculate_continuous_fitness(
                     pair_res["predicted"], pair_res["expected"], progress
                 )
-        fitness = total / result["n_total"] if result["n_total"] > 0 else 0.0
+        base_fitness = total / result["n_total"] if result["n_total"] > 0 else 0.0
+        fitness = max(0.0, base_fitness - penalty)
         return fitness, result
 
     def _embed_behavior(
@@ -343,8 +363,8 @@ class PSOOrchestrator:
 
                 pred_arr = np.array(pred)
                 exp_arr  = np.array(expected)
-                pred_text = "\n".join(" ".join(str(v) for v in row) for row in pred_arr)
-                exp_text  = "\n".join(" ".join(str(v) for v in row) for row in exp_arr)
+                pred_text = _compress_grid(pred_arr)
+                exp_text  = _compress_grid(exp_arr)
                 pair_texts.append(f"{exp_text}\n---\n{pred_text}")
 
             behavior_text = "\n===\n".join(pair_texts)
@@ -882,8 +902,18 @@ class PSOOrchestrator:
                         continue
                     if (pred == exp).all():
                         continue
-                    fc_lines.append(f"Pair {i+1} — predicted:\n  {_grid_to_str(pred)}")
-                    fc_lines.append(f"Pair {i+1} — expected:\n  {_grid_to_str(exp)}")
+                    if pred.size > 400 or exp.size > 400:
+                        diff_pixels = (
+                            int(np.sum(pred != exp))
+                            if pred.shape == exp.shape else "N/A (shape mismatch)"
+                        )
+                        fc_lines.append(
+                            f"Pair {i+1}: Grids too large to display. "
+                            f"{diff_pixels} pixel(s) differ."
+                        )
+                    else:
+                        fc_lines.append(f"Pair {i+1} — predicted:\n  {_grid_to_str(pred)}")
+                        fc_lines.append(f"Pair {i+1} — expected:\n  {_grid_to_str(exp)}")
                 if fc_lines:
                     full_comparison = "\n\nFull output comparison for failing pairs:\n" + "\n".join(fc_lines)
 

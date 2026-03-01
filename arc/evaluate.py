@@ -8,6 +8,7 @@ signal used by the PSO swarm to guide optimization beyond the binary pass/fail.
 """
 from __future__ import annotations
 
+import ast
 import traceback
 from pathlib import Path
 from typing import Callable
@@ -25,7 +26,7 @@ TransformFn = Callable[[Grid], Grid]
 # ---------------------------------------------------------------------------
 
 def _count_objects_total(grid: Grid) -> int:
-    """Count 4-connected components of non-background cells."""
+    """Count 8-connected components of non-background cells."""
     if grid.size == 0:
         return 0
     bg = background_color(grid)
@@ -45,8 +46,40 @@ def _count_objects_total(grid: Grid) -> int:
                     if visited[cr, cc] or grid[cr, cc] != color:
                         continue
                     visited[cr, cc] = True
-                    stack.extend([(cr+1,cc),(cr-1,cc),(cr,cc+1),(cr,cc-1)])
+                    stack.extend([
+                        (cr+1, cc), (cr-1, cc), (cr, cc+1), (cr, cc-1),
+                        (cr+1, cc+1), (cr-1, cc-1), (cr+1, cc-1), (cr-1, cc+1),
+                    ])
     return count
+
+
+def calculate_complexity_penalty(code: str) -> float:
+    """Penalise spaghetti code that memorises training inputs.
+
+    Computes a small penalty in [0.0, 0.15] based on AST structure:
+      +0.005 per ``if`` statement   — heavy branching
+      +0.02  per large literal      — hardcoded arrays/dicts/tuples (>5 elements)
+      +0.002 per ``Compare`` node   — raw coordinate / value comparisons
+
+    Returns 0.10 on SyntaxError (unparseable code gets penalised).
+    """
+    if not code:
+        return 0.0
+    try:
+        tree = ast.parse(code)
+        penalty = 0.0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                penalty += 0.005
+            elif isinstance(node, (ast.List, ast.Dict, ast.Tuple)):
+                elts = getattr(node, "elts", None) or getattr(node, "keys", [])
+                if len(elts) > 5:
+                    penalty += 0.02
+            elif isinstance(node, ast.Compare):
+                penalty += 0.002
+        return min(penalty, 0.15)
+    except SyntaxError:
+        return 0.10
 
 
 # ---------------------------------------------------------------------------

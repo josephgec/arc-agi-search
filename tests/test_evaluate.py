@@ -4,7 +4,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arc.evaluate import calculate_continuous_fitness, evaluate_task, evaluate_directory, _count_objects_total
+from arc.evaluate import (
+    calculate_continuous_fitness, calculate_complexity_penalty,
+    evaluate_task, evaluate_directory, _count_objects_total,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +153,19 @@ class TestCountObjectsTotal:
         g = np.array([[0, 1, 2, 0]], dtype=np.int32)
         assert _count_objects_total(g) == 2
 
+    def test_diagonal_connection_counts_as_one(self):
+        # With 8-way connectivity, diagonally-touching same-colour cells are one object
+        g = np.array([[1, 0],
+                      [0, 1]], dtype=np.int32)
+        assert _count_objects_total(g) == 1
+
+    def test_cross_shape_is_one_object(self):
+        # X / cross — all cells connected via diagonals or orthogonals
+        g = np.array([[1, 0, 1],
+                      [0, 1, 0],
+                      [1, 0, 1]], dtype=np.int32)
+        assert _count_objects_total(g) == 1
+
 
 class TestDynamicFitnessWeighting:
     def test_perfect_match_progress_none(self):
@@ -213,3 +229,47 @@ class TestEvaluateDirectory:
         result = evaluate_directory(tmp_path, lambda g: g.copy())
         assert result["n_tasks"] == 0
         assert result["n_solved"] == 0
+
+
+# ---------------------------------------------------------------------------
+# calculate_complexity_penalty
+# ---------------------------------------------------------------------------
+
+class TestComplexityPenalty:
+    def test_empty_code_zero(self):
+        assert calculate_complexity_penalty("") == pytest.approx(0.0)
+
+    def test_clean_transform_low_penalty(self):
+        code = (
+            "def transform(grid):\n"
+            "    return grid[::-1]\n"
+        )
+        penalty = calculate_complexity_penalty(code)
+        assert penalty < 0.05
+
+    def test_if_branches_increase_penalty(self):
+        code = "\n".join(f"if x == {i}: pass" for i in range(10))
+        p_many = calculate_complexity_penalty(code)
+        p_none = calculate_complexity_penalty("x = 1")
+        assert p_many > p_none
+
+    def test_large_literal_penalised(self):
+        # A list with 10 elements triggers the >5 threshold
+        code = "x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"
+        assert calculate_complexity_penalty(code) > 0.0
+
+    def test_memorisation_code_hits_cap(self):
+        # Heavy branching + large literals should reach the 0.15 cap
+        lines = ["def transform(g):"]
+        for i in range(10):
+            lines.append(f"    if (g == [{', '.join(str(j) for j in range(10))}]).all(): return g")
+        code = "\n".join(lines)
+        assert calculate_complexity_penalty(code) == pytest.approx(0.15)
+
+    def test_syntax_error_returns_penalty(self):
+        assert calculate_complexity_penalty("def f(: pass") == pytest.approx(0.10)
+
+    def test_penalty_capped_at_015(self):
+        # Regardless of how bad the code is, penalty never exceeds 0.15
+        code = "\n".join(["if x: pass"] * 100 + ["y = [1,2,3,4,5,6,7,8,9,10]"] * 20)
+        assert calculate_complexity_penalty(code) <= 0.15
