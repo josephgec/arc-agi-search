@@ -6,19 +6,27 @@ from arc.grid import load_task
 from agents.multi_agent import MultiAgent
 
 TASKS = [
-    "data/training/d22278a0.json",
-    "data/training/28e73c20.json",
-    "data/training/0a938d79.json",
-    "data/training/ed36ccf7.json",
-    "data/training/623ea044.json",
+    "data/training/46442a0e.json",
+    "data/training/49d1d64f.json",
+    "data/training/8d5021e8.json",
+    "data/training/4522001f.json",
+    "data/training/6150a2bd.json",
 ]
 
 
 def main() -> None:
+    # Use role-specific models: reasoning for Hypothesizer/Critic,
+    # coding for Coder (faster, no huge thinking overhead)
     solver = MultiAgent(
         backend="ollama",
-        model="qwen2.5-coder:7b",
-        timeout=60.0,
+        model="deepseek-r1:14b",        # default fallback
+        hypothesizer_model="deepseek-r1:14b",
+        coder_model="qwen2.5-coder:14b",
+        critic_model="deepseek-r1:14b",
+        hypothesizer_max_tokens=4096,   # trim thinking overhead
+        coder_max_tokens=2048,          # code is short
+        critic_max_tokens=2048,
+        timeout=120.0,
         debug=True,
         max_cycles=12,
     )

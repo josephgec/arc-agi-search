@@ -648,11 +648,11 @@ class MultiAgent:
         hypothesizer_temperature: float      = 0.6,
         coder_temperature:        float      = 0.1,
         critic_temperature:       float      = 0.2,
-        hypothesizer_max_tokens:  int        = 32768,
-        coder_max_tokens:         int        = 8192,
-        critic_max_tokens:        int        = 16384,
+        hypothesizer_max_tokens:  int        = 8192,
+        coder_max_tokens:         int        = 4096,
+        critic_max_tokens:        int        = 4096,
         decomposer_max_tokens:    int        = 4096,
-        verifier_max_tokens:      int        = 8192,
+        verifier_max_tokens:      int        = 4096,
         timeout:                  float      = 120.0,
         debug:                    bool       = False,
         max_cycles:               int        = 9,
@@ -740,6 +740,18 @@ class MultiAgent:
                 })
                 if self.debug:
                     print(f"[debug] Hypothesizer: {len(hypotheses)} hypothesis(es)")
+
+                # Guard: if the model response was truncated (only thinking
+                # tokens, nothing parseable), treat it like a transient error
+                # and skip this cycle rather than crashing with IndexError.
+                if not hypotheses:
+                    log.append({"cycle": cycle, "agent": "hypothesizer",
+                                "error": "no_parseable_hypotheses"})
+                    continue
+
+            # Guard: hyp_index must be in bounds (defensive, belt-and-suspenders)
+            if hyp_index >= len(hypotheses):
+                hyp_index = 0
 
             # Reset per-hypothesis counters whenever we transition to a new
             # hypothesis (hyp_index changed) or just got fresh hypotheses from
