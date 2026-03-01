@@ -20,7 +20,7 @@ def main() -> None:
         model="qwen2.5-coder:7b",
         timeout=60.0,
         debug=True,
-        max_cycles=4,
+        max_cycles=12,
     )
 
     results = []

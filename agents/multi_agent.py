@@ -709,6 +709,7 @@ class MultiAgent:
         training_examples: str       = _format_training_examples(task)
         hypotheses:        list[str] = []
         hyp_index:         int       = 0
+        prev_hyp_index:    int       = -1   # tracks hypothesis transitions
         hyp_feedback:      str | None = None
         coder_feedback:    str | None = None
         prev_n_correct:    int        = -1
@@ -740,12 +741,15 @@ class MultiAgent:
                 if self.debug:
                     print(f"[debug] Hypothesizer: {len(hypotheses)} hypothesis(es)")
 
-            if not hypotheses or hyp_index == 0 or (
-                log and log[-1].get("agent") == "hypothesizer"
-            ):
+            # Reset per-hypothesis counters whenever we transition to a new
+            # hypothesis (hyp_index changed) or just got fresh hypotheses from
+            # the Hypothesizer.  This ensures no_improve_count starts from zero
+            # for every hypothesis, so stuck-detection works correctly.
+            if hyp_index != prev_hyp_index:
                 coder_attempt    = 0
                 prev_n_correct   = -1
                 no_improve_count = 0
+                prev_hyp_index   = hyp_index
 
             current_hypothesis = hypotheses[hyp_index]
             coder_attempt += 1
