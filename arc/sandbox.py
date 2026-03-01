@@ -190,6 +190,121 @@ def evaluate_code(
 
 
 # ---------------------------------------------------------------------------
+# CPU parameter search
+# ---------------------------------------------------------------------------
+
+def _param_search_worker(
+    code: str,
+    train_pairs: list[tuple[list, list]],
+    out_queue: "mp.Queue[tuple]",
+    max_combinations: int,
+) -> None:
+    """Subprocess target: sweep PARAM_GRID and return (best_params, best_fitness)."""
+    import contextlib
+    import io
+    import itertools
+
+    import numpy as np
+
+    from arc.evaluate import calculate_continuous_fitness
+
+    namespace = dict(DSL_NAMESPACE)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(code, namespace)  # noqa: S102
+    except Exception as exc:
+        out_queue.put(("error", f"Compile error: {exc}"))
+        return
+
+    param_grid = namespace.get("PARAM_GRID", {})
+    transform_fn = namespace.get("transform")
+    if not param_grid or transform_fn is None:
+        out_queue.put(("error", "Code must define PARAM_GRID and transform(grid, **params)"))
+        return
+
+    param_names  = list(param_grid.keys())
+    param_values = [param_grid[k] for k in param_names]
+    best_params:  dict  = {}
+    best_fitness: float = -1.0
+
+    for combo in itertools.islice(itertools.product(*param_values), max_combinations):
+        params = dict(zip(param_names, combo))
+        total  = 0.0
+        for inp_list, out_list in train_pairs:
+            inp_arr = np.array(inp_list, dtype=np.int32)
+            out_arr = np.array(out_list, dtype=np.int32)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pred = transform_fn(inp_arr.copy(), **params)
+                if not isinstance(pred, np.ndarray):
+                    pred = np.array(pred, dtype=np.int32)
+                total += calculate_continuous_fitness(pred, out_arr)
+            except Exception:
+                pass
+        fitness = total / max(len(train_pairs), 1)
+        if fitness > best_fitness:
+            best_fitness = fitness
+            best_params  = params
+            if best_fitness >= 1.0:
+                break
+
+    out_queue.put(("ok", (best_params, best_fitness)))
+
+
+def param_search(
+    code: str,
+    task: dict,
+    timeout: float = 30.0,
+    max_combinations: int = 1000,
+) -> tuple[dict, float]:
+    """Sweep all combinations of PARAM_GRID defined in ``code``.
+
+    The LLM-generated code must define:
+
+      PARAM_GRID = {'param_name': [v1, v2, ...], ...}
+      def transform(grid, **params):
+          ...
+
+    All combinations (up to ``max_combinations``) are tested against the
+    task's training pairs inside a single sandboxed subprocess.  The
+    subprocess is killed after ``timeout`` seconds.
+
+    Returns:
+        (best_params, best_fitness) — the parameter dict that achieved the
+        highest average continuous fitness across training pairs, and its
+        score.  Returns ({}, 0.0) on timeout or any error.
+    """
+    if "input(" in code or "sys.stdin" in code:
+        return {}, 0.0
+
+    train_pairs = [
+        (pair["input"].tolist(), pair["output"].tolist())
+        for pair in task["train"]
+    ]
+    out_queue: "mp.Queue[tuple]" = _MP_CTX.Queue()
+    proc = _MP_CTX.Process(
+        target=_param_search_worker,
+        args=(code, train_pairs, out_queue, max_combinations),
+    )
+    proc.start()
+    proc.join(timeout=timeout)
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        return {}, 0.0
+
+    if out_queue.empty():
+        return {}, 0.0
+
+    status, value = out_queue.get()
+    if status == "ok":
+        best_params, best_fitness = value
+        return best_params, float(best_fitness)
+    return {}, 0.0
+
+
+# ---------------------------------------------------------------------------
 # Spatial diff helpers
 # ---------------------------------------------------------------------------
 

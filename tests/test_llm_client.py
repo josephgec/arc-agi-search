@@ -196,3 +196,45 @@ class TestGenerateOllama:
         call_kwargs = mock_req.call_args[1]
         payload = json.loads(call_kwargs["data"].decode())
         assert payload["options"]["temperature"] == pytest.approx(0.42)
+
+
+class TestBatchGenerate:
+    """Tests for LLMClient.batch_generate (parallel completion)."""
+
+    def test_returns_list_of_strings(self):
+        client = LLMClient()
+        with patch.object(client, "generate", return_value="result") as mock_gen:
+            results = client.batch_generate(
+                [("sys1", [{"role": "user", "content": "q1"}]),
+                 ("sys2", [{"role": "user", "content": "q2"}])]
+            )
+        assert results == ["result", "result"]
+        assert mock_gen.call_count == 2
+
+    def test_preserves_order(self):
+        client = LLMClient()
+        responses = ["first", "second", "third"]
+
+        def _mock_generate(system, messages, temperature=None):
+            # Return based on which system was passed
+            return {"sys1": "first", "sys2": "second", "sys3": "third"}[system]
+
+        with patch.object(client, "generate", side_effect=_mock_generate):
+            results = client.batch_generate([
+                ("sys1", []),
+                ("sys2", []),
+                ("sys3", []),
+            ], max_workers=2)
+
+        assert results == ["first", "second", "third"]
+
+    def test_temperature_forwarded(self):
+        client = LLMClient()
+        with patch.object(client, "generate", return_value="ok") as mock_gen:
+            client.batch_generate([("sys", [])], temperature=0.42)
+        mock_gen.assert_called_once_with("sys", [], temperature=0.42)
+
+    def test_empty_requests_returns_empty(self):
+        client = LLMClient()
+        results = client.batch_generate([])
+        assert results == []

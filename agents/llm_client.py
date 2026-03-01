@@ -21,6 +21,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -184,6 +185,33 @@ class LLMClient:
         if self.debug:
             print(f"[llm] anthropic/{self.model}: {len(text)} chars")
         return text
+
+    def batch_generate(
+        self,
+        requests: list[tuple[str, list[dict[str, str]]]],
+        max_workers: int = 4,
+        temperature: float | None = None,
+    ) -> list[str]:
+        """Generate completions for multiple (system, messages) pairs in parallel.
+
+        Uses a thread pool so multiple requests hit Ollama's HTTP endpoint
+        concurrently.  Set max_workers to match OLLAMA_NUM_PARALLEL (default 4)
+        for maximum throughput without overloading the server.
+
+        Args:
+            requests:    List of (system_prompt, messages) tuples.
+            max_workers: Max concurrent HTTP connections.
+            temperature: Temperature override applied to every request.
+
+        Returns:
+            List of completion strings in the same order as ``requests``.
+        """
+        def _call(req: tuple[str, list[dict[str, str]]]) -> str:
+            system, messages = req
+            return self.generate(system, messages, temperature=temperature)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(_call, requests))
 
     # ------------------------------------------------------------------
     # Embeddings (always via Ollama, model-independent of backend)

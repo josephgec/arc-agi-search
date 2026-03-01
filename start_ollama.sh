@@ -7,14 +7,19 @@
 #   • Spatial / pattern reasoning  → deepseek-r1  (native chain-of-thought)
 #   • Python code generation       → qwen2.5-coder (highest Pass@1 on code benchmarks)
 #
-# Choose a tier based on available VRAM:
-#   TIER=small   ~8 GB VRAM   deepseek-r1:8b   + qwen2.5-coder:7b
-#   TIER=medium  ~16 GB VRAM  deepseek-r1:14b  + qwen2.5-coder:14b  (default)
-#   TIER=large   ~32 GB VRAM  deepseek-r1:32b  + qwen2.5-coder:32b
+# Choose a tier based on available RAM/VRAM:
+#   TIER=small   ~8 GB    deepseek-r1:8b   + qwen2.5-coder:7b
+#   TIER=medium  ~16 GB   deepseek-r1:14b  + qwen2.5-coder:14b  (default)
+#   TIER=large   ~32 GB   deepseek-r1:32b  + qwen2.5-coder:32b
+#   TIER=ultra   ~64 GB   deepseek-r1:32b  + qwen2.5-coder:7b   (asymmetric: big reasoner + fast coder)
+#
+# M1/M2/M3 Ultra with 64 GB: use TIER=ultra.  The 32B reasoner (~20 GB at Q4)
+# leaves ~44 GB for the KV cache — massive context headroom for large ARC grids.
+# The 7B coder runs at 70+ t/s so the Coder step costs almost nothing.
 #
 # Override by exporting TIER, REASONER_MODEL, or CODER_MODEL before running:
-#   TIER=large ./start_ollama.sh
-#   REASONER_MODEL=deepseek-r1:32b CODER_MODEL=qwen2.5-coder:14b ./start_ollama.sh
+#   TIER=ultra ./start_ollama.sh
+#   REASONER_MODEL=deepseek-r1:32b CODER_MODEL=qwen2.5-coder:7b ./start_ollama.sh
 
 set -euo pipefail
 
@@ -32,6 +37,12 @@ case "$TIER" in
   large)
     DEFAULT_REASONER="deepseek-r1:32b"
     DEFAULT_CODER="qwen2.5-coder:32b"
+    ;;
+  ultra)
+    # Asymmetric: 32B for reasoning (Hypothesizer + Critic), 7B for fast coding
+    # Optimal for 64 GB Apple Silicon — 32B @ Q4 ~20 GB, 7B ~5 GB, 39 GB left for KV cache
+    DEFAULT_REASONER="deepseek-r1:32b"
+    DEFAULT_CODER="qwen2.5-coder:7b"
     ;;
   medium|*)
     DEFAULT_REASONER="deepseek-r1:14b"
@@ -51,9 +62,14 @@ echo ""
 # ---------------------------------------------------------------------------
 # Ollama server settings
 # ---------------------------------------------------------------------------
-# Raise parallel limit for the PSO swarm (concurrent embed + generate calls).
-# Lower OLLAMA_NUM_PARALLEL if you hit OOM errors.
+# OLLAMA_FLASH_ATTENTION  — fused attention kernel; critical speedup on M-series
+# OLLAMA_KV_CACHE_TYPE    — f16 KV cache is ideal for Apple Silicon (800 GB/s bandwidth)
+# OLLAMA_NUM_PARALLEL     — simultaneous token streams; match to GPU core count
+# OLLAMA_MAX_LOADED_MODELS — keep reasoner + coder both hot in VRAM
+# Lower OLLAMA_NUM_PARALLEL or set OLLAMA_MAX_LOADED_MODELS=1 if you hit OOM.
 
+export OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
+export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-"f16"}
 export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
 export OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
 

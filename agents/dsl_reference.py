@@ -49,4 +49,25 @@ PHYSICS / GRAVITY
   gravity(grid, direction="down") -> Grid   Slide non-zero cells to edge (up/down/left/right).
 
 numpy is also available as np and numpy.
+
+PARAMETERIZED OPTIMIZATION (optional — CPU sweeps constants automatically):
+  If your transform depends on unknown constants (target colour, shift amount,
+  threshold…), define PARAM_GRID and accept **params in the signature.
+  The solver will test all combinations against training pairs instantly.
+
+  Example:
+    PARAM_GRID = dict(
+        target_color=list(range(10)),
+        fill_color=list(range(10)),
+    )
+    def transform(grid, target_color=0, fill_color=1):
+        result = grid.copy()
+        result[result == target_color] = fill_color
+        return result
+
+  Rules:
+  - PARAM_GRID must be a plain dict of name -> list of values (use dict() not literal braces).
+  - transform must have keyword arguments with sensible defaults
+    so it still runs as transform(grid) when params are not swept.
+  - Keep each list short (<=10 values) to avoid combinatorial explosion.
 """

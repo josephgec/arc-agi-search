@@ -232,3 +232,66 @@ class TestDSLNamespace:
         ]
         for name in required:
             assert name in DSL_NAMESPACE, f"Missing '{name}' from DSL_NAMESPACE"
+
+
+# ---------------------------------------------------------------------------
+# param_search
+# ---------------------------------------------------------------------------
+
+from arc.sandbox import param_search
+
+
+class TestParamSearch:
+    """Tests for CPU-parallel parameter sweep."""
+
+    TASK = {
+        "train": [
+            {
+                "input":  np.array([[1, 0, 0]], dtype=np.int32),
+                "output": np.array([[2, 0, 0]], dtype=np.int32),
+            },
+            {
+                "input":  np.array([[0, 1, 0]], dtype=np.int32),
+                "output": np.array([[0, 2, 0]], dtype=np.int32),
+            },
+        ]
+    }
+
+    GOOD_CODE = """\
+PARAM_GRID = dict(src=list(range(10)), dst=list(range(10)))
+
+def transform(grid, src=0, dst=0):
+    result = grid.copy()
+    result[result == src] = dst
+    return result
+"""
+
+    def test_finds_correct_params(self):
+        params, fitness = param_search(self.GOOD_CODE, self.TASK, timeout=30.0)
+        assert fitness == pytest.approx(1.0, abs=1e-6)
+        assert params.get("src") == 1
+        assert params.get("dst") == 2
+
+    def test_no_param_grid_returns_zero(self):
+        code = "def transform(grid):\n    return grid.copy()\n"
+        params, fitness = param_search(code, self.TASK, timeout=10.0)
+        assert fitness == pytest.approx(0.0)
+        assert params == {}
+
+    def test_syntax_error_returns_zero(self):
+        params, fitness = param_search("def f(: pass", self.TASK, timeout=5.0)
+        assert params == {}
+        assert fitness == pytest.approx(0.0)
+
+    def test_returns_best_not_first(self):
+        # PARAM_GRID has many combos; best (src=1,dst=2) should win
+        params, fitness = param_search(self.GOOD_CODE, self.TASK,
+                                       max_combinations=500, timeout=30.0)
+        assert fitness == pytest.approx(1.0, abs=1e-6)
+
+    def test_max_combinations_respected(self):
+        # Even with only 1 combination tested, function returns without error
+        params, fitness = param_search(self.GOOD_CODE, self.TASK,
+                                       max_combinations=1, timeout=10.0)
+        assert isinstance(params, dict)
+        assert 0.0 <= fitness <= 1.0

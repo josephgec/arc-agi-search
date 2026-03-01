@@ -333,12 +333,23 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
 def _format_training_examples(task: dict) -> str:
     lines = ["Training examples (use these to verify your implementation):"]
     for i, pair in enumerate(task["train"]):
-        inp, out = pair["input"], pair["output"]
-        ih, iw   = inp.shape
-        oh, ow   = out.shape
+        inp, out  = pair["input"], pair["output"]
+        ih, iw    = inp.shape
+        oh, ow    = out.shape
+        max_cells = max(inp.size, out.size)
         lines.append(f"Example {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
-        lines.append(f"  Input:  {_grid_to_str(inp)}")
-        lines.append(f"  Output: {_grid_to_str(out)}")
+        if max_cells > _SPARSE_GRID_THRESHOLD:
+            lines.append(f"  Input:  [large grid — {inp.size} cells, see task description]")
+            lines.append(f"  Output: [large grid — {out.size} cells, see task description]")
+        elif max_cells > _RLE_GRID_THRESHOLD:
+            lines.append(f"  Input  [sparse]: {_grid_to_sparse(inp)}")
+            lines.append(f"  Output [sparse]: {_grid_to_sparse(out)}")
+        elif max_cells > _DENSE_GRID_THRESHOLD:
+            lines.append(f"  Input  [RLE]:\n    {_grid_to_rle(inp)}")
+            lines.append(f"  Output [RLE]:\n    {_grid_to_rle(out)}")
+        else:
+            lines.append(f"  Input:  {_grid_to_str(inp)}")
+            lines.append(f"  Output: {_grid_to_str(out)}")
         ann = _diff_annotation(inp, out)
         if ann:
             lines.append(ann)
