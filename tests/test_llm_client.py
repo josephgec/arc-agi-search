@@ -6,6 +6,7 @@ Ollama server or Anthropic API key.
 from __future__ import annotations
 
 import json
+import socket
 from io import BytesIO
 from unittest.mock import MagicMock, patch, call
 from urllib.error import URLError
@@ -256,6 +257,61 @@ class TestAnthropicBackend:
         with patch.dict(sys.modules, {"anthropic": mock_module}):
             client = LLMClient(backend="anthropic", model=None)
         assert "claude" in client.model.lower()
+
+
+class TestRetryOnTimeout:
+    """Verify that a single timeout triggers a warning + 10s sleep + one retry."""
+
+    def _make_success_stream(self) -> MagicMock:
+        lines = [json.dumps({"message": {"content": "ok"}, "done": True}).encode()]
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = lambda s: iter(lines)
+        return mock_resp
+
+    def test_retries_once_on_timeout_and_succeeds(self):
+        timeout_exc = URLError(socket.timeout("timed out"))
+
+        with patch("agents.llm_client.urllib.request.urlopen",
+                   side_effect=[timeout_exc, self._make_success_stream()]):
+            with patch("agents.llm_client.time.sleep") as mock_sleep:
+                with patch("agents.llm_client._log") as mock_log:
+                    client = LLMClient()
+                    result = client.generate("sys", [{"role": "user", "content": "q"}])
+
+        assert result == "ok"
+        mock_sleep.assert_called_once_with(10)
+        mock_log.warning.assert_called_once()
+        assert "timed out" in mock_log.warning.call_args[0][0].lower()
+
+    def test_second_timeout_logs_error_and_raises(self):
+        timeout_exc = URLError(socket.timeout("timed out"))
+
+        with patch("agents.llm_client.urllib.request.urlopen",
+                   side_effect=[timeout_exc, timeout_exc]):
+            with patch("agents.llm_client.time.sleep"):
+                with patch("agents.llm_client._log") as mock_log:
+                    client = LLMClient()
+                    with pytest.raises(ConnectionError, match="Cannot reach Ollama"):
+                        client.generate("sys", [{"role": "user", "content": "q"}])
+
+        mock_log.error.assert_called_once()
+
+    def test_non_timeout_url_error_raises_immediately_no_retry(self):
+        """Connection refused should not trigger a retry."""
+        conn_err = URLError("connection refused")
+
+        with patch("agents.llm_client.urllib.request.urlopen",
+                   side_effect=[conn_err, self._make_success_stream()]) as mock_urlopen:
+            with patch("agents.llm_client.time.sleep") as mock_sleep:
+                client = LLMClient()
+                with pytest.raises(ConnectionError):
+                    client.generate("sys", [{"role": "user", "content": "q"}])
+
+        # urlopen called exactly once — no retry for non-timeout errors
+        assert mock_urlopen.call_count == 1
+        mock_sleep.assert_not_called()
 
 
 class TestOllamaThinkingFilter:

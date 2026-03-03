@@ -18,6 +18,8 @@ not expose a dedicated embeddings API.
 from __future__ import annotations
 
 import json
+import logging
+import socket as _socket
 import time
 import urllib.request
 import urllib.error
@@ -25,6 +27,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Connection constants
@@ -50,7 +54,7 @@ class LLMClient:
         model:         str | None = None,
         temperature:   float      = 0.6,
         max_tokens:    int        = 8192,
-        timeout:       float      = 120.0,
+        timeout:       float      = 600.0,
         embed_timeout: float      = 30.0,
         debug:         bool       = False,
     ) -> None:
@@ -106,67 +110,86 @@ class LLMClient:
                 "num_predict": self.max_tokens,   # cap output length (Ollama param)
             },
         }
-        data    = json.dumps(payload).encode()
-        request = urllib.request.Request(
-            OLLAMA_CHAT_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        content   = []
-        thinking  = []
-        in_think  = False
+        data = json.dumps(payload).encode()
 
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                for line in resp:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+        for attempt in range(2):
+            request = urllib.request.Request(
+                OLLAMA_CHAT_URL,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            content  = []
+            thinking = []
+            in_think = False
 
-                    msg = obj.get("message", {})
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                    for line in resp:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-                    # Handle explicit thinking field (deepseek-r1 style)
-                    think_chunk = msg.get("thinking", "")
-                    if think_chunk:
-                        thinking.append(think_chunk)
+                        msg = obj.get("message", {})
 
-                    chunk = msg.get("content", "")
-                    if not chunk:
-                        continue
+                        # Handle explicit thinking field (deepseek-r1 style)
+                        think_chunk = msg.get("thinking", "")
+                        if think_chunk:
+                            thinking.append(think_chunk)
 
-                    # Handle inline <think> tags
-                    if "<think>" in chunk:
-                        in_think = True
-                    if in_think:
-                        thinking.append(chunk)
-                        if "</think>" in chunk:
-                            in_think = False
-                    else:
-                        content.append(chunk)
+                        chunk = msg.get("content", "")
+                        if not chunk:
+                            continue
 
-                    if obj.get("done"):
-                        break
-        except urllib.error.URLError as exc:
-            raise ConnectionError(
-                f"Cannot reach Ollama at {OLLAMA_CHAT_URL}: {exc}"
-            ) from exc
+                        # Handle inline <think> tags
+                        if "<think>" in chunk:
+                            in_think = True
+                        if in_think:
+                            thinking.append(chunk)
+                            if "</think>" in chunk:
+                                in_think = False
+                        else:
+                            content.append(chunk)
 
-        text = "".join(content)
-        if thinking:
-            think_text = "".join(thinking)
-            if "<think>" not in think_text:
-                think_text = f"<think>{think_text}</think>"
-            text = think_text + text
+                        if obj.get("done"):
+                            break
 
-        if self.debug:
-            print(f"[llm] ollama/{self.model}: {len(text)} chars")
+                # Success — build and return text
+                text = "".join(content)
+                if thinking:
+                    think_text = "".join(thinking)
+                    if "<think>" not in think_text:
+                        think_text = f"<think>{think_text}</think>"
+                    text = think_text + text
 
-        return text
+                if self.debug:
+                    print(f"[llm] ollama/{self.model}: {len(text)} chars")
+
+                return text
+
+            except urllib.error.URLError as exc:
+                is_timeout = isinstance(exc.reason, _socket.timeout)
+                if is_timeout and attempt == 0:
+                    _log.warning(
+                        "Ollama request timed out after %.0fs (attempt 1/2), retrying in 10s…",
+                        self.timeout,
+                    )
+                    time.sleep(10)
+                    continue
+                if is_timeout:
+                    _log.error(
+                        "Ollama request timed out on retry (attempt 2/2), giving up."
+                    )
+                raise ConnectionError(
+                    f"Cannot reach Ollama at {OLLAMA_CHAT_URL}: {exc}"
+                ) from exc
+
+        # Unreachable, but satisfies type checker
+        raise ConnectionError("Ollama request failed after retry")
 
     def _generate_anthropic(
         self,

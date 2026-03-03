@@ -72,6 +72,8 @@ export OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
 export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-"f16"}
 export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
 export OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
+# Never unload idle models — prevents the 30-60s reload penalty that blows past timeouts
+export OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
 
 echo "Starting Ollama (parallel=$OLLAMA_NUM_PARALLEL, max_models=$OLLAMA_MAX_LOADED_MODELS)…"
 ollama serve &
@@ -99,6 +101,37 @@ ollama pull "$REASONER_MODEL" || true
 if [ "$CODER_MODEL" != "$REASONER_MODEL" ]; then
     ollama pull "$CODER_MODEL" || true
 fi
+
+# ---------------------------------------------------------------------------
+# Pre-warm: load both models into VRAM now so first real task has no cold-start
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "Pre-warming models (loading into VRAM)…"
+curl -s http://localhost:11434/api/generate \
+    -d "{\"model\":\"${REASONER_MODEL}\",\"prompt\":\"hi\",\"stream\":false}" > /dev/null &
+WARM_PID1=$!
+# Only fire a second request if the coder model differs from the reasoner
+if [ "$CODER_MODEL" != "$REASONER_MODEL" ]; then
+    curl -s http://localhost:11434/api/generate \
+        -d "{\"model\":\"${CODER_MODEL}\",\"prompt\":\"hi\",\"stream\":false}" > /dev/null &
+    WARM_PID2=$!
+else
+    WARM_PID2=""
+fi
+wait $WARM_PID1 ${WARM_PID2:-}
+echo "Pre-warm complete. Loaded models:"
+curl -s http://localhost:11434/api/ps \
+  | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for m in data.get('models', []):
+        vram = m.get('size_vram', 0)
+        print(f\"  {m['name']}: size_vram={vram:,} bytes\")
+except Exception:
+    pass
+" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Usage guide
