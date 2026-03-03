@@ -521,8 +521,8 @@ def _extract_code_raw(text: str) -> str | None:
     if not text.strip():
         return None
 
-    # 1. ```python … ``` — last block preferred
-    matches = list(re.finditer(r"```python\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE))
+    # 1. ```python … ``` or ```py … ``` — last block preferred
+    matches = list(re.finditer(r"```(?:python|py)\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE))
     if matches:
         candidate = matches[-1].group(1).strip()
         return _truncate_to_valid_function(candidate) if "def " in candidate else candidate
@@ -573,6 +573,20 @@ def _extract_code(text: str) -> str | None:
         result = _extract_code_raw(think_content)
         if result:
             return result
+
+    # Final fallback: search the entire raw text (think tags and all) for the
+    # last ```python/py … ``` block.  Catches cases where partial fences inside
+    # think blocks confuse earlier passes or where the model used ```py instead
+    # of ```python and the think-stripped text had no recognisable fence.
+    raw_matches = list(re.finditer(
+        r"```(?:python|py)\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE
+    ))
+    if raw_matches:
+        candidate = raw_matches[-1].group(1).strip()
+        if "def " in candidate:
+            return _truncate_to_valid_function(candidate)
+        if candidate:
+            return candidate
 
     return None
 
@@ -748,6 +762,7 @@ class MultiAgent:
         best_n_correct: int        = -1
         cycle:          int        = 0
         task_start:     float      = time.time()
+        tried_codes:    set[str]   = set()    # deduplication across all coder attempts
         # Short identifier for log lines — hash of first training pair input
         _task_id = hex(abs(hash(str(task["train"][0]["input"].tolist()))))[-8:]
 
@@ -873,6 +888,24 @@ class MultiAgent:
                 hyp_index    += 1
                 decomp_tried  = False
                 continue
+
+            # Deduplication: skip sandbox if this exact code was already tried
+            code_key = code.strip()
+            if code_key in tried_codes:
+                logger.info(
+                    "[stage] Coder duplicate detected (cycle=%d hyp=%d) — forcing new approach",
+                    cycle, hyp_index,
+                )
+                log.append({
+                    "cycle": cycle, "agent": "coder",
+                    "hypothesis_index": hyp_index, "error": "duplicate_code",
+                })
+                coder_feedback = (
+                    "This code is identical to a previous attempt. "
+                    "Try a fundamentally different approach."
+                )
+                continue
+            tried_codes.add(code_key)
 
             eval_result = sandbox.evaluate_code(code, task)
             n_correct   = eval_result["n_correct"]

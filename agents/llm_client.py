@@ -84,25 +84,38 @@ class LLMClient:
 
     def generate(
         self,
-        system:      str,
-        messages:    list[dict[str, str]],
-        temperature: float | None = None,
+        system:         str,
+        messages:       list[dict[str, str]],
+        temperature:    float | None = None,
+        model_override: str | None   = None,
     ) -> str:
-        """Return a completion string for the given system prompt + messages."""
+        """Return a completion string for the given system prompt + messages.
+
+        Args:
+            system:         System prompt.
+            messages:       Conversation messages.
+            temperature:    Override the client's default temperature.
+            model_override: Use this model instead of ``self.model`` for this
+                            single call (Ollama only).  Useful for routing fast
+                            vs. slow roles to different model sizes without
+                            creating separate LLMClient instances.
+        """
         temp = temperature if temperature is not None else self.temperature
 
         if self.backend == "anthropic":
             return self._generate_anthropic(system, messages, temp)
-        return self._generate_ollama(system, messages, temp)
+        return self._generate_ollama(system, messages, temp, model_override=model_override)
 
     def _generate_ollama(
         self,
-        system:      str,
-        messages:    list[dict[str, str]],
-        temperature: float,
+        system:         str,
+        messages:       list[dict[str, str]],
+        temperature:    float,
+        model_override: str | None = None,
     ) -> str:
+        model = model_override or self.model
         payload = {
-            "model":    self.model,
+            "model":    model,
             "messages": [{"role": "system", "content": system}] + messages,
             "stream":   True,
             "options":  {
@@ -178,7 +191,7 @@ class LLMClient:
                     text = think_text + text
 
                 if self.debug:
-                    print(f"[llm] ollama/{self.model}: {len(text)} chars")
+                    print(f"[llm] ollama/{model}: {len(text)} chars")
 
                 return text
 

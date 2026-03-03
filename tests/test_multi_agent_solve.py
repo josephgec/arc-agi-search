@@ -334,14 +334,24 @@ class TestDecomposerIntegration:
         We therefore route the first Critic call to HYPOTHESIZER (advancing
         hyp_index to 1), then route subsequent calls to CODER so stagnation
         can accumulate.
+
+        Each wrong-code call uses a unique comment so the deduplication check
+        does not block stagnation from accumulating.
         """
         call_count = {"n": 0}
 
         def code_side_effect(*a, **kw):
             call_count["n"] += 1
-            # First 5 calls produce wrong code; from 6th onward produce correct code
-            if call_count["n"] <= 5:
-                return "```python\n" + WRONG_CODE + "\n```"
+            n = call_count["n"]
+            # First 5 calls produce wrong code — each unique (avoids dedup block)
+            if n <= 5:
+                return (
+                    f"```python\n"
+                    f"def transform(input_grid):\n"
+                    f"    # attempt {n}\n"
+                    f"    return input_grid * 0\n"
+                    f"```"
+                )
             return "```python\n" + IDENTITY_CODE + "\n```"
 
         critic_seq = (
@@ -414,16 +424,34 @@ class TestVerifierIntegration:
         assert result["success"] is True
 
     def test_verifier_fail_sends_feedback_to_coder(self):
-        """When Verifier fails, the loop continues and Coder gets the verifier feedback."""
-        call_count = {"n": 0}
+        """When Verifier fails, the loop continues and Coder gets the verifier feedback.
+
+        The Coder must produce a unique code on each call so the deduplication
+        check does not block the second all-correct pass from reaching the Verifier.
+        """
+        ver_calls = {"n": 0}
+        cod_calls = {"n": 0}
 
         def verifier_side_effect(*a, **kw):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
+            ver_calls["n"] += 1
+            if ver_calls["n"] == 1:
                 return {"passes": False, "issues": "Hardcoded shape", "suggestion": "Use dynamic shape"}
             return {"passes": True, "issues": "", "suggestion": ""}
 
+        def coder_side_effect(*a, **kw):
+            # Each call produces functionally identical but textually unique code
+            # so the deduplication check doesn't prevent the second verifier call.
+            cod_calls["n"] += 1
+            return (
+                f"```python\n"
+                f"def transform(input_grid):\n"
+                f"    # v{cod_calls['n']}\n"
+                f"    return input_grid.copy()\n"
+                f"```"
+            )
+
         agent = make_agent(
+            code_responses=coder_side_effect,
             verifier_responses=verifier_side_effect,
             max_cycles=15,
             use_verifier=True,

@@ -207,7 +207,11 @@ class Coder:
             content += "\n\nImplement the `transform` function."
 
         messages = [{"role": "user", "content": content}]
-        return self._client.generate(_CODER_SYSTEM, messages, temperature=temperature)
+        return self._client.generate(
+            _CODER_SYSTEM, messages,
+            temperature=temperature,
+            model_override="qwen2.5-coder:7b",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +502,11 @@ class PSOCoder:
         )
 
         messages = [{"role": "user", "content": content}]
-        response = self._client.generate(sys, messages, temperature=temperature)
+        response = self._client.generate(
+            sys, messages,
+            temperature=temperature,
+            model_override="qwen2.5-coder:7b",
+        )
 
         # Extract all python code blocks
         blocks = re.findall(r"```python\s*(.*?)\s*```", response, re.DOTALL)

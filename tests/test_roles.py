@@ -378,6 +378,30 @@ class TestPSOCoder:
         assert len(results) <= 3
 
 
+class TestCoderModelRouting:
+    """Coder and PSOCoder must route to qwen2.5-coder:7b via model_override."""
+
+    def test_coder_passes_fast_model_override(self):
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        coder.generate("hypothesis")
+        call_kwargs = llm.generate.call_args[1]
+        assert call_kwargs.get("model_override") == "qwen2.5-coder:7b"
+
+    def test_pso_coder_passes_fast_model_override(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        pso_coder = PSOCoder(llm, k=2)
+        pso_coder.generate_mutations(
+            task_description="t", training_context="e",
+            current_code="", current_fitness=0.0,
+            pbest_code="def transform(g): return g", pbest_fitness=0.0,
+            gbest_code="def transform(g): return g", gbest_fitness=0.0,
+            role_name="r", role_description="d",
+        )
+        call_kwargs = llm.generate.call_args[1]
+        assert call_kwargs.get("model_override") == "qwen2.5-coder:7b"
+
+
 class TestVerifierExceptionSafety:
     """Verifier._parse_verify_output exception path (line 381-382)."""
 

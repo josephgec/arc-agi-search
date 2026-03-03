@@ -199,6 +199,42 @@ class TestGenerateOllama:
         assert payload["options"]["temperature"] == pytest.approx(0.42)
 
 
+class TestModelOverride:
+    """model_override routes the call to a different model for a single call."""
+
+    def _make_stream_resp(self):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = lambda s: iter([
+            json.dumps({"message": {"content": "ok"}, "done": True}).encode()
+        ])
+        return mock_resp
+
+    def test_model_override_used_in_payload(self):
+        with patch("agents.llm_client.urllib.request.urlopen",
+                   return_value=self._make_stream_resp()):
+            with patch("agents.llm_client.urllib.request.Request") as mock_req:
+                mock_req.return_value = MagicMock(full_url=OLLAMA_CHAT_URL)
+                client = LLMClient(model="deepseek-r1:32b")
+                client.generate(
+                    "sys", [{"role": "user", "content": "q"}],
+                    model_override="qwen2.5-coder:7b",
+                )
+        payload = json.loads(mock_req.call_args[1]["data"].decode())
+        assert payload["model"] == "qwen2.5-coder:7b"
+
+    def test_no_override_uses_configured_model(self):
+        with patch("agents.llm_client.urllib.request.urlopen",
+                   return_value=self._make_stream_resp()):
+            with patch("agents.llm_client.urllib.request.Request") as mock_req:
+                mock_req.return_value = MagicMock(full_url=OLLAMA_CHAT_URL)
+                client = LLMClient(model="deepseek-r1:32b")
+                client.generate("sys", [{"role": "user", "content": "q"}])
+        payload = json.loads(mock_req.call_args[1]["data"].decode())
+        assert payload["model"] == "deepseek-r1:32b"
+
+
 class TestBatchGenerate:
     """Tests for LLMClient.batch_generate (parallel completion)."""
 

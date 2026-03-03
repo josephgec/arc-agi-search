@@ -180,6 +180,56 @@ class TestExtractCode:
         assert "recolor" in code  # real code wins
         assert "g*0" not in code
 
+    def test_backtick_py_fence_extracted(self):
+        """```py ... ``` (without 'python') should be accepted as a code fence."""
+        text = (
+            "Here is my solution:\n"
+            "```py\n"
+            "def transform(input_grid):\n"
+            "    return input_grid[::-1]\n"
+            "```"
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
+    def test_raw_text_fallback_finds_last_fence_in_whole_response(self):
+        """Final fallback: scan entire raw text (think included) for last ```python block."""
+        # Both blocks are inside a malformed think block so earlier passes may miss them;
+        # the final raw-scan should find the LAST one.
+        text = (
+            "<think>\n"
+            "```python\n"
+            "def transform(input_grid):\n"
+            "    return input_grid  # draft\n"
+            "```\n"
+            "Actually let me improve it:\n"
+            "```python\n"
+            "def transform(input_grid):\n"
+            "    return flip(input_grid, 0)\n"
+            "```\n"
+            "</think>\n"
+            "I could not produce a clean answer."
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
+    def test_py_fence_in_think_raw_fallback(self):
+        """```py fence inside a think block is found by the raw final fallback."""
+        text = (
+            "<think>\n"
+            "```py\n"
+            "def transform(input_grid):\n"
+            "    return rotate(input_grid, 1)\n"
+            "```\n"
+            "</think>\n"
+            "The answer is above."
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
 
 # ---------------------------------------------------------------------------
 # _truncate_to_valid_function
@@ -854,6 +904,99 @@ class TestMultiAgentInit:
 # ---------------------------------------------------------------------------
 # Orchestrator.__init__ (orchestrator.py lines 53-71)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Code deduplication in MultiAgent.solve()
+# ---------------------------------------------------------------------------
+
+class TestCodeDeduplication:
+    """Verify that duplicate code is detected and skipped without re-running sandbox."""
+
+    def _make_task(self):
+        """Minimal 1-pair task returning a fixed 1×1 grid."""
+        g = np.array([[1]], dtype=np.int32)
+        return {"train": [{"input": g, "output": g}], "test": [{"input": g}]}
+
+    def test_duplicate_code_gets_new_approach_feedback(self):
+        """When Coder returns the same code twice, solve() injects a diversity prompt."""
+        from unittest.mock import patch, MagicMock
+        from agents.multi_agent import MultiAgent
+
+        code_once = "def transform(input_grid):\n    return input_grid.copy()\n"
+
+        with patch("agents.multi_agent.LLMClient") as MockClient:
+            MockClient.return_value = MagicMock(model="mock")
+            agent = MultiAgent(max_cycles=6, use_decomposer=False, use_verifier=False)
+
+        call_count = [0]
+        def _fake_coder_generate(hyp, fb=None, training_context=None, temperature=None):
+            call_count[0] += 1
+            # Always return the same code regardless of feedback
+            return f"```python\n{code_once}```"
+
+        def _fake_hyp_generate(desc, feedback=None):
+            return "1. The output is the input copied unchanged for all training examples."
+
+        agent._hypothesizer.generate = _fake_hyp_generate
+        agent._coder.generate = _fake_coder_generate
+
+        with patch("agents.multi_agent.sandbox.evaluate_code") as mock_eval:
+            mock_eval.return_value = {
+                "all_correct": False,
+                "n_correct": 0, "n_total": 1,
+                "pairs": [{"correct": False, "predicted": None,
+                           "expected": np.array([[1]]), "error": None}],
+            }
+            result = agent.solve(self._make_task())
+
+        # sandbox.evaluate_code should NOT be called twice for the same code
+        # (second call is a duplicate and must be skipped)
+        assert mock_eval.call_count < call_count[0], (
+            "sandbox should be skipped for duplicate code"
+        )
+
+    def test_different_codes_both_evaluated(self):
+        """Two distinct code strings must each reach the sandbox."""
+        from unittest.mock import patch, MagicMock
+        from agents.multi_agent import MultiAgent
+        from agents.roles import ROUTE_CODER
+
+        codes = [
+            "def transform(input_grid):\n    return input_grid.copy()\n",
+            "def transform(input_grid):\n    return input_grid[::-1]\n",
+        ]
+        call_idx = [0]
+
+        with patch("agents.multi_agent.LLMClient") as MockClient:
+            MockClient.return_value = MagicMock(model="mock")
+            agent = MultiAgent(max_cycles=8, use_decomposer=False, use_verifier=False)
+
+        def _fake_coder(hyp, fb=None, training_context=None, temperature=None):
+            code = codes[min(call_idx[0], len(codes) - 1)]
+            call_idx[0] += 1
+            return f"```python\n{code}```"
+
+        agent._hypothesizer.generate = lambda *a, **kw: (
+            "1. The output is a copy of the input grid without any modifications made."
+        )
+        agent._coder.generate = _fake_coder
+        # Critic routes back to coder so the hypothesis stays alive for the 2nd attempt
+        agent._critic.analyze = lambda *a, **kw: {
+            "route": ROUTE_CODER, "feedback": "try a different approach"
+        }
+
+        with patch("agents.multi_agent.sandbox.evaluate_code") as mock_eval:
+            mock_eval.return_value = {
+                "all_correct": False,
+                "n_correct": 0, "n_total": 1,
+                "pairs": [{"correct": False, "predicted": None,
+                           "expected": np.array([[1]]), "error": None}],
+            }
+            agent.solve(self._make_task())
+
+        # Both distinct codes should reach the sandbox
+        assert mock_eval.call_count >= 2
+
 
 class TestOrchestratorInit:
     def test_init_computes_max_cycles(self):
