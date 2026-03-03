@@ -57,6 +57,18 @@ _CODER_SYSTEM = (
     "- Use only the DSL primitives listed above plus plain Python/numpy.\n"
     "- The function must handle every training example shown.\n"
     "- No print statements, no side effects, no I/O.\n"
+    "- CRITICAL: Always clamp array indices near grid edges:\n"
+    "    rows, cols = grid.shape\n"
+    "    r_min, r_max = max(0, r-1), min(rows, r+2)\n"
+    "    c_min, c_max = max(0, c-1), min(cols, c+2)\n"
+    "  Never use grid[r-1:r+2] without clamping. Use the safe_neighbors()\n"
+    "  helper when you need a cell's neighbourhood.\n"
+    "\nMANDATORY OUTPUT FORMAT: You MUST wrap your code in a fenced block:\n"
+    "```python\n"
+    "def transform(input_grid):\n"
+    "    \u2026\n"
+    "```\n"
+    "Do NOT output code outside a fenced block. This is required.\n"
 )
 
 _CRITIC_SYSTEM = """\
@@ -99,6 +111,18 @@ _PSO_CODER_SYSTEM = (
     "- Do NOT hardcode specific cell coordinates or shape-based if-else branches.\n"
     "- Prefer solutions that fix the systematic root cause of the listed failures.\n"
     "- No print, no I/O, no side effects.\n"
+    "- CRITICAL: Always clamp array indices near grid edges:\n"
+    "    rows, cols = grid.shape\n"
+    "    r_min, r_max = max(0, r-1), min(rows, r+2)\n"
+    "    c_min, c_max = max(0, c-1), min(cols, c+2)\n"
+    "  Never use grid[r-1:r+2] without clamping. Use the safe_neighbors()\n"
+    "  helper when you need a cell's neighbourhood.\n"
+    "\nMANDATORY OUTPUT FORMAT: You MUST wrap each function in a fenced block:\n"
+    "```python\n"
+    "def transform_1(input_grid):\n"
+    "    \u2026\n"
+    "```\n"
+    "Do NOT output code outside fenced blocks. This is required.\n"
 )
 
 # ---------------------------------------------------------------------------

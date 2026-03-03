@@ -351,3 +351,38 @@ class TestOllamaThinkingFilter:
         # thinking prepended as <think>...</think>, followed by content
         assert "answer" in result
         assert "think step" in result
+
+    def test_close_tag_and_code_in_same_chunk(self):
+        """Regression: code that arrives in the same chunk as </think> must not
+        be swallowed into the thinking buffer."""
+        client = LLMClient(debug=False)
+        chunks = [
+            {"message": {"content": "<think>"}, "done": False},
+            {"message": {"content": "reasoning here"}, "done": False},
+            # </think> and the start of the code block in one chunk
+            {"message": {"content": "</think>\n```python\ndef transform(g):\n    return g\n```"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ]
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_open.return_value.__enter__.return_value = self._make_stream(chunks)
+            result = client.generate("sys", [{"role": "user", "content": "q"}])
+        # The code block must appear outside the <think>...</think> wrapper
+        from agents.multi_agent import _strip_thinking, _extract_code
+        stripped = _strip_thinking(result)
+        assert "def transform" in stripped, (
+            f"Code was swallowed into think block. stripped={stripped!r}"
+        )
+        assert _extract_code(result) is not None
+
+    def test_open_and_close_and_code_all_in_one_chunk(self):
+        """<think>thought</think>code all in a single streaming token."""
+        client = LLMClient(debug=False)
+        chunks = [
+            {"message": {"content": "<think>thought</think>```python\ndef transform(g):\n    return g\n```"}, "done": True},
+        ]
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_open.return_value.__enter__.return_value = self._make_stream(chunks)
+            result = client.generate("sys", [{"role": "user", "content": "q"}])
+        from agents.multi_agent import _strip_thinking
+        stripped = _strip_thinking(result)
+        assert "def transform" in stripped

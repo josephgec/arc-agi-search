@@ -40,6 +40,29 @@ from arc.dsl import (
     detect_grid_layout, find_periodicity, gravity,
 )
 
+
+def safe_neighbors(grid: np.ndarray, r: int, c: int, size: int = 1) -> np.ndarray:
+    """Return the neighbourhood of cell (r, c), clamped to grid boundaries.
+
+    Equivalent to grid[r-size:r+size+1, c-size:c+size+1] but safe at edges.
+    Use instead of grid[r-1:r+2, c-1:c+2] to avoid index wrapping at row 0
+    or the last row/column.
+
+    Args:
+        grid: 2-D numpy array.
+        r:    Row index of the centre cell.
+        c:    Column index of the centre cell.
+        size: Half-width of the neighbourhood (default 1 → 3×3 patch).
+
+    Returns:
+        A sub-array of shape up to (2*size+1, 2*size+1).
+    """
+    r_min = max(0, r - size)
+    r_max = min(grid.shape[0], r + size + 1)
+    c_min = max(0, c - size)
+    c_max = min(grid.shape[1], c + size + 1)
+    return grid[r_min:r_max, c_min:c_max]
+
 # ---------------------------------------------------------------------------
 # Public constants
 # ---------------------------------------------------------------------------
@@ -70,6 +93,7 @@ DSL_NAMESPACE: dict[str, Any] = {
     "detect_grid_layout":  detect_grid_layout,
     "find_periodicity":    find_periodicity,
     "gravity":             gravity,
+    "safe_neighbors":      safe_neighbors,
 }
 
 

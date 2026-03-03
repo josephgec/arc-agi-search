@@ -48,6 +48,13 @@ GRID STRUCTURE ANALYSIS
 PHYSICS / GRAVITY
   gravity(grid, direction="down") -> Grid   Slide non-zero cells to edge (up/down/left/right).
 
+SAFE INDEXING
+  safe_neighbors(grid, r, c, size=1) -> Grid
+      Return the neighbourhood of (r,c) clamped to grid boundaries.
+      Equivalent to grid[r-size:r+size+1, c-size:c+size+1] but safe at edges.
+      ALWAYS use this instead of grid[r-1:r+2, c-1:c+2] to avoid index
+      wrapping when r=0 or c=0 (Python negative indices return wrong data).
+
 numpy is also available as np and numpy.
 
 PARAMETERIZED OPTIMIZATION (optional — CPU sweeps constants automatically):

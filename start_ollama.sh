@@ -27,7 +27,7 @@ set -euo pipefail
 # Tier selection
 # ---------------------------------------------------------------------------
 
-TIER=${TIER:-medium}
+TIER=${TIER:-ultra}   # M1/M2/M3 Ultra 64 GB: ultra is the right default
 
 case "$TIER" in
   small)
@@ -73,7 +73,16 @@ export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-"f16"}
 export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
 export OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
 # Never unload idle models — prevents the 30-60s reload penalty that blows past timeouts
-export OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
+# Unconditional: must be set before ollama serve starts; conditional form preserves
+# stale values from a previous session that did not have -1.
+export OLLAMA_KEEP_ALIVE=-1
+
+# Kill any existing Ollama so the fresh env vars (esp. KEEP_ALIVE) actually take effect
+if pgrep -x ollama > /dev/null 2>&1; then
+    echo "Stopping existing Ollama server…"
+    pkill -x ollama 2>/dev/null || killall ollama 2>/dev/null || true
+    sleep 3
+fi
 
 echo "Starting Ollama (parallel=$OLLAMA_NUM_PARALLEL, max_models=$OLLAMA_MAX_LOADED_MODELS)…"
 ollama serve &

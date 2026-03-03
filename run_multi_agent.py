@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import time
 from pathlib import Path
@@ -61,7 +62,11 @@ def parse_args() -> argparse.Namespace:
     # Shared LLM config
     p.add_argument("--backend",     default="ollama",
                    choices=["ollama", "anthropic"])
-    p.add_argument("--model",       default=None)
+    p.add_argument("--model",        default=None)
+    p.add_argument("--coder-model",  default=None,
+                   help="Override model for Coder role (multi strategy only)")
+    p.add_argument("--critic-model", default=None,
+                   help="Override model for Critic/Decomposer/Verifier roles")
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--max-tokens",  type=int,   default=8192)
     p.add_argument("--timeout",     type=float, default=120.0)
@@ -81,7 +86,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pso-embed-model",    default="nomic-embed-text")
 
     # Output
-    p.add_argument("--max-tasks", type=int, default=None)
+    p.add_argument("--max-tasks",    type=int, default=None)
+    p.add_argument("--task-timeout", type=int, default=0,
+                   help="Hard wall-clock limit per task in seconds (0 = unlimited)")
     p.add_argument("--output",    type=Path, default=None)
     p.add_argument("--debug",     action="store_true")
 
@@ -131,6 +138,10 @@ def build_solver(args: argparse.Namespace):
         return MultiAgent(
             backend=args.backend,
             model=args.model,
+            coder_model=args.coder_model,
+            critic_model=args.critic_model,
+            decomposer_model=args.critic_model,
+            verifier_model=args.critic_model,
             timeout=args.timeout,
             debug=args.debug,
             max_cycles=args.max_cycles,
@@ -141,10 +152,34 @@ def build_solver(args: argparse.Namespace):
 # Execution helpers
 # ---------------------------------------------------------------------------
 
-def solve_task(solver, task_path: Path) -> dict:
-    task    = load_task(task_path)
-    t0      = time.time()
-    result  = solver.solve(task)
+def solve_task(solver, task_path: Path, task_timeout: int = 0) -> dict:
+    task = load_task(task_path)
+    t0   = time.time()
+
+    if task_timeout > 0:
+        def _handler(signum, frame):
+            raise TimeoutError(f"Task exceeded {task_timeout}s wall-clock limit")
+        old = signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(task_timeout)
+
+    try:
+        result = solver.solve(task)
+    except TimeoutError as exc:
+        return {
+            "task":         str(task_path),
+            "success":      False,
+            "test_correct": None,
+            "elapsed_s":    round(time.time() - t0, 2),
+            "code":         "",
+            "prediction":   None,
+            "gbest_fitness": None,
+            "error":        str(exc),
+        }
+    finally:
+        if task_timeout > 0:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
     elapsed = time.time() - t0
 
     pred_list = None
@@ -188,20 +223,31 @@ def main() -> None:
     print()
 
     if args.task:
-        summary = solve_task(solver, args.task)
+        summary = solve_task(solver, args.task, task_timeout=args.task_timeout)
         print(json.dumps(summary, indent=2, default=str))
         all_results = [summary]
     else:
+        import random as _random
         paths = sorted(args.task_dir.glob("*.json"))
+        _random.shuffle(paths)
         if args.max_tasks:
             paths = paths[:args.max_tasks]
         all_results = []
         for i, path in enumerate(paths, 1):
             print(f"[{i}/{len(paths)}] {path.name} … ", end="", flush=True)
-            summary = solve_task(solver, path)
-            status  = "SOLVED" if summary["success"] else "failed"
+            summary = solve_task(solver, path, task_timeout=args.task_timeout)
+            elapsed = summary.get("elapsed_s", 0)
+            if summary.get("error"):
+                status = f"TIMEOUT ({elapsed:.0f}s)"
+            else:
+                status = f"{'SOLVED' if summary['success'] else 'failed'} ({elapsed:.0f}s)"
             print(status)
+            # Running tally every 10 tasks
             all_results.append(summary)
+            if i % 10 == 0:
+                n_so_far = sum(r["success"] for r in all_results)
+                avg_t = sum(r.get("elapsed_s", 0) for r in all_results) / len(all_results)
+                print(f"  → {n_so_far}/{i} solved so far  |  avg {avg_t:.0f}s/task", flush=True)
 
         n_solved = sum(r["success"] for r in all_results)
         print(f"\n{n_solved}/{len(all_results)} solved "

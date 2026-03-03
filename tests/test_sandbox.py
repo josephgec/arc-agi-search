@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arc.sandbox import execute, evaluate_code, compute_spatial_diff, EXECUTION_TIMEOUT, DSL_NAMESPACE
+from arc.sandbox import execute, evaluate_code, compute_spatial_diff, safe_neighbors, EXECUTION_TIMEOUT, DSL_NAMESPACE
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,71 @@ class TestComputeSpatialDiff:
         assert "overlap" in result.lower() or "match" in result.lower()
 
 
+class TestSafeNeighbors:
+    """Tests for safe_neighbors() — bounds-clamped neighbourhood extraction."""
+
+    def setup_method(self):
+        # 5×5 grid: values = row*10 + col (1-indexed) for easy identification
+        self.grid = np.array(
+            [[11, 12, 13, 14, 15],
+             [21, 22, 23, 24, 25],
+             [31, 32, 33, 34, 35],
+             [41, 42, 43, 44, 45],
+             [51, 52, 53, 54, 55]],
+            dtype=np.int32,
+        )
+
+    def test_center_cell_full_3x3(self):
+        # (2,2) with size=1 → rows 1:4, cols 1:4
+        patch = safe_neighbors(self.grid, 2, 2, size=1)
+        expected = np.array([[22, 23, 24], [32, 33, 34], [42, 43, 44]], dtype=np.int32)
+        np.testing.assert_array_equal(patch, expected)
+
+    def test_top_left_corner_clamped(self):
+        # (0,0) with size=1 should only return 2×2, not wrap around to row -1
+        patch = safe_neighbors(self.grid, 0, 0, size=1)
+        expected = np.array([[11, 12], [21, 22]], dtype=np.int32)
+        np.testing.assert_array_equal(patch, expected)
+
+    def test_top_edge_clamped(self):
+        # (0, 2) with size=1 → row clamped to 0:2, col is 1:4
+        patch = safe_neighbors(self.grid, 0, 2, size=1)
+        expected = np.array([[12, 13, 14], [22, 23, 24]], dtype=np.int32)
+        np.testing.assert_array_equal(patch, expected)
+
+    def test_bottom_right_corner_clamped(self):
+        patch = safe_neighbors(self.grid, 4, 4, size=1)
+        expected = np.array([[44, 45], [54, 55]], dtype=np.int32)
+        np.testing.assert_array_equal(patch, expected)
+
+    def test_1x1_grid_always_returns_single_cell(self):
+        tiny = np.array([[7]], dtype=np.int32)
+        patch = safe_neighbors(tiny, 0, 0, size=1)
+        np.testing.assert_array_equal(patch, np.array([[7]], dtype=np.int32))
+
+    def test_size_2_center(self):
+        patch = safe_neighbors(self.grid, 2, 2, size=2)
+        np.testing.assert_array_equal(patch, self.grid)  # full 5×5
+
+    def test_available_in_dsl_namespace(self):
+        assert "safe_neighbors" in DSL_NAMESPACE
+
+    def test_usable_in_sandbox(self):
+        code = (
+            "def transform(input_grid):\n"
+            "    patch = safe_neighbors(input_grid, 0, 0, size=1)\n"
+            "    out = input_grid.copy()\n"
+            "    out[0, 0] = patch.sum()\n"
+            "    return out\n"
+        )
+        grid = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        result, err = execute(code, grid)
+        assert err is None
+        assert result is not None
+        # safe_neighbors(grid, 0, 0) gives [[1,2],[3,4]] → sum=10
+        assert result[0, 0] == 10
+
+
 class TestDSLNamespace:
     def test_required_functions_present(self):
         required = [
@@ -229,6 +294,7 @@ class TestDSLNamespace:
             "flood_fill", "find_objects", "bounding_box", "crop_to_content",
             "pad", "symmetrize", "get_color", "get_size", "get_centroid",
             "detect_grid_layout", "find_periodicity", "gravity",
+            "safe_neighbors",
         ]
         for name in required:
             assert name in DSL_NAMESPACE, f"Missing '{name}' from DSL_NAMESPACE"

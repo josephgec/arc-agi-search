@@ -109,6 +109,77 @@ class TestExtractCode:
         assert _extract_code("") is None
         assert _extract_code("   ") is None
 
+    # --- deepseek-r1 / think-block scenarios ---
+
+    def test_think_then_fenced_block(self):
+        """Long think chain followed by a real code fence — primary path."""
+        text = (
+            "<think>Let me reason step by step.\n"
+            "The grid rotates 90 degrees.\n"
+            "I should use rotate().\n"
+            "</think>\n"
+            "Here is the implementation:\n"
+            "```python\n"
+            "def transform(input_grid):\n"
+            "    return rotate(input_grid, 1)\n"
+            "```"
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+        assert "rotate" in code
+
+    def test_code_inside_think_block_extracted_as_fallback(self):
+        """Model emits code inside <think> and nothing outside — fallback path."""
+        text = (
+            "<think>\n"
+            "```python\n"
+            "def transform(input_grid):\n"
+            "    return flip(input_grid, 1)\n"
+            "```\n"
+            "</think>\n"
+            "The answer is shown above."
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+        assert "flip" in code
+
+    def test_bare_def_in_think_block_extracted_as_fallback(self):
+        """Bare def inside <think>, no fence anywhere — deepest fallback."""
+        text = (
+            "<think>\n"
+            "def transform(input_grid):\n"
+            "    return input_grid[::-1]\n"
+            "</think>\n"
+            "Done."
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
+    def test_no_code_anywhere_returns_none(self):
+        """No code inside or outside think — must return None, not crash."""
+        text = (
+            "<think>I am thinking but have no code.</think>\n"
+            "Sorry, I cannot solve this."
+        )
+        assert _extract_code(text) is None
+
+    def test_fake_code_in_think_ignored_when_real_code_outside(self):
+        """Fake def inside think must not shadow real code outside."""
+        text = (
+            "<think>ignore: def transform(g): return g*0</think>\n"
+            "```python\n"
+            "def transform(input_grid):\n"
+            "    return recolor(input_grid, 1, 2)\n"
+            "```"
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "recolor" in code  # real code wins
+        assert "g*0" not in code
+
 
 # ---------------------------------------------------------------------------
 # _truncate_to_valid_function

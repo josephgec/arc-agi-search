@@ -36,7 +36,7 @@ _log = logging.getLogger(__name__)
 
 OLLAMA_CHAT_URL       = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL      = "http://localhost:11434/api/embeddings"
-DEFAULT_OLLAMA_MODEL  = "deepseek-r1:14b"
+DEFAULT_OLLAMA_MODEL  = "deepseek-r1:32b"
 DEFAULT_EMBED_MODEL   = "nomic-embed-text"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
@@ -145,13 +145,24 @@ class LLMClient:
                         if not chunk:
                             continue
 
-                        # Handle inline <think> tags
-                        if "<think>" in chunk:
+                        # Handle inline <think> tags, carefully splitting at
+                        # the </think> boundary so content in the same chunk
+                        # as the closing tag is not silently swallowed.
+                        if not in_think and "<think>" in chunk:
                             in_think = True
+
                         if in_think:
-                            thinking.append(chunk)
                             if "</think>" in chunk:
+                                # Split: everything up to and including </think>
+                                # goes to thinking; the remainder goes to content.
+                                close_idx = chunk.index("</think>") + len("</think>")
+                                thinking.append(chunk[:close_idx])
                                 in_think = False
+                                remainder = chunk[close_idx:]
+                                if remainder:
+                                    content.append(remainder)
+                            else:
+                                thinking.append(chunk)
                         else:
                             content.append(chunk)
 

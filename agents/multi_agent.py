@@ -13,9 +13,13 @@ The loop runs up to ``max_cycles`` total agent calls.  On each cycle either:
 """
 from __future__ import annotations
 
+import logging
 import re
+import time
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from arc import sandbox
 from arc.grid import Grid, grids_equal
@@ -507,8 +511,13 @@ def _truncate_to_valid_function(text: str) -> str:
     return "\n".join(result).rstrip() if result else text
 
 
-def _extract_code(text: str) -> str | None:
-    text = _strip_thinking(text)
+def _extract_code_raw(text: str) -> str | None:
+    """Extract Python code from *text* without stripping think blocks first.
+
+    Tries five patterns in order of preference and returns the first match,
+    or None if no code-like content is found.  Callers are responsible for
+    deciding whether to pre-strip ``<think>`` blocks.
+    """
     if not text.strip():
         return None
 
@@ -538,6 +547,32 @@ def _extract_code(text: str) -> str | None:
     if "import numpy" in text and "def " in text:
         start = text.rfind("import numpy")
         return _truncate_to_valid_function(text[start:])
+
+    return None
+
+
+def _extract_code(text: str) -> str | None:
+    """Extract Python code, stripping think blocks and falling back into them.
+
+    Strategy:
+      1. Strip ``<think>…</think>`` and search the visible text first.
+      2. If nothing found (model put code inside the think block), search
+         inside each think block as a last resort.
+
+    This handles deepseek-r1 responses where the entire code generation
+    happens inside the chain-of-thought before the model emits an answer.
+    """
+    # Primary: search outside think blocks
+    result = _extract_code_raw(_strip_thinking(text))
+    if result:
+        return result
+
+    # Fallback: code is inside <think> (happens when deepseek-r1 generates
+    # code during its chain-of-thought but doesn't repeat it afterwards)
+    for think_content in re.findall(r"<think>(.*?)</think>", text, re.DOTALL):
+        result = _extract_code_raw(think_content)
+        if result:
+            return result
 
     return None
 
@@ -712,6 +747,9 @@ class MultiAgent:
         best_code:      str | None = None
         best_n_correct: int        = -1
         cycle:          int        = 0
+        task_start:     float      = time.time()
+        # Short identifier for log lines — hash of first training pair input
+        _task_id = hex(abs(hash(str(task["train"][0]["input"].tolist()))))[-8:]
 
         test_pair             = task.get("test", [{}])[0]
         has_test_ground_truth = "output" in test_pair
@@ -735,9 +773,16 @@ class MultiAgent:
                 cycle += 1
                 if cycle > self.max_cycles:
                     break
+                logger.info("[stage] Hypothesizer starting (cycle=%d)", cycle)
+                _t0 = time.time()
                 try:
                     hyp_response = self._hypothesizer.generate(task_description, hyp_feedback)
+                    logger.info("[stage] Hypothesizer done (%.1fs)", time.time() - _t0)
                 except Exception as e:
+                    logger.info(
+                        "[stage] Hypothesizer FAILED: %s: %s (%.1fs)",
+                        type(e).__name__, e, time.time() - _t0,
+                    )
                     log.append({"cycle": cycle, "agent": "hypothesizer", "error": str(e)})
                     break
 
@@ -782,13 +827,23 @@ class MultiAgent:
             cycle += 1
             if cycle > self.max_cycles:
                 break
+            logger.info(
+                "[stage] Coder starting (cycle=%d hyp=%d attempt=%d temp=%.2f)",
+                cycle, hyp_index, coder_attempt, temperature,
+            )
+            _t0 = time.time()
             try:
                 code_response = self._coder.generate(
                     current_hypothesis, coder_feedback,
                     training_context=training_examples,
                     temperature=temperature,
                 )
+                logger.info("[stage] Coder done (%.1fs)", time.time() - _t0)
             except Exception as e:
+                logger.info(
+                    "[stage] Coder FAILED: %s: %s (%.1fs)",
+                    type(e).__name__, e, time.time() - _t0,
+                )
                 log.append({
                     "cycle": cycle, "agent": "coder",
                     "hypothesis_index": hyp_index, "error": str(e),
@@ -821,6 +876,10 @@ class MultiAgent:
 
             eval_result = sandbox.evaluate_code(code, task)
             n_correct   = eval_result["n_correct"]
+            logger.info(
+                "[stage] Sandbox: fitness=n/a correct=%d/%d",
+                n_correct, eval_result["n_total"],
+            )
 
             if n_correct > best_n_correct:
                 best_n_correct = n_correct
@@ -837,11 +896,22 @@ class MultiAgent:
 
             if eval_result["all_correct"]:
                 if self.use_verifier and verifier_attempts < 2:
+                    logger.info("[stage] Verifier starting (cycle=%d)", cycle)
+                    _t0 = time.time()
                     try:
                         ver_result = self._verifier.verify(
                             code, task_description, training_examples, eval_result
                         )
-                    except Exception:
+                        logger.info(
+                            "[stage] Verifier done verdict=%s (%.1fs)",
+                            "pass" if ver_result["passes"] else "fail",
+                            time.time() - _t0,
+                        )
+                    except Exception as e:
+                        logger.info(
+                            "[stage] Verifier FAILED: %s: %s (%.1fs)",
+                            type(e).__name__, e, time.time() - _t0,
+                        )
                         ver_result = {"passes": True, "issues": "", "suggestion": ""}
 
                     log.append({
@@ -860,6 +930,10 @@ class MultiAgent:
                         # Continue the loop so the Coder can fix the fragility
                         continue
 
+                logger.info(
+                    "[summary] task=%s solved=True fitness=1.000 time=%.0fs",
+                    _task_id, time.time() - task_start,
+                )
                 return {
                     "success":      True,
                     "test_correct": self._evaluate_test(best_code, test_pair) if has_test_ground_truth else None,
@@ -906,13 +980,23 @@ class MultiAgent:
             cycle += 1
             if cycle > self.max_cycles:
                 break
+            logger.info("[stage] Critic starting (cycle=%d)", cycle)
+            _t0 = time.time()
             try:
                 critic_result = self._critic.analyze(
                     current_hypothesis, code,
                     _format_error_info(eval_result),
                     _format_spatial_diff(eval_result),
                 )
+                logger.info(
+                    "[stage] Critic done route=%s (%.1fs)",
+                    critic_result["route"], time.time() - _t0,
+                )
             except Exception as e:
+                logger.info(
+                    "[stage] Critic FAILED: %s: %s (%.1fs)",
+                    type(e).__name__, e, time.time() - _t0,
+                )
                 log.append({"cycle": cycle, "agent": "critic", "error": str(e)})
                 hyp_index    += 1
                 coder_attempt = 0
@@ -924,6 +1008,7 @@ class MultiAgent:
                 "route":    critic_result["route"],
                 "feedback": critic_result["feedback"],
             })
+            logger.info("[stage] Critic route: %s", critic_result["route"])
             if self.debug:
                 print(f"[debug] Critic → {critic_result['route']}")
 
@@ -935,6 +1020,11 @@ class MultiAgent:
             else:
                 coder_feedback = critic_result["feedback"]
 
+        _best_fitness = best_n_correct / max(len(task["train"]), 1)
+        logger.info(
+            "[summary] task=%s solved=False fitness=%.3f time=%.0fs",
+            _task_id, _best_fitness, time.time() - task_start,
+        )
         return {
             "success":      False,
             "test_correct": (

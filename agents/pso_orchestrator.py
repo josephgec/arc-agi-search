@@ -39,10 +39,13 @@ A fitness of 1.0 means all training pairs are pixel-perfect.
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from scipy.spatial.distance import cosine
@@ -468,10 +471,13 @@ class PSOOrchestrator:
         task_description  = _format_task_description(task)
         training_examples = _format_training_examples(task)
         log: list[dict]   = []
+        _task_start = time.time()
+        _task_id    = hex(abs(hash(str(task["train"][0]["input"].tolist()))))[-8:]
 
         # ----------------------------------------------------------------
         # Phase 1 — Initialisation
         # ----------------------------------------------------------------
+        logger.info("[PSO] task=%s Initialising %d particles", _task_id, self.n_particles)
         if self.debug:
             print(f"\n[PSO] Initialising {self.n_particles} particles …")
 
@@ -502,6 +508,11 @@ class PSOOrchestrator:
 
         for p in swarm:
             seed_hyp = hypotheses[p.particle_id % len(hypotheses)] if hypotheses else None
+            logger.info(
+                "[PSO] task=%s init particle=%d role=%s",
+                _task_id, p.particle_id, p.role_name,
+            )
+            _t0 = time.time()
             p.code, generated = self._init_particle_code(
                 p, task_description, training_examples, hypothesis=seed_hyp
             )
@@ -519,6 +530,10 @@ class PSOOrchestrator:
                 if beh_pos is not None:
                     p.pos = beh_pos
             p.update_pbest(p.code, p.pos, p.fitness)
+            logger.info(
+                "[PSO] task=%s init particle=%d fitness=%.4f generated=%s (%.1fs)",
+                _task_id, p.particle_id, p.fitness, generated, time.time() - _t0,
+            )
             if self.debug:
                 print(f"  Particle {p.particle_id} ({p.role_name}): fitness={p.fitness:.4f}")
 
@@ -555,6 +570,10 @@ class PSOOrchestrator:
             progress = iteration / max(1, self.max_iterations - 1)
             w_eff = self.w * (1.0 - 0.6 * progress)  # e.g. 0.50 → 0.20
 
+            logger.info(
+                "[PSO] task=%s iter=%d/%d gbest=%.4f w=%.3f",
+                _task_id, iteration + 1, self.max_iterations, gbest_fitness, w_eff,
+            )
             if self.debug:
                 print(
                     f"\n[PSO] Iteration {iteration + 1}/{self.max_iterations}  "
@@ -568,6 +587,7 @@ class PSOOrchestrator:
             }
 
             for p in swarm:
+                _p_t0 = time.time()
                 dim = len(p.pos)
 
                 # ------------------------------------------------------------
@@ -600,6 +620,11 @@ class PSOOrchestrator:
                 # ------------------------------------------------------------
                 diff_str = _format_eval_diff(p.last_eval, max_pairs=len(task["train"]))
 
+                logger.info(
+                    "[PSO] task=%s iter=%d particle=%d role=%s mutation starting",
+                    _task_id, iteration + 1, p.particle_id, p.role_name,
+                )
+                _mut_t0 = time.time()
                 try:
                     candidates = self._pso_coder.generate_mutations(
                         task_description=task_description,
@@ -614,7 +639,17 @@ class PSOOrchestrator:
                         role_description=p.role_desc,
                         eval_diff=diff_str,
                     )
+                    logger.info(
+                        "[PSO] task=%s iter=%d particle=%d mutation done candidates=%d (%.1fs)",
+                        _task_id, iteration + 1, p.particle_id, len(candidates),
+                        time.time() - _mut_t0,
+                    )
                 except Exception as exc:
+                    logger.info(
+                        "[PSO] task=%s iter=%d particle=%d mutation FAILED: %s: %s (%.1fs)",
+                        _task_id, iteration + 1, p.particle_id,
+                        type(exc).__name__, exc, time.time() - _mut_t0,
+                    )
                     if self.debug:
                         print(f"  [PSO] Mutation failed for particle {p.particle_id}: {exc}")
                     candidates = [p.pbest_code]
@@ -672,12 +707,21 @@ class PSOOrchestrator:
                 # Step 5 — Evaluate in sandbox
                 # ------------------------------------------------------------
                 p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=progress)
+                logger.info(
+                    "[PSO] task=%s iter=%d particle=%d fitness=%.4f pbest=%.4f (%.1fs)",
+                    _task_id, iteration + 1, p.particle_id,
+                    p.fitness, p.pbest_fitness, time.time() - _p_t0,
+                )
 
                 # ------------------------------------------------------------
                 # Step 6 — Update personal best
                 # ------------------------------------------------------------
                 if p.fitness > p.pbest_fitness:
                     p.update_pbest(p.code, p.pos, p.fitness)
+                    logger.info(
+                        "[PSO] task=%s iter=%d particle=%d new pbest=%.4f",
+                        _task_id, iteration + 1, p.particle_id, p.pbest_fitness,
+                    )
                     if self.debug:
                         print(
                             f"  Particle {p.particle_id} pbest update: "
@@ -691,6 +735,10 @@ class PSOOrchestrator:
                     gbest_code    = p.code
                     gbest_pos     = p.pos.copy()
                     gbest_fitness = p.fitness
+                    logger.info(
+                        "[PSO] task=%s iter=%d particle=%d NEW GBEST=%.4f",
+                        _task_id, iteration + 1, p.particle_id, gbest_fitness,
+                    )
                     if self.debug:
                         print(
                             f"  *** New gbest! Particle {p.particle_id}: "
@@ -814,7 +862,12 @@ class PSOOrchestrator:
                 task_description, training_examples, log
             )
 
-        return self._make_result(gbest_fitness >= 1.0, gbest_code, gbest_fitness, log, task)
+        _solved = gbest_fitness >= 1.0
+        logger.info(
+            "[PSO] [summary] task=%s solved=%s fitness=%.4f time=%.0fs",
+            _task_id, _solved, gbest_fitness, time.time() - _task_start,
+        )
+        return self._make_result(_solved, gbest_code, gbest_fitness, log, task)
 
     # ------------------------------------------------------------------
     # Refinement helpers
