@@ -25,16 +25,14 @@ from arc import sandbox
 from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
 from agents.roles import Hypothesizer, Coder, Critic, Decomposer, Verifier, ROUTE_HYPOTHESIZER
+from agents.formatting import format_grid_visual
 
 
 # ---------------------------------------------------------------------------
 # Shared constants
 # ---------------------------------------------------------------------------
 
-_DENSE_GRID_THRESHOLD  =  50   # <=50 cells: dense [[v,...],...]
-_RLE_GRID_THRESHOLD    = 400   # 51-400: RLE per row
-_SPARSE_GRID_THRESHOLD = 800   # 401-800: sparse {(r,c)=v,...}
-                                # >800: omitted
+_CODER_NUMPY_MAX_CELLS = 600   # include raw list-of-lists for Coder only when ≤ this
 
 _COLOR_NAMES = {
     0: "black", 1: "blue",   2: "red",    3: "green",  4: "yellow",
@@ -335,25 +333,48 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
 
 
 def _format_training_examples(task: dict) -> str:
+    """Visual format for all roles except Coder (no raw numpy arrays)."""
     lines = ["Training examples (use these to verify your implementation):"]
     for i, pair in enumerate(task["train"]):
-        inp, out  = pair["input"], pair["output"]
-        ih, iw    = inp.shape
-        oh, ow    = out.shape
-        max_cells = max(inp.size, out.size)
-        lines.append(f"Example {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
-        if max_cells > _SPARSE_GRID_THRESHOLD:
-            lines.append(f"  Input:  [large grid — {inp.size} cells, see task description]")
-            lines.append(f"  Output: [large grid — {out.size} cells, see task description]")
-        elif max_cells > _RLE_GRID_THRESHOLD:
-            lines.append(f"  Input  [sparse]: {_grid_to_sparse(inp)}")
-            lines.append(f"  Output [sparse]: {_grid_to_sparse(out)}")
-        elif max_cells > _DENSE_GRID_THRESHOLD:
-            lines.append(f"  Input  [RLE]:\n    {_grid_to_rle(inp)}")
-            lines.append(f"  Output [RLE]:\n    {_grid_to_rle(out)}")
-        else:
-            lines.append(f"  Input:  {_grid_to_str(inp)}")
-            lines.append(f"  Output: {_grid_to_str(out)}")
+        inp, out = pair["input"], pair["output"]
+        ih, iw   = inp.shape
+        oh, ow   = out.shape
+        lines.append(f"\nExample {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
+        lines.append(f"Input:")
+        lines.append(format_grid_visual(inp))
+        lines.append(f"Output:")
+        lines.append(format_grid_visual(out))
+        ann = _diff_annotation(inp, out)
+        if ann:
+            lines.append(ann)
+        sn = _structural_note(inp, out)
+        if sn:
+            lines.append(sn)
+    return "\n".join(lines)
+
+
+def _format_training_examples_coder(task: dict) -> str:
+    """Visual format + raw list-of-lists for the Coder role.
+
+    The Coder needs to author numpy code, so each grid is shown first as
+    a human-readable visual (spatial pattern visible) then as a compact
+    Python list-of-lists (easy to copy into array literals).  Raw arrays
+    are omitted for grids larger than _CODER_NUMPY_MAX_CELLS cells.
+    """
+    lines = ["Training examples (use these to verify your implementation):"]
+    for i, pair in enumerate(task["train"]):
+        inp, out = pair["input"], pair["output"]
+        ih, iw   = inp.shape
+        oh, ow   = out.shape
+        lines.append(f"\nExample {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
+        lines.append("Input:")
+        lines.append(format_grid_visual(inp))
+        if inp.size <= _CODER_NUMPY_MAX_CELLS:
+            lines.append(f"Input array: {_grid_to_str(inp)}")
+        lines.append("Output:")
+        lines.append(format_grid_visual(out))
+        if out.size <= _CODER_NUMPY_MAX_CELLS:
+            lines.append(f"Output array: {_grid_to_str(out)}")
         ann = _diff_annotation(inp, out)
         if ann:
             lines.append(ann)
@@ -393,13 +414,13 @@ def _output_shape_constraint(task: dict) -> str:
 
 
 def _format_task_description(task: dict) -> str:
-    """Format task description showing ALL training pairs.
+    """Format task description showing ALL training pairs using visual grid format.
 
-    Dispatch by max cells in a pair:
-      >800  : omit both grids
-      >400  : sparse {(r,c)=v,...}
-      > 50  : RLE per row
-      <=50  : dense [[v,...],...]
+    All grids use format_grid_visual (single-char colour codes) so the LLM
+    can perceive spatial structure directly.  Small grids (≤10×10) are shown
+    without index labels; larger grids get row/column numbers for orientation.
+    Block-analysis hints are preserved for pairs where the output is an
+    integer multiple of the input size.
     """
     all_pairs = task["train"]
     lines = ["Here is an ARC-AGI puzzle.\n"]
@@ -408,49 +429,20 @@ def _format_task_description(task: dict) -> str:
         inp, out = pair["input"], pair["output"]
         ih, iw   = inp.shape
         oh, ow   = out.shape
-        in_cells  = inp.size
-        out_cells = out.size
-        max_cells = max(in_cells, out_cells)
-
         lines.append(f"### Training pair {i + 1}")
-
-        if max_cells > _SPARSE_GRID_THRESHOLD:
-            lines.append(
-                f"Input  ({ih}\u00d7{iw}): [omitted \u2014 {in_cells} cells, too large to display]"
-            )
-            lines.append(
-                f"Output ({oh}\u00d7{ow}): [omitted \u2014 {out_cells} cells, too large to display]"
-            )
-        elif max_cells > _RLE_GRID_THRESHOLD:
-            # Sparse format: list non-zero cells only
-            lines.append(f"Input  ({ih}\u00d7{iw}) sparse: {_grid_to_sparse(inp)}")
-            lines.append(f"Output ({oh}\u00d7{ow}) sparse: {_grid_to_sparse(out)}")
-        elif max_cells > _DENSE_GRID_THRESHOLD:
-            # RLE format: human-readable run-length encoding
-            lines.append(f"Input  ({ih}\u00d7{iw}) [RLE]:\n  {_grid_to_rle(inp)}")
-            lines.append(f"Output ({oh}\u00d7{ow}) [RLE]:\n  {_grid_to_rle(out)}")
-        else:
-            lines.append(f"Input  ({ih}\u00d7{iw}):\n{_grid_to_str(inp)}")
-            lines.append(f"Output ({oh}\u00d7{ow}):\n{_grid_to_str(out)}")
-            ba = _block_analysis(inp, out)
-            if ba:
-                lines.append(ba)
+        lines.append(f"Input ({ih}×{iw}):")
+        lines.append(format_grid_visual(inp))
+        lines.append(f"Output ({oh}×{ow}):")
+        lines.append(format_grid_visual(out))
+        ba = _block_analysis(inp, out)
+        if ba:
+            lines.append(ba)
         lines.append("")
 
     test_inp = task["test"][0]["input"]
     th, tw   = test_inp.shape
-    test_cells = test_inp.size
-
-    if test_cells > _SPARSE_GRID_THRESHOLD:
-        lines.append(
-            f"### Test input ({th}\u00d7{tw}): [omitted \u2014 {test_cells} cells, too large to display]"
-        )
-    elif test_cells > _RLE_GRID_THRESHOLD:
-        lines.append(f"### Test input ({th}\u00d7{tw}) sparse:\n{_grid_to_sparse(test_inp)}")
-    elif test_cells > _DENSE_GRID_THRESHOLD:
-        lines.append(f"### Test input ({th}\u00d7{tw}) [RLE]:\n  {_grid_to_rle(test_inp)}")
-    else:
-        lines.append(f"### Test input ({th}\u00d7{tw}):\n{_grid_to_str(test_inp)}")
+    lines.append(f"### Test input ({th}×{tw}):")
+    lines.append(format_grid_visual(test_inp))
 
     lines.append(_output_shape_constraint(task))
     lines.append("\nStudy the training pairs and identify the transformation rule.")
@@ -668,8 +660,8 @@ def _format_diff(eval_result: dict) -> str:
                 pred = pair["predicted"]
                 if exp.size <= _FULL_GRID_CELL_LIMIT:
                     section += (
-                        f"\n  Full expected:  {_grid_to_str(exp)}"
-                        f"\n  Full predicted: {_grid_to_str(pred)}"
+                        f"\n  Full expected:\n{format_grid_visual(exp)}"
+                        f"\n  Full predicted:\n{format_grid_visual(pred)}"
                     )
                 first_fail = False
             parts.append(section)
@@ -771,6 +763,7 @@ class MultiAgent:
 
         task_description: str        = _format_task_description(task)
         training_examples: str       = _format_training_examples(task)
+        training_examples_coder: str = _format_training_examples_coder(task)
         hypotheses:        list[str] = []
         hyp_index:         int       = 0
         prev_hyp_index:    int       = -1   # tracks hypothesis transitions
@@ -850,7 +843,7 @@ class MultiAgent:
             try:
                 code_response = self._coder.generate(
                     current_hypothesis, coder_feedback,
-                    training_context=training_examples,
+                    training_context=training_examples_coder,
                     temperature=temperature,
                 )
                 logger.info("[stage] Coder done (%.1fs)", time.time() - _t0)

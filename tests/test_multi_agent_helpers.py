@@ -335,7 +335,7 @@ class TestFormatTaskDescription:
         text = _format_task_description(identity_task)
         assert "×" in text   # e.g. "2×2"
 
-    def test_large_grid_sparse_format(self):
+    def test_large_grid_uses_visual_with_labels(self):
         big = np.ones((21, 21), dtype=np.int32)
         task = {
             "train": [
@@ -346,10 +346,12 @@ class TestFormatTaskDescription:
             "test": [{"input": big}],
         }
         text = _format_task_description(task)
-        # All pairs are shown, but large grids use sparse format
+        # All pairs shown with visual format
         assert "Training pair 3" in text
-        # Large grids (441 cells > RLE threshold 400) use "sparse" notation
-        assert "sparse" in text.lower()
+        # Large grids (>10 in either dim) get row/col index labels
+        assert " 0:" in text
+        # Old compression markers gone
+        assert "sparse" not in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -640,29 +642,36 @@ def _make_task(train_shape, test_shape):
 
 
 class TestFormatTaskDescriptionSizes:
-    def test_very_large_train_grid_omitted(self):
-        # >800 cells triggers "omitted" path for training pair
-        task = _make_task((30, 30), (2, 2))   # 900 train cells
+    def test_very_large_train_grid_shown(self):
+        # All grids shown regardless of size — visual format with row/col labels
+        task = _make_task((30, 30), (2, 2))
         desc = _format_task_description(task)
-        assert "omitted" in desc.lower()
+        assert "Training pair 1" in desc
+        # 30×30 grid → row label pattern present (r_width=2 → " 0:")
+        assert " 0:" in desc
+        assert "omitted" not in desc.lower()
 
-    def test_rle_train_grid(self):
-        # 64 cells (8×8) > 50 → RLE for training pair
+    def test_medium_train_grid_visual(self):
+        # 8×8 grid (≤10 in both dims) → plain visual format, no [RLE]
         task = _make_task((8, 8), (2, 2))
         desc = _format_task_description(task)
-        assert "[RLE]" in desc
+        assert "Training pair 1" in desc
+        assert "[RLE]" not in desc
 
-    def test_very_large_test_input_omitted(self):
-        # Training pair tiny, test input >800 cells → omit test input
+    def test_very_large_test_input_shown(self):
+        # All grids shown — 30×30 test input shown with row/col labels
         task = _make_task((2, 2), (30, 30))
         desc = _format_task_description(task)
-        assert "omitted" in desc.lower()
+        assert "Test input" in desc
+        assert " 0:" in desc
+        assert "omitted" not in desc.lower()
 
-    def test_rle_test_input(self):
-        # Training pair tiny, test input 8×8=64 cells > 50 → RLE for test
+    def test_medium_test_input_visual(self):
+        # 8×8 test input → plain visual format
         task = _make_task((2, 2), (8, 8))
         desc = _format_task_description(task)
-        assert "[RLE]" in desc
+        assert "Test input" in desc
+        assert "[RLE]" not in desc
 
 
 # ---------------------------------------------------------------------------
@@ -822,32 +831,39 @@ class TestFormatTrainingExamplesAdaptive:
         return {"train": [{"input": inp, "output": out}],
                 "test":  [{"input": inp}]}
 
-    def test_large_grid_omitted(self):
-        # >800 cells each → omit message
+    def test_large_grid_shown_with_labels(self):
+        # All grids shown — 30×30 gets row/col labels (>10 in both dims)
         big = np.zeros((30, 30), dtype=np.int32)
         task = self._make_task(big, big)
         result = _format_training_examples(task)
-        assert "large grid" in result
+        assert "Example 1" in result
+        # Row label present for large grid (r_width=2 → " 0:")
+        assert " 0:" in result
+        assert "large grid" not in result.lower()
 
-    def test_medium_sparse_grid(self):
-        # 401-800 cells → sparse format
+    def test_medium_grid_shown_visually(self):
+        # 25×20 grid → shown with visual format and labels (>10 in both dims)
         med = np.zeros((25, 20), dtype=np.int32)  # 500 cells
         med[0, 0] = 3
         task = self._make_task(med, med)
         result = _format_training_examples(task)
-        assert "[sparse]" in result
-        assert "(0,0)=3" in result
+        assert "Example 1" in result
+        assert "[sparse]" not in result
+        # Green (color 3) shown as "G"
+        assert "G" in result
 
-    def test_rle_grid_range(self):
-        # 51-400 cells → RLE format
+    def test_small_grid_visual_format(self):
+        # 8×8 grid (≤10 in both dims) → plain visual format, no [RLE]
         rle_grid = np.zeros((8, 8), dtype=np.int32)  # 64 cells
         rle_grid[0, :] = 1
         task = self._make_task(rle_grid, rle_grid)
         result = _format_training_examples(task)
-        assert "[RLE]" in result
+        assert "[RLE]" not in result
+        # Blue (color 1) shown as "B"
+        assert "B" in result
 
     def test_small_grid_dense(self):
-        # ≤50 cells → dense [[v,...]] format
+        # ≤50 cells → visual format (no [RLE], no [sparse])
         small = np.array([[1, 2], [3, 4]], dtype=np.int32)
         task = self._make_task(small, small)
         result = _format_training_examples(task)
@@ -861,14 +877,17 @@ class TestFormatTrainingExamplesAdaptive:
 # ---------------------------------------------------------------------------
 
 class TestFormatTaskDescLargeTest:
-    def test_large_test_input_omitted(self):
-        # test input >800 cells → omit branch
+    def test_large_test_input_shown(self):
+        # test input 30×30 → shown with visual format + row/col labels (not omitted)
         small  = np.array([[1, 2], [3, 4]], dtype=np.int32)
         big    = np.zeros((30, 30), dtype=np.int32)
         task   = {"train": [{"input": small, "output": small}],
                   "test":  [{"input": big}]}
         result = _format_task_description(task)
-        assert "too large to display" in result
+        assert "Test input" in result
+        # Large grid labels present (r_width=2 → " 0:")
+        assert " 0:" in result
+        assert "too large" not in result.lower()
 
 
 # ---------------------------------------------------------------------------

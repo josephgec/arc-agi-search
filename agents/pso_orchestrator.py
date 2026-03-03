@@ -56,6 +56,7 @@ from arc.grid import Grid, grids_equal
 from agents.llm_client import LLMClient
 from agents.roles import PSOCoder, Hypothesizer
 from agents.dsl_reference import _DSL_REFERENCE
+from agents.formatting import format_grid_visual
 from agents.multi_agent import (
     _format_task_description,
     _format_training_examples,
@@ -64,7 +65,6 @@ from agents.multi_agent import (
     _extract_code,
     _parse_hypotheses,
     _structural_note,
-    _grid_to_str,
 )
 
 # ---------------------------------------------------------------------------
@@ -965,8 +965,8 @@ class PSOOrchestrator:
                             f"{diff_pixels} pixel(s) differ."
                         )
                     else:
-                        fc_lines.append(f"Pair {i+1} — predicted:\n  {_grid_to_str(pred)}")
-                        fc_lines.append(f"Pair {i+1} — expected:\n  {_grid_to_str(exp)}")
+                        fc_lines.append(f"Pair {i+1} — predicted:\n{format_grid_visual(pred)}")
+                        fc_lines.append(f"Pair {i+1} — expected:\n{format_grid_visual(exp)}")
                 if fc_lines:
                     full_comparison = "\n\nFull output comparison for failing pairs:\n" + "\n".join(fc_lines)
 
