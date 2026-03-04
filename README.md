@@ -62,7 +62,7 @@ arc-agi-search/
 │   ├── single_agent.py         ← Single-agent baseline
 │   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
 │
-├── tests/                      ← 496 tests, 94% coverage
+├── tests/                      ← 603 tests, 94% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -110,6 +110,7 @@ The system has two layers that communicate through a single embedding bridge:
 | `multi` | `MultiAgent` | Fast; good for well-structured tasks |
 | `ensemble` | `Ensemble` | Highest reliability via majority voting |
 | `single` | `SingleAgent` | Quick baseline check |
+| `two_phase` | `TwoPhaseOrchestrator` | Fast MultiAgent warm-up → seeded PSO; best of both |
 
 ---
 
@@ -147,40 +148,51 @@ All functions are **pure** — they return a new array and never mutate the inpu
 ```
 Geometric:   crop · rotate · flip · translate · scale · tile
 Colour:      recolor · mask · overlay
-Fill:        flood_fill
+Fill:        flood_fill · fill_enclosed_regions
 Detection:   find_objects · bounding_box · crop_to_content
+Physics:     gravity(grid, direction, bg_color=0)
 ```
 
 These are the only allowed operations inside generated `transform()` functions. They are injected into the sandbox execution namespace automatically.
+
+**`fill_enclosed_regions(grid, fill_color, bg_color=None)`** — BFS from all border cells; any background cell unreachable from the border is *enclosed* and gets painted `fill_color`. Handles rings, thick borders, and multi-region interiors. `bg_color` defaults to `background_color(grid)`.
+
+**`gravity(grid, direction, bg_color=0)`** — Slides all non-background cells toward an edge (`"up"`, `"down"`, `"left"`, `"right"`). The `bg_color` parameter (default `0`) lets gravity work correctly on grids whose empty colour is not black.
 
 ---
 
 #### `arc/sandbox.py` — Hardened Execution
 
-Generated code is untrusted and could contain infinite loops, import statements, or crashes. Every execution runs in a **separate child process** with a hard wall-clock timeout.
+Generated code is untrusted and could contain infinite loops, import statements, or crashes. Every execution runs in a **separate child process** with a hard wall-clock timeout via a persistent `ProcessPoolExecutor`.
 
 ```
 ┌─ Parent process ────────────────────────────────────────────┐
 │                                                             │
+│  _POOL = ProcessPoolExecutor(max_workers=8, fork)           │
+│       (created lazily; shared across all execute() calls)  │
+│                                                             │
 │  execute(code, input_grid, timeout=10s)                     │
 │       │                                                     │
-│       ├── spawn child process                               │
-│       ├── inject DSL_NAMESPACE (np, crop, rotate, ...)      │
-│       ├── exec(code) in child                               │
-│       ├── call transform(input_grid)                        │
-│       ├── put result on mp.Queue                            │
-│       └── join(timeout=10s) ──► kill if alive               │
+│       ├── pool.submit(_subprocess_worker, code, grid)       │
+│       ├── future.result(timeout=10s)                        │
+│       │       worker: inject DSL_NAMESPACE, exec, transform │
+│       │       returns (status, value) tuple                 │
+│       └── TimeoutError / BrokenProcessPool → handled        │
 │                                                             │
 │  evaluate_code(code, task) ──► {pairs, n_correct, ...}      │
+│  shutdown_pool() ──► atexit-registered; safe to call ×N     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
+Using a persistent pool eliminates the 50–200 ms process-spawn overhead on every sandbox call. Workers are forked from the parent so the DSL namespace is inherited without re-importing.
+
 Security guards:
 - `input()` / `sys.stdin` usage → rejected before spawning
-- Hard timeout → process killed if exceeded
+- Hard timeout via `future.result(timeout=t)` → timed-out worker replaced automatically by the pool
+- `BrokenProcessPool` → caught; pool reset via `shutdown_pool()`
 - No network, no file-write access (subprocess isolation)
 
-**Parameterized CPU Search** (`param_search`): if generated code defines a `PARAM_GRID = dict(...)` mapping parameter names to lists of values, `param_search` sweeps all combinations (up to 1,000) in a single sandboxed subprocess, returning the best `(params, fitness)` pair — offloading constant-guessing from the LLM to the CPU:
+**Parameterized CPU Search** (`param_search`): if generated code defines a `PARAM_GRID = dict(...)` mapping parameter names to lists of values, `param_search` sweeps all combinations (up to `MAX_PARAM_COMBINATIONS = 5000`) in a single sandboxed subprocess, returning the best `(params, fitness)` pair — offloading constant-guessing from the LLM to the CPU:
 
 ```python
 # LLM writes this pattern; CPU sweeps all 100 combinations automatically
@@ -215,7 +227,16 @@ pixel_score = correct_cells / total_target_cells
 | Right colours, wrong positions | `0.2–0.5` |
 | Wrong shape | `< 0.5` |
 
-**AST Complexity Penalty** (`calculate_complexity_penalty`): deducted from fitness to penalise memorisation code. Penalises `If` nodes (+0.005 each), large literals with >5 elements (+0.02 each), and `Compare` nodes (+0.002 each), capped at 0.15. A `SyntaxError` returns a flat 0.10 penalty.
+**AST Complexity Penalty** (`calculate_complexity_penalty`): deducted from fitness to penalise memorisation code. Two additive terms, overall cap `0.50`:
+
+| Term | Trigger | Per-node penalty |
+|---|---|---|
+| `If` nodes | Heavy branching | +0.005 |
+| Large literals (>5 elements) | Hardcoded arrays/dicts | +0.02 |
+| `Compare` nodes | Raw coordinate comparisons | +0.002 |
+| **Literal-data ratio** | `sum(repr lengths of ast.Constant nodes) / len(code) > 0.40` | `+min(0.50, ratio)` |
+
+The literal-data ratio term specifically targets lookup-table memorisation — code whose body is dominated by hardcoded grid data rather than transformation logic. A memoriser accumulates enough penalty that its net fitness stays below `1.0`, preventing it from displacing genuinely correct `gbest` code. A `SyntaxError` returns a flat `0.10` penalty.
 
 ```
 final_fitness = max(0.0, raw_fitness - complexity_penalty)
@@ -262,7 +283,12 @@ Hypothesizer   generates 3 competing natural-language hypotheses
                about the transformation rule
 
 Coder          translates one hypothesis into a Python transform()
-               function using only the DSL primitives
+               function using only the DSL primitives.
+               prior_failures= parameter: a rolling window of up to 3
+               (code_snippet, critic_feedback) pairs from previous failed
+               attempts under the same hypothesis, injected into the prompt
+               as explicit negative examples so the model avoids repeating
+               broken patterns.
 
 Critic         reads the error diff and decides:
                ROUTE: hypothesizer  ← hypothesis is fundamentally wrong
@@ -277,7 +303,10 @@ Verifier       gates success — re-reads the code and training pairs and
                (returns passes=True) on any malformed or missing response
 
 PSOCoder       generates K distinct Python functions that blend the
-               logic of pbest and gbest to move toward the PSO target
+               logic of pbest and gbest to move toward the PSO target.
+               failed_examples= parameter: list of (snippet, fitness, error)
+               tuples shown before the reference code so the model avoids
+               repeating candidates that already proved ineffective.
 ```
 
 ---
@@ -318,6 +347,35 @@ A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 a
 #### `agents/pso_orchestrator.py` — PSO Swarm Solver
 
 The core contribution. See [The PSO Algorithm in Detail](#the-pso-algorithm-in-detail) below.
+
+Key additions beyond the base PSO loop:
+
+**Parallel particle updates** — each iteration runs all N particles concurrently inside a `ThreadPoolExecutor(max_workers=N)`. Ollama HTTP calls release the GIL, so all N LLM mutation requests are in-flight simultaneously. A gbest snapshot is taken before each iteration; Step 7 (global best update) reconciles in the main thread after all futures complete. An early-exit cancels queued futures the moment any particle reaches `fitness ≥ 1.0`.
+
+**Staleness early-exit** — if `gbest_fitness` hasn't improved by more than `0.01` for 3 consecutive iterations, the loop terminates early and logs `"[pso] Stagnation detected after {n} iterations, terminating"`. This is independent of the existing particle-reinit stagnation mechanism (which uses a tighter `1e-6` threshold and triggers crossover/reinit instead of stopping).
+
+**`seed_particles(initial_codes)`** — call before `solve()` to pre-seed the first N particles with provided code strings instead of LLM-generated initialisation. Used by `TwoPhaseOrchestrator` to hand the MultiAgent's best code directly to PSO. Empty strings fall back to normal LLM init; the seed list is consumed (reset to `[]`) at the start of each `solve()` call.
+
+---
+
+#### `run_multi_agent.py` — `TwoPhaseOrchestrator`
+
+A coordination wrapper that combines fast multi-agent warm-up with PSO refinement:
+
+```
+Phase 1 — MultiAgent(max_cycles=5, model=phase1_model)
+    fast 7b model; low token budget; quick pattern check
+          │
+          ├─ success? ──► return result immediately (PSO never runs)
+          │
+          └─ failed? ──► pso.seed_particles([best_code_from_phase1])
+                               │
+                         Phase 2 — PSOOrchestrator(full reasoner model)
+                               starts from a warmed-up position rather
+                               than random initialisation
+```
+
+Activated with `--strategy two_phase`. Use `--coder-model qwen2.5-coder:7b` to set the fast phase-1 model while keeping the 32b reasoner for phase 2.
 
 ---
 
@@ -771,8 +829,10 @@ TIER=ultra  ./start_ollama.sh      # ~25 GB — deepseek-r1:32b (reasoner) + qwe
 
 # Performance flags (set automatically by start_ollama.sh):
 #   OLLAMA_FLASH_ATTENTION=1     — fused attention kernel for Apple Silicon
-#   OLLAMA_KV_CACHE_TYPE=f16    — optimal KV cache precision for M-series bandwidth
-#   OLLAMA_NUM_PARALLEL=4       — concurrent request slots (set to batch_generate workers)
+#   OLLAMA_KV_CACHE_TYPE=q8_0   — halves KV memory vs f16 with negligible quality loss
+#                                  frees ~6 GB on 64 GB machines for an extra parallel slot
+#   OLLAMA_NUM_PARALLEL=6       — matches PSO swarm size; 6 concurrent LLM streams
+#   OLLAMA_KEEP_ALIVE=-1        — models stay loaded; avoids 30-60s reload penalty
 ```
 
 ### PSO Solver
@@ -821,6 +881,10 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy ensemble
 
 # Single-agent baseline
 python run_multi_agent.py --task data/training/007bbfb7.json --strategy single
+
+# Two-phase: fast 7b MultiAgent warm-up, then seeded PSO if unsolved
+python run_multi_agent.py --task data/training/007bbfb7.json --strategy two_phase \
+    --coder-model qwen2.5-coder:7b
 ```
 
 ### Output Format
@@ -843,7 +907,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy single
 ## Running Tests
 
 ```bash
-# Run all 496 tests
+# Run all 603 tests
 python -m pytest
 
 # With coverage report
@@ -879,7 +943,7 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 | `arc/sandbox.py` | 96% |
 | **Total** | **94%** |
 
-> `arc/sandbox.py` subprocess worker bodies are tested by calling them directly in-process with a threading `Queue`, giving full line coverage without requiring a real child process.
+> `arc/sandbox.py` subprocess worker bodies (`_subprocess_worker`, `_param_search_worker`) are tested by calling them directly in-process, giving full line coverage without requiring a real child process. The persistent `ProcessPoolExecutor` is registered with `atexit` so pytest exits cleanly without hanging.
 
 ---
 
