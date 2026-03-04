@@ -63,14 +63,16 @@ echo ""
 # Ollama server settings
 # ---------------------------------------------------------------------------
 # OLLAMA_FLASH_ATTENTION  — fused attention kernel; critical speedup on M-series
-# OLLAMA_KV_CACHE_TYPE    — f16 KV cache is ideal for Apple Silicon (800 GB/s bandwidth)
-# OLLAMA_NUM_PARALLEL     — simultaneous token streams; match to GPU core count
+# OLLAMA_KV_CACHE_TYPE    — q8_0 halves KV memory vs f16 with negligible quality loss
+#                           Memory: models ~25 GB + KV 6×q8 ~6 GB + embed ~0.3 GB
+#                           + system ~4 GB ≈ 35 GB of 64 GB (~29 GB headroom)
+# OLLAMA_NUM_PARALLEL     — simultaneous token streams; 6 fills headroom on M1 Ultra
 # OLLAMA_MAX_LOADED_MODELS — keep reasoner + coder both hot in VRAM
 # Lower OLLAMA_NUM_PARALLEL or set OLLAMA_MAX_LOADED_MODELS=1 if you hit OOM.
 
 export OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
-export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-"f16"}
-export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
+export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-"q8_0"}
+export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-6}
 export OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
 # Never unload idle models — prevents the 30-60s reload penalty that blows past timeouts
 # Unconditional: must be set before ollama serve starts; conditional form preserves
