@@ -45,8 +45,19 @@ GRID STRUCTURE ANALYSIS
   detect_grid_layout(grid) -> (n_rows,n_cols)|None   Sub-grid sections from divider lines.
   find_periodicity(grid) -> (rp,cp)|None             Smallest exact tiling period.
 
+ENCLOSED REGION FILL
+  fill_enclosed_regions(grid, fill_color, bg_color=None) -> Grid
+      Fill background cells that are completely enclosed by non-background cells.
+      Uses BFS from all border cells; any background cell unreachable from the
+      border is "enclosed" and gets painted fill_color.  bg_color defaults to
+      background_color(grid) (0 when any zero is present).
+      Example: a ring of 1s surrounding interior 0s -> interior 0s become fill_color.
+
 PHYSICS / GRAVITY
-  gravity(grid, direction="down") -> Grid   Slide non-zero cells to edge (up/down/left/right).
+  gravity(grid, direction="down", bg_color=0) -> Grid
+      Slide non-background cells to edge; bg_color fills vacated cells.
+      direction: "down" | "up" | "left" | "right". Each column/row slides independently.
+      bg_color: color treated as empty space (default 0).
 
 SAFE INDEXING
   safe_neighbors(grid, r, c, size=1) -> Grid

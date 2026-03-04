@@ -10,7 +10,8 @@ from arc.dsl import (
     find_objects, bounding_box, crop_to_content,
     pad, symmetrize,
     get_color, get_size, get_centroid,
-    detect_grid_layout, find_periodicity, gravity,
+    detect_grid_layout, find_periodicity,
+    fill_enclosed_regions, gravity,
 )
 
 
@@ -556,3 +557,196 @@ class TestGravity:
         original = grid.copy()
         gravity(grid, "down")
         np.testing.assert_array_equal(grid, original)
+
+    def test_bg_color_nonzero(self):
+        # bg_color=5: treat 5 as empty, slide non-5 cells down
+        grid = g([1, 5], [5, 5], [5, 2])
+        result = gravity(grid, "down", bg_color=5)
+        # col 0: non-bg=[1], fill 2 with 5 → [5,5,1]
+        # col 1: non-bg=[2], fill 2 with 5 → [5,5,2]
+        np.testing.assert_array_equal(result, g([5, 5], [5, 5], [1, 2]))
+
+    def test_bg_color_default_zero(self):
+        # explicit bg_color=0 should behave same as the old default
+        grid = g([1, 0], [0, 0], [0, 2])
+        r1 = gravity(grid, "down")
+        r2 = gravity(grid, "down", bg_color=0)
+        np.testing.assert_array_equal(r1, r2)
+
+
+# ---------------------------------------------------------------------------
+# fill_enclosed_regions
+# ---------------------------------------------------------------------------
+
+class TestFillEnclosedRegions:
+    # ------------------------------------------------------------------
+    # Normal case — single enclosed region
+    # ------------------------------------------------------------------
+
+    def test_single_enclosed_region(self):
+        # Interior (2,2) is background, surrounded by 1s; border zeros open.
+        grid = g(
+            [0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 0],
+            [0, 1, 0, 1, 0],
+            [0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0],
+        )
+        result = fill_enclosed_regions(grid, fill_color=2)
+        # Interior cell filled; border zeros untouched
+        assert result[2, 2] == 2
+        assert result[0, 0] == 0
+        assert result[4, 4] == 0
+
+    def test_enclosed_cells_all_filled(self):
+        # 3-cell enclosed region
+        grid = g(
+            [1, 1, 1, 1, 1],
+            [1, 0, 0, 0, 1],
+            [1, 1, 1, 1, 1],
+        )
+        result = fill_enclosed_regions(grid, fill_color=3)
+        np.testing.assert_array_equal(
+            result,
+            g(
+                [1, 1, 1, 1, 1],
+                [1, 3, 3, 3, 1],
+                [1, 1, 1, 1, 1],
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # No enclosed regions
+    # ------------------------------------------------------------------
+
+    def test_no_enclosed_regions(self):
+        # L-shaped foreground; all background connected to border
+        grid = g(
+            [0, 0, 0],
+            [0, 1, 0],
+            [0, 0, 0],
+        )
+        result = fill_enclosed_regions(grid, fill_color=2)
+        # All background cells are reachable from the border → unchanged
+        np.testing.assert_array_equal(result, grid)
+
+    def test_open_corridor_not_filled(self):
+        # A gap on the bottom row lets interior escape
+        grid = g(
+            [1, 1, 1, 1],
+            [1, 0, 0, 1],
+            [1, 1, 0, 1],   # gap at bottom-middle
+        )
+        result = fill_enclosed_regions(grid, fill_color=7)
+        # Interior connects to border via bottom gap
+        assert result[1, 1] == 0
+        assert result[1, 2] == 0
+
+    # ------------------------------------------------------------------
+    # Entire interior enclosed (thick border)
+    # ------------------------------------------------------------------
+
+    def test_entire_interior_enclosed(self):
+        grid = g(
+            [1, 1, 1, 1, 1],
+            [1, 0, 0, 0, 1],
+            [1, 0, 0, 0, 1],
+            [1, 0, 0, 0, 1],
+            [1, 1, 1, 1, 1],
+        )
+        result = fill_enclosed_regions(grid, fill_color=9)
+        # All nine interior cells should be filled
+        assert (result[1:4, 1:4] == 9).all()
+        # Border 1s unchanged
+        assert (result[0, :] == 1).all()
+        assert (result[4, :] == 1).all()
+
+    # ------------------------------------------------------------------
+    # 1×1 grid
+    # ------------------------------------------------------------------
+
+    def test_1x1_bg_cell(self):
+        # Single background cell is on the border → not enclosed
+        grid = g([0])
+        result = fill_enclosed_regions(grid, fill_color=5)
+        np.testing.assert_array_equal(result, grid)
+
+    def test_1x1_nonbg_cell(self):
+        # Single non-background cell — no background at all
+        grid = g([3])
+        result = fill_enclosed_regions(grid, fill_color=5)
+        np.testing.assert_array_equal(result, grid)
+
+    # ------------------------------------------------------------------
+    # Multiple enclosed regions of different colors (bg_color parameter)
+    # ------------------------------------------------------------------
+
+    def test_multiple_enclosed_regions_same_bg(self):
+        # Two separate enclosed 0-regions; both get filled
+        grid = g(
+            [1, 1, 1, 1, 1, 1, 1],
+            [1, 0, 1, 1, 1, 0, 1],
+            [1, 1, 1, 1, 1, 1, 1],
+        )
+        result = fill_enclosed_regions(grid, fill_color=4)
+        assert result[1, 1] == 4
+        assert result[1, 5] == 4
+
+    def test_custom_bg_color(self):
+        # Background is 9; enclosed 9-cells should be filled
+        grid = g(
+            [1, 1, 1],
+            [1, 9, 1],
+            [1, 1, 1],
+        )
+        result = fill_enclosed_regions(grid, fill_color=2, bg_color=9)
+        assert result[1, 1] == 2
+
+    def test_custom_bg_color_border_not_filled(self):
+        # Background 9 on border stays 9; only interior enclosed 9 gets filled
+        grid = g(
+            [9, 9, 9, 9],
+            [9, 1, 1, 9],
+            [9, 1, 9, 1],   # interior 9 at (2,2)
+            [9, 1, 1, 9],
+            [9, 9, 9, 9],
+        )
+        result = fill_enclosed_regions(grid, fill_color=3, bg_color=9)
+        assert result[2, 2] == 3     # enclosed interior → filled
+        assert result[0, 0] == 9     # border bg → unchanged
+
+    # ------------------------------------------------------------------
+    # Does not mutate input
+    # ------------------------------------------------------------------
+
+    def test_does_not_mutate(self):
+        grid = g(
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+        )
+        original = grid.copy()
+        fill_enclosed_regions(grid, fill_color=5)
+        np.testing.assert_array_equal(grid, original)
+
+    # ------------------------------------------------------------------
+    # Returns int32 dtype
+    # ------------------------------------------------------------------
+
+    def test_returns_int32(self):
+        grid = g([1, 1], [1, 0])
+        result = fill_enclosed_regions(grid, fill_color=2)
+        assert result.dtype == np.int32
+
+    # ------------------------------------------------------------------
+    # fill_color equals bg_color is a no-op (enclosed → same as bg)
+    # ------------------------------------------------------------------
+
+    def test_fill_color_same_as_bg_is_noop(self):
+        grid = g(
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+        )
+        result = fill_enclosed_regions(grid, fill_color=0)
+        np.testing.assert_array_equal(result, grid)

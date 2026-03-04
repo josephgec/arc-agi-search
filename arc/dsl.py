@@ -333,24 +333,108 @@ def find_periodicity(grid: Grid) -> tuple | None:
 
 
 # ---------------------------------------------------------------------------
+# Enclosed-region fill
+# ---------------------------------------------------------------------------
+
+def fill_enclosed_regions(grid: Grid, fill_color: int, bg_color: int | None = None) -> Grid:
+    """Fill background cells that are completely enclosed by non-background cells.
+
+    A background cell is "enclosed" if it cannot be reached by BFS starting
+    from any border cell while stepping only through other background cells
+    (4-connectivity).  Cells reachable from the border are open to the
+    outside; all remaining background cells are interior and get filled.
+
+    Args:
+        grid:       Input grid.
+        fill_color: Color to paint enclosed cells.
+        bg_color:   Color treated as background.  If None, uses
+                    background_color(grid) — 0 when any zero exists,
+                    otherwise the most-frequent color.
+
+    Returns:
+        New grid with all enclosed background regions set to fill_color.
+
+    Example::
+
+        grid = np.array([
+            [0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 0],
+            [0, 1, 0, 1, 0],
+            [0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0],
+        ], dtype=np.int32)
+        fill_enclosed_regions(grid, fill_color=2)
+        # → interior (2,2) becomes 2; border zeros stay 0
+    """
+    if bg_color is None:
+        bg_color = background_color(grid)
+
+    rows, cols = grid.shape
+    reachable = np.zeros((rows, cols), dtype=bool)
+
+    # Seed BFS from every border cell that is background.
+    queue: list[tuple[int, int]] = []
+    for r in range(rows):
+        for c in (0, cols - 1):
+            if grid[r, c] == bg_color and not reachable[r, c]:
+                reachable[r, c] = True
+                queue.append((r, c))
+    for c in range(cols):
+        for r in (0, rows - 1):
+            if grid[r, c] == bg_color and not reachable[r, c]:
+                reachable[r, c] = True
+                queue.append((r, c))
+
+    # BFS — spread reachability through background cells only.
+    head = 0
+    while head < len(queue):
+        r, c = queue[head]
+        head += 1
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if grid[nr, nc] == bg_color and not reachable[nr, nc]:
+                    reachable[nr, nc] = True
+                    queue.append((nr, nc))
+
+    # Any background cell not reachable from the border is enclosed.
+    result = grid.copy()
+    result[(grid == bg_color) & ~reachable] = fill_color
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Gravity / physics
 # ---------------------------------------------------------------------------
 
-def gravity(grid: Grid, direction: str = "down") -> Grid:
-    """Slide all non-zero cells toward an edge; zeros fill the vacated side.
-    direction: "down" | "up" | "left" | "right". Each column/row slides independently."""
+def gravity(grid: Grid, direction: str = "down", bg_color: int = 0) -> Grid:
+    """Slide all non-background cells toward an edge; bg_color fills the vacated side.
+
+    Each column (for up/down) or row (for left/right) is handled independently.
+
+    Args:
+        grid:      Input grid.
+        direction: "down" | "up" | "left" | "right".
+        bg_color:  Color treated as background / empty space (default 0).
+                   Non-background cells are the ones that slide.
+
+    Returns:
+        New grid with non-background cells packed toward the chosen edge.
+    """
     result = grid.copy()
     rows, cols = result.shape
     if direction in ("down", "up"):
         for c in range(cols):
-            col = result[:, c]; nz = col[col != 0]
-            zeros = np.zeros(rows - len(nz), dtype=np.int32)
-            result[:, c] = np.concatenate([zeros, nz] if direction == "down" else [nz, zeros])
+            col = result[:, c]
+            nz = col[col != bg_color]
+            fill = np.full(rows - len(nz), bg_color, dtype=np.int32)
+            result[:, c] = np.concatenate([fill, nz] if direction == "down" else [nz, fill])
     elif direction in ("left", "right"):
         for r in range(rows):
-            row = result[r, :]; nz = row[row != 0]
-            zeros = np.zeros(cols - len(nz), dtype=np.int32)
-            result[r, :] = np.concatenate([nz, zeros] if direction == "left" else [zeros, nz])
+            row = result[r, :]
+            nz = row[row != bg_color]
+            fill = np.full(cols - len(nz), bg_color, dtype=np.int32)
+            result[r, :] = np.concatenate([nz, fill] if direction == "left" else [fill, nz])
     else:
         raise ValueError(f"direction must be up/down/left/right; got {direction!r}")
     return result
