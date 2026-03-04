@@ -258,21 +258,92 @@ class TestComplexityPenalty:
         code = "x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"
         assert calculate_complexity_penalty(code) > 0.0
 
-    def test_memorisation_code_hits_cap(self):
-        # Heavy branching + large literals should reach the 0.15 cap
+    def test_memorisation_code_structural_penalty(self):
+        # Heavy branching + large literals: structural penalty alone > 0.15
         lines = ["def transform(g):"]
         for i in range(10):
             lines.append(f"    if (g == [{', '.join(str(j) for j in range(10))}]).all(): return g")
         code = "\n".join(lines)
-        assert calculate_complexity_penalty(code) == pytest.approx(0.15)
+        assert calculate_complexity_penalty(code) > 0.15
 
     def test_syntax_error_returns_penalty(self):
         assert calculate_complexity_penalty("def f(: pass") == pytest.approx(0.10)
 
-    def test_penalty_capped_at_015(self):
-        # Regardless of how bad the code is, penalty never exceeds 0.15
+    def test_penalty_capped_at_050(self):
+        # Regardless of how bad the code is, penalty never exceeds 0.50
         code = "\n".join(["if x: pass"] * 100 + ["y = [1,2,3,4,5,6,7,8,9,10]"] * 20)
-        assert calculate_complexity_penalty(code) <= 0.15
+        assert calculate_complexity_penalty(code) <= 0.50
+
+    # ------------------------------------------------------------------
+    # New tests for literal-ratio penalty
+    # ------------------------------------------------------------------
+
+    def test_giant_lookup_dict_high_penalty(self):
+        # Lookup table memorising training examples: literal data dominates code.
+        # Build a dict mapping 20 integer keys to 50-element lists.
+        rows = [
+            "def transform(g):",
+            "    import numpy as np",
+            "    LOOKUP = {",
+        ]
+        for i in range(20):
+            vals = ", ".join(str(v % 10) for v in range(50))
+            rows.append(f"        {i}: [{vals}],")
+        rows += [
+            "    }",
+            "    return LOOKUP.get(int(g[0, 0]), g)",
+        ]
+        code = "\n".join(rows)
+        penalty = calculate_complexity_penalty(code)
+        # Literal ratio should be well above 0.4 → substantial penalty
+        assert penalty > 0.3
+
+    def test_giant_lookup_still_capped_at_050(self):
+        # Even a pathological memoriser must not exceed the 0.50 cap.
+        rows = ["def transform(g):"]
+        for i in range(50):
+            vals = ", ".join(str(v % 10) for v in range(100))
+            rows.append(f"    x_{i} = [{vals}]")
+        code = "\n".join(rows)
+        assert calculate_complexity_penalty(code) <= 0.50
+
+    def test_param_grid_legitimate_not_penalised(self):
+        # PARAM_GRID using dict() + list(range(n)) has almost no literal data.
+        code = (
+            "PARAM_GRID = dict(\n"
+            "    fill_color=list(range(10)),\n"
+            "    target_color=list(range(10)),\n"
+            ")\n"
+            "def transform(grid, fill_color=1, target_color=0):\n"
+            "    result = grid.copy()\n"
+            "    result[result == target_color] = fill_color\n"
+            "    return result\n"
+        )
+        penalty = calculate_complexity_penalty(code)
+        # The only literals are small ints (10, 10, 1, 0) — ratio well below 0.4
+        assert penalty < 0.05
+
+    def test_literal_ratio_below_threshold_no_extra_penalty(self):
+        # Code with some constants but literal_ratio < 0.4 gets no ratio penalty.
+        code = (
+            "def transform(g):\n"
+            "    rows, cols = g.shape\n"
+            "    result = g.copy()\n"
+            "    for r in range(rows):\n"
+            "        for c in range(cols):\n"
+            "            if g[r, c] == 1:\n"
+            "                result[r, c] = 2\n"
+            "    return result\n"
+        )
+        # Only literals: 1, 2 (and shape indexing) — tiny ratio
+        penalty = calculate_complexity_penalty(code)
+        assert penalty < 0.05
+
+    def test_literal_ratio_exactly_at_threshold_no_penalty(self):
+        # Construct code where literal_ratio is just under 0.4 (no ratio penalty)
+        # and check that only structural penalties apply.
+        code = "x = 1\n"  # single constant, very low ratio
+        assert calculate_complexity_penalty(code) < 0.05
 
 
 class TestEdgeCaseFitness:

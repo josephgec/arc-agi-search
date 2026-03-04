@@ -56,18 +56,31 @@ def _count_objects_total(grid: Grid) -> int:
 def calculate_complexity_penalty(code: str) -> float:
     """Penalise spaghetti code that memorises training inputs.
 
-    Computes a small penalty in [0.0, 0.15] based on AST structure:
-      +0.005 per ``if`` statement   — heavy branching
-      +0.02  per large literal      — hardcoded arrays/dicts/tuples (>5 elements)
-      +0.002 per ``Compare`` node   — raw coordinate / value comparisons
+    Structural penalties (accumulate per AST node):
+      +0.005 per ``if`` statement      — heavy branching
+      +0.02  per large literal         — hardcoded arrays/dicts/tuples (>5 elements)
+      +0.002 per ``Compare`` node      — raw coordinate / value comparisons
 
-    Returns 0.10 on SyntaxError (unparseable code gets penalised).
+    Literal-data ratio penalty (applied when the ratio exceeds 0.4):
+      literal_ratio = (sum of repr-lengths of all ast.Constant nodes) / len(code)
+      When literal_ratio > 0.4: penalty += min(0.5, literal_ratio)
+
+    A high literal ratio is the hallmark of lookup-table memorisation — the
+    code body is dominated by hardcoded grid data rather than transformation
+    logic.  This penalty is large enough (up to 0.5) that a memoriser can no
+    longer achieve a net fitness of 1.0 and displace genuinely correct code
+    as gbest.
+
+    Overall cap: 0.50.
+    Returns 0.10 on SyntaxError (unparseable code is penalised but not zero).
     """
     if not code:
         return 0.0
     try:
         tree = ast.parse(code)
         penalty = 0.0
+
+        # Structural penalties
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
                 penalty += 0.005
@@ -77,7 +90,20 @@ def calculate_complexity_penalty(code: str) -> float:
                     penalty += 0.02
             elif isinstance(node, ast.Compare):
                 penalty += 0.002
-        return min(penalty, 0.15)
+
+        # Literal-data ratio: heavy literal content signals memorisation
+        total_chars = len(code)
+        if total_chars > 0:
+            literal_chars = sum(
+                len(repr(node.value))
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant)
+            )
+            literal_ratio = literal_chars / total_chars
+            if literal_ratio > 0.4:
+                penalty += min(0.5, literal_ratio)
+
+        return min(penalty, 0.50)
     except SyntaxError:
         return 0.10
 
