@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arc.sandbox import execute, evaluate_code, compute_spatial_diff, safe_neighbors, EXECUTION_TIMEOUT, DSL_NAMESPACE
+from arc.sandbox import execute, evaluate_code, compute_spatial_diff, safe_neighbors, EXECUTION_TIMEOUT, DSL_NAMESPACE, shutdown_pool, MAX_PARAM_COMBINATIONS
 
 
 # ---------------------------------------------------------------------------
@@ -367,56 +367,42 @@ def transform(grid, src=0, dst=0):
 # _subprocess_worker direct call tests (no forking — covers subprocess body)
 # ---------------------------------------------------------------------------
 
-from arc.sandbox import _subprocess_worker, _param_search_worker
-from queue import Queue as ThreadQueue   # threading queue — works in-process without fork
+from arc.sandbox import _subprocess_worker, _param_search_worker, shutdown_pool, MAX_PARAM_COMBINATIONS
 
 
 class TestSubprocessWorkerDirect:
     """Call _subprocess_worker directly in-process to get line coverage.
 
-    Uses a threading.Queue (not multiprocessing.Queue) because the fork-context
-    Queue uses pipes that require a real subprocess to function correctly.
+    Workers now return (status, value) tuples instead of putting to a queue,
+    so they can be called directly without any multiprocessing infrastructure.
     """
 
-    def _q(self):
-        return ThreadQueue()
-
     def test_compile_error_reports_error(self):
-        q = self._q()
-        _subprocess_worker("def f(: pass", [[1, 0]], q)
-        status, msg = q.get_nowait()
+        status, msg = _subprocess_worker("def f(: pass", [[1, 0]])
         assert status == "error"
         assert "Compile error" in msg
 
     def test_no_transform_function_reports_error(self):
-        q = self._q()
-        _subprocess_worker("x = 42", [[1, 0]], q)
-        status, msg = q.get_nowait()
+        status, msg = _subprocess_worker("x = 42", [[1, 0]])
         assert status == "error"
         assert "transform" in msg.lower()
 
     def test_runtime_error_reports_error(self):
-        q = self._q()
         code = "def transform(g):\n    raise ValueError('boom')\n"
-        _subprocess_worker(code, [[1, 0]], q)
-        status, msg = q.get_nowait()
+        status, msg = _subprocess_worker(code, [[1, 0]])
         assert status == "error"
         assert "Runtime error" in msg
 
     def test_non_ndarray_result_converted(self):
-        q = self._q()
         code = "def transform(g):\n    return g.tolist()\n"
-        _subprocess_worker(code, [[1, 2]], q)
-        status, val = q.get_nowait()
+        status, val = _subprocess_worker(code, [[1, 2]])
         assert status == "ok"
         assert val == [[1, 2]]
 
     def test_non_transform_user_function_used(self):
         # If no 'transform' found, the last user-defined callable is used
-        q = self._q()
         code = "def my_fn(g):\n    return g.copy()\n"
-        _subprocess_worker(code, [[5]], q)
-        status, val = q.get_nowait()
+        status, val = _subprocess_worker(code, [[5]])
         assert status == "ok"
 
 
@@ -427,30 +413,32 @@ class TestParamSearchWorkerDirect:
         ([[1, 0]], [[2, 0]]),
     ]
 
-    def _q(self):
-        return ThreadQueue()
-
     def test_no_param_grid_error(self):
-        q = self._q()
         code = "def transform(g):\n    return g.copy()\n"
-        _param_search_worker(code, self.TASK_PAIRS, q, max_combinations=10)
-        status, _ = q.get_nowait()
+        status, _ = _param_search_worker(code, self.TASK_PAIRS, max_combinations=10)
         assert status == "error"
 
     def test_compile_error(self):
-        q = self._q()
-        _param_search_worker("def f(: pass", self.TASK_PAIRS, q, max_combinations=10)
-        status, _ = q.get_nowait()
+        status, _ = _param_search_worker("def f(: pass", self.TASK_PAIRS, max_combinations=10)
         assert status == "error"
 
     def test_finds_best_params(self):
-        q = self._q()
         code = "PARAM_GRID = dict(v=list(range(5)))\ndef transform(g, v=0):\n    r = g.copy(); r[r==1]=v; return r\n"
-        _param_search_worker(code, self.TASK_PAIRS, q, max_combinations=100)
-        status, (best_params, best_fitness) = q.get_nowait()
+        status, (best_params, best_fitness) = _param_search_worker(
+            code, self.TASK_PAIRS, max_combinations=100
+        )
         assert status == "ok"
         assert best_params.get("v") == 2
         assert best_fitness == pytest.approx(1.0, abs=0.01)
+
+
+class TestShutdownPool:
+    def test_shutdown_pool_safe_to_call_multiple_times(self):
+        shutdown_pool()
+        shutdown_pool()  # second call should not raise
+
+    def test_max_param_combinations_constant(self):
+        assert MAX_PARAM_COMBINATIONS == 5000
 
 
 class TestParamSearchStdinGuard:

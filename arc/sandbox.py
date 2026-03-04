@@ -12,21 +12,22 @@ execute(code, input_grid, timeout) -> (Grid | None, str | None)
 evaluate_code(code, task, timeout) -> dict
     Apply execute() to every training pair and return correctness statistics.
 
+shutdown_pool() -> None
+    Shut down the persistent worker pool (call at program exit or in tests).
+
 Constants
 ---------
-EXECUTION_TIMEOUT   Hard wall-clock limit in seconds (default 10 s).
-DSL_NAMESPACE       The exec namespace seeded with DSL helpers and numpy.
+EXECUTION_TIMEOUT       Hard wall-clock limit in seconds (default 10 s).
+MAX_PARAM_COMBINATIONS  Upper bound on PARAM_GRID combinations swept (default 5000).
+DSL_NAMESPACE           The exec namespace seeded with DSL helpers and numpy.
 """
 from __future__ import annotations
 
+import atexit
+import concurrent.futures as cf
 import multiprocessing as mp
-import sys
+import threading
 from typing import Any
-
-# Use "fork" on macOS/Linux so the child process inherits the parent's memory
-# without re-importing __main__.  "spawn" (macOS default) would re-run the
-# entire entry-point script on every sandbox call, which is both slow and wrong.
-_MP_CTX = mp.get_context("fork")
 
 import numpy as np
 
@@ -37,7 +38,8 @@ from arc.dsl import (
     find_objects, bounding_box, crop_to_content,
     pad, symmetrize,
     get_color, get_size, get_centroid,
-    detect_grid_layout, find_periodicity, gravity,
+    detect_grid_layout, find_periodicity,
+    fill_enclosed_regions, gravity,
 )
 
 
@@ -68,6 +70,7 @@ def safe_neighbors(grid: np.ndarray, r: int, c: int, size: int = 1) -> np.ndarra
 # ---------------------------------------------------------------------------
 
 EXECUTION_TIMEOUT: float = 10.0
+MAX_PARAM_COMBINATIONS: int = 5000
 
 DSL_NAMESPACE: dict[str, Any] = {
     "np":              np,
@@ -92,16 +95,74 @@ DSL_NAMESPACE: dict[str, Any] = {
     "get_centroid":        get_centroid,
     "detect_grid_layout":  detect_grid_layout,
     "find_periodicity":    find_periodicity,
-    "gravity":             gravity,
-    "safe_neighbors":      safe_neighbors,
+    "fill_enclosed_regions": fill_enclosed_regions,
+    "gravity":               gravity,
+    "safe_neighbors":        safe_neighbors,
 }
 
 
 # ---------------------------------------------------------------------------
-# Subprocess worker
+# Persistent worker pool
+# ---------------------------------------------------------------------------
+# Using a ProcessPoolExecutor avoids the ~100 ms spawn overhead that
+# occurred when a new Process was forked for every execute() call.
+# With 6 particles × 10 candidates × 3-5 training pairs the savings
+# are substantial (~18-30 s per PSO iteration on cold-start macOS).
+#
+# fork context: child inherits parent memory (DSL_NAMESPACE, numpy, etc.)
+# so the worker functions require no re-import of heavy dependencies.
+#
+# Timeout semantics: future.result(timeout=t) raises TimeoutError in the
+# calling thread.  The underlying worker process continues until it finishes
+# naturally; the pool spawns a fresh replacement for the next task.  With
+# max_workers=8 and a 10 s execution cap this is acceptable — stuck workers
+# consume one slot briefly before being recycled.
+
+_POOL_MAX_WORKERS = 8
+_POOL: cf.ProcessPoolExecutor | None = None
+_POOL_LOCK = threading.Lock()
+
+
+def _get_pool() -> cf.ProcessPoolExecutor:
+    """Return the shared ProcessPoolExecutor, creating it on first call."""
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = cf.ProcessPoolExecutor(
+                max_workers=_POOL_MAX_WORKERS,
+                mp_context=mp.get_context("fork"),
+            )
+    return _POOL
+
+
+def shutdown_pool() -> None:
+    """Shut down the persistent worker pool.
+
+    Called automatically at process exit (registered with atexit).
+    Safe to call even if the pool was never created or already shut down.
+    """
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is not None:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+            _POOL = None
+
+
+# Ensure the pool is cleaned up when the process exits so that worker
+# processes don't linger and block pytest / script exit.
+atexit.register(shutdown_pool)
+
+
+# ---------------------------------------------------------------------------
+# Subprocess workers
 # ---------------------------------------------------------------------------
 
-def _subprocess_worker(code: str, grid_list: list, out_queue: mp.Queue) -> None:
+def _subprocess_worker(code: str, grid_list: list) -> tuple[str, Any]:
+    """Execute untrusted transform code against one input grid.
+
+    Designed to run inside a ProcessPoolExecutor worker process (fork).
+    Returns ("ok", result_list) on success or ("error", message) on failure.
+    """
     import contextlib
     import io
     import traceback
@@ -114,8 +175,7 @@ def _subprocess_worker(code: str, grid_list: list, out_queue: mp.Queue) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
             exec(code, namespace)  # noqa: S102
     except Exception as e:
-        out_queue.put(("error", f"Compile error: {type(e).__name__}: {e}"))
-        return
+        return ("error", f"Compile error: {type(e).__name__}: {e}")
 
     transform_fn = namespace.get("transform")
     if transform_fn is None:
@@ -129,8 +189,7 @@ def _subprocess_worker(code: str, grid_list: list, out_queue: mp.Queue) -> None:
         if user_fns:
             transform_fn = user_fns[-1]
         else:
-            out_queue.put(("error", "No `transform` function found in generated code."))
-            return
+            return ("error", "No `transform` function found in generated code.")
 
     input_grid = np.array(grid_list, dtype=np.int32)
     try:
@@ -138,9 +197,9 @@ def _subprocess_worker(code: str, grid_list: list, out_queue: mp.Queue) -> None:
             result = transform_fn(input_grid.copy())
         if not isinstance(result, np.ndarray):
             result = np.array(result, dtype=np.int32)
-        out_queue.put(("ok", result.astype(np.int32).tolist()))
+        return ("ok", result.astype(np.int32).tolist())
     except Exception as e:
-        out_queue.put(("error", f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}"))
+        return ("error", f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 # ---------------------------------------------------------------------------
@@ -155,26 +214,20 @@ def execute(
     if "input(" in code or "sys.stdin" in code:
         return None, "Code uses input()/stdin — not allowed; grid is passed as argument."
 
-    out_queue: mp.Queue = _MP_CTX.Queue()
-    proc = _MP_CTX.Process(
-        target=_subprocess_worker,
-        args=(code, input_grid.tolist(), out_queue),
-    )
-    proc.start()
-    proc.join(timeout=timeout)
-
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
+    try:
+        future = _get_pool().submit(_subprocess_worker, code, input_grid.tolist())
+        status, value = future.result(timeout=timeout)
+    except cf.TimeoutError:
         return None, (
             f"Execution timed out after {timeout}s "
             "(infinite loop or excessive computation)"
         )
+    except cf.BrokenProcessPool:
+        shutdown_pool()
+        return None, "Worker pool crashed; pool has been reset."
+    except Exception as exc:
+        return None, f"Execution error: {exc}"
 
-    if out_queue.empty():
-        return None, f"Execution process exited unexpectedly (exit code {proc.exitcode})"
-
-    status, value = out_queue.get()
     if status == "ok":
         return np.array(value, dtype=np.int32), None
     return None, value
@@ -220,10 +273,12 @@ def evaluate_code(
 def _param_search_worker(
     code: str,
     train_pairs: list[tuple[list, list]],
-    out_queue: "mp.Queue[tuple]",
     max_combinations: int,
-) -> None:
-    """Subprocess target: sweep PARAM_GRID and return (best_params, best_fitness)."""
+) -> tuple[str, Any]:
+    """Subprocess target: sweep PARAM_GRID and return (best_params, best_fitness).
+
+    Returns ("ok", (best_params, best_fitness)) or ("error", message).
+    """
     import contextlib
     import io
     import itertools
@@ -237,14 +292,12 @@ def _param_search_worker(
         with contextlib.redirect_stdout(io.StringIO()):
             exec(code, namespace)  # noqa: S102
     except Exception as exc:
-        out_queue.put(("error", f"Compile error: {exc}"))
-        return
+        return ("error", f"Compile error: {exc}")
 
     param_grid = namespace.get("PARAM_GRID", {})
     transform_fn = namespace.get("transform")
     if not param_grid or transform_fn is None:
-        out_queue.put(("error", "Code must define PARAM_GRID and transform(grid, **params)"))
-        return
+        return ("error", "Code must define PARAM_GRID and transform(grid, **params)")
 
     param_names  = list(param_grid.keys())
     param_values = [param_grid[k] for k in param_names]
@@ -272,14 +325,14 @@ def _param_search_worker(
             if best_fitness >= 1.0:
                 break
 
-    out_queue.put(("ok", (best_params, best_fitness)))
+    return ("ok", (best_params, best_fitness))
 
 
 def param_search(
     code: str,
     task: dict,
     timeout: float = 30.0,
-    max_combinations: int = 1000,
+    max_combinations: int = MAX_PARAM_COMBINATIONS,
 ) -> tuple[dict, float]:
     """Sweep all combinations of PARAM_GRID defined in ``code``.
 
@@ -305,23 +358,20 @@ def param_search(
         (pair["input"].tolist(), pair["output"].tolist())
         for pair in task["train"]
     ]
-    out_queue: "mp.Queue[tuple]" = _MP_CTX.Queue()
-    proc = _MP_CTX.Process(
-        target=_param_search_worker,
-        args=(code, train_pairs, out_queue, max_combinations),
-    )
-    proc.start()
-    proc.join(timeout=timeout)
 
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
+    try:
+        future = _get_pool().submit(
+            _param_search_worker, code, train_pairs, max_combinations
+        )
+        status, value = future.result(timeout=timeout)
+    except cf.TimeoutError:
+        return {}, 0.0
+    except cf.BrokenProcessPool:
+        shutdown_pool()
+        return {}, 0.0
+    except Exception:
         return {}, 0.0
 
-    if out_queue.empty():
-        return {}, 0.0
-
-    status, value = out_queue.get()
     if status == "ok":
         best_params, best_fitness = value
         return best_params, float(best_fitness)

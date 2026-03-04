@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -117,6 +119,7 @@ _ROLE_FALLBACK: dict[str, str] = {
 _IDENTITY_FALLBACK = "def transform(input_grid):\n    return input_grid.copy()"
 
 _EMBED_DIM = 768  # nomic-embed-text output dimension
+_FAILED_HISTORY_MAX = 5  # max failed candidates remembered per particle
 
 
 def _compress_grid(g: np.ndarray) -> str:
@@ -142,6 +145,38 @@ def _random_unit_vec(rng: np.random.Generator | None = None) -> np.ndarray:
         v = rng.standard_normal(_EMBED_DIM).astype(np.float32)
     norm = np.linalg.norm(v)
     return v / norm if norm > 0 else v
+
+
+def _brief_error_desc(eval_result: dict, fitness: float) -> str:
+    """Return a one-line description of why a candidate failed.
+
+    Checks (in order): runtime crash, wrong output shape, partial/zero accuracy.
+    """
+    pairs = eval_result.get("pairs", [])
+    if not pairs:
+        return f"fitness={fitness:.3f} (no evaluation data)"
+
+    # Runtime errors take priority
+    errors = [p["error"] for p in pairs if p.get("error")]
+    if errors:
+        msg = str(errors[0])[:80].replace("\n", " ")
+        return f"runtime error: {msg}"
+
+    # Shape mismatches
+    shape_issues: list[str] = []
+    for p in pairs:
+        pred = p.get("predicted")
+        exp  = p.get("expected")
+        if pred is not None and exp is not None:
+            if hasattr(pred, "shape") and hasattr(exp, "shape"):
+                if pred.shape != exp.shape:
+                    shape_issues.append(f"{pred.shape}≠{exp.shape}")
+    if shape_issues:
+        return f"wrong dimensions: {', '.join(shape_issues)}"
+
+    n_correct = eval_result.get("n_correct", 0)
+    n_total   = eval_result.get("n_total", 0)
+    return f"{n_correct}/{n_total} pairs correct, fitness={fitness:.3f}"
 
 
 _INIT_CODER_SYSTEM = (
@@ -183,6 +218,10 @@ class Particle:
     pbest_code:    str              = ""
     pbest_pos:     np.ndarray       = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     pbest_fitness: float            = -1.0
+    # Ring-buffer of (code_snippet, fitness, error_desc) for candidates that
+    # didn't beat pbest.  Passed to generate_mutations() so the LLM learns
+    # what not to regenerate.  Capped at _FAILED_HISTORY_MAX.
+    failed_history: list            = field(default_factory=list)
 
     def update_pbest(self, code: str, pos: np.ndarray, fitness: float) -> None:
         self.pbest_code    = code
@@ -260,8 +299,11 @@ class PSOOrchestrator:
         # _behavior_cache : behavior_text → L2-normalised embedding vector
         # These save up to 40% of total runtime when the LLM emits duplicate
         # or near-identical code across particles / iterations / k-candidates.
+        # _cache_lock protects both dicts for concurrent access by the
+        # per-particle threads spawned in the parallel PSO iteration loop.
         self._sandbox_cache:  dict[str, dict]       = {}
         self._behavior_cache: dict[str, np.ndarray] = {}
+        self._cache_lock = threading.Lock()
 
         # Expose for CLI / logging
         self.backend  = backend
@@ -304,11 +346,12 @@ class PSOOrchestrator:
             return 0.0, empty
 
         cache_key = f"{id(task)}_{hash(code.strip())}"
-        if cache_key in self._sandbox_cache:
-            result = self._sandbox_cache[cache_key]
-        else:
+        with self._cache_lock:
+            result = self._sandbox_cache.get(cache_key)
+        if result is None:
             result = sandbox.evaluate_code(code, task)
-            self._sandbox_cache[cache_key] = result
+            with self._cache_lock:
+                self._sandbox_cache[cache_key] = result
 
         penalty = calculate_complexity_penalty(code)
 
@@ -371,14 +414,17 @@ class PSOOrchestrator:
                 pair_texts.append(f"{exp_text}\n---\n{pred_text}")
 
             behavior_text = "\n===\n".join(pair_texts)
-            if behavior_text in self._behavior_cache:
-                return self._behavior_cache[behavior_text]
+            with self._cache_lock:
+                cached = self._behavior_cache.get(behavior_text)
+            if cached is not None:
+                return cached
 
             vec = self._llm.embed_code(behavior_text, model=self.embed_model)
             norm = np.linalg.norm(vec)
             if norm > 0:
                 final_vec = (vec / norm).astype(np.float32)
-                self._behavior_cache[behavior_text] = final_vec
+                with self._cache_lock:
+                    self._behavior_cache[behavior_text] = final_vec
                 return final_vec
             return _random_unit_vec() if fallback_random else None
         except Exception as exc:
@@ -445,6 +491,177 @@ class PSOOrchestrator:
             return code, True
         fallback = _ROLE_FALLBACK.get(particle.role_name, _IDENTITY_FALLBACK)
         return fallback, False
+
+    # ------------------------------------------------------------------
+    # Per-particle update (runs concurrently in ThreadPoolExecutor)
+    # ------------------------------------------------------------------
+
+    def _particle_step(
+        self,
+        p:                  Particle,
+        gbest_snap_code:    str,
+        gbest_snap_pos:     np.ndarray,
+        gbest_snap_fitness: float,
+        task:               dict,
+        task_description:   str,
+        training_examples:  str,
+        w_eff:              float,
+        progress:           float,
+        _task_id:           str,
+        iteration:          int,
+    ) -> dict:
+        """Execute Steps 1–6 for a single particle.
+
+        Thread-safe: only touches ``p``'s own fields; shared caches are
+        accessed under ``self._cache_lock``; the gbest values are passed
+        in as a snapshot so no shared-state writes occur here.
+
+        Returns a per-particle log dict for ``iter_log["particles"]``.
+        """
+        _p_t0 = time.time()
+        dim = len(p.pos)
+
+        # ----------------------------------------------------------------
+        # Step 1 — PSO velocity update (continuous embedding space)
+        # ----------------------------------------------------------------
+        # Use default_rng() per call to avoid numpy global RNG races.
+        rng = np.random.default_rng()
+        r1 = rng.random(dim).astype(np.float32)
+        r2 = rng.random(dim).astype(np.float32)
+
+        if len(p.velocity) != dim:
+            p.velocity = np.zeros(dim, dtype=np.float32)
+        gbest_pos_d = gbest_snap_pos if len(gbest_snap_pos) == dim else np.zeros(dim, dtype=np.float32)
+
+        p.velocity = (
+            w_eff * p.velocity
+            + self.c1 * r1 * (p.pbest_pos - p.pos)
+            + self.c2 * r2 * (gbest_pos_d - p.pos)
+        )
+
+        target_pos = p.pos + p.velocity
+        t_norm = np.linalg.norm(target_pos)
+        if t_norm > 0:
+            target_pos = target_pos / t_norm
+
+        # ----------------------------------------------------------------
+        # Step 2 — LLM generates K candidate mutations
+        # ----------------------------------------------------------------
+        diff_str = _format_eval_diff(p.last_eval, max_pairs=len(task["train"]))
+
+        logger.info(
+            "[PSO] task=%s iter=%d particle=%d role=%s mutation starting",
+            _task_id, iteration + 1, p.particle_id, p.role_name,
+        )
+        _mut_t0 = time.time()
+        try:
+            candidates = self._pso_coder.generate_mutations(
+                task_description=task_description,
+                training_context=training_examples,
+                current_code=p.code,
+                current_fitness=p.fitness,
+                pbest_code=p.pbest_code,
+                pbest_fitness=p.pbest_fitness,
+                gbest_code=gbest_snap_code,
+                gbest_fitness=gbest_snap_fitness,
+                role_name=p.role_name,
+                role_description=p.role_desc,
+                eval_diff=diff_str,
+                failed_examples=p.failed_history or None,
+            )
+            logger.info(
+                "[PSO] task=%s iter=%d particle=%d mutation done candidates=%d (%.1fs)",
+                _task_id, iteration + 1, p.particle_id, len(candidates),
+                time.time() - _mut_t0,
+            )
+        except Exception as exc:
+            logger.info(
+                "[PSO] task=%s iter=%d particle=%d mutation FAILED: %s: %s (%.1fs)",
+                _task_id, iteration + 1, p.particle_id,
+                type(exc).__name__, exc, time.time() - _mut_t0,
+            )
+            candidates = [p.pbest_code]
+
+        # ----------------------------------------------------------------
+        # Step 3 — Generate-and-Project: fitness-first hybrid selection
+        # ----------------------------------------------------------------
+        best_candidate = p.pbest_code
+        best_emb       = p.pbest_pos.copy()
+
+        cand_results: list[tuple[str, np.ndarray | None, float, float, dict]] = []
+        for cand in candidates:
+            if not cand or not cand.strip():
+                continue
+            fit, eval_res = self._eval_fitness(cand, task, progress=progress)
+            cand_results.append((cand, None, float("inf"), fit, eval_res))
+
+        if cand_results:
+            improving = [t for t in cand_results if t[3] > p.fitness + 1e-6]
+            if improving:
+                winner_code, _, _, _, winner_eval = max(improving, key=lambda x: x[3])
+                best_emb = self._pos_from_eval(winner_code, task, winner_eval)
+                best_candidate = winner_code
+            else:
+                enriched = []
+                for c, _, _, f, eval_res in cand_results:
+                    e = self._pos_from_eval(c, task, eval_res, fallback_random=False)
+                    if e is None or len(e) != len(target_pos):
+                        continue
+                    d = cosine(e, target_pos)
+                    enriched.append((c, e, d, f))
+                if enriched:
+                    best_c, best_e, _, _ = min(enriched, key=lambda x: x[2])
+                    best_candidate = best_c
+                    best_emb       = best_e
+
+        # ----------------------------------------------------------------
+        # Step 3b — Record failed candidates in particle history
+        # ----------------------------------------------------------------
+        for _cand_code, _, _, _cand_fit, _cand_eval in cand_results:
+            if _cand_fit < p.pbest_fitness:
+                _err = _brief_error_desc(_cand_eval, _cand_fit)
+                _snippet = "\n".join(_cand_code.splitlines()[:8])
+                p.failed_history.append((_snippet, _cand_fit, _err))
+        if len(p.failed_history) > _FAILED_HISTORY_MAX:
+            p.failed_history = p.failed_history[-_FAILED_HISTORY_MAX:]
+
+        # ----------------------------------------------------------------
+        # Step 4 — Update particle state
+        # ----------------------------------------------------------------
+        prev_pos   = p.pos.copy()
+        p.code     = best_candidate
+        p.pos      = best_emb
+        if len(p.pos) == len(prev_pos):
+            p.velocity = p.pos - prev_pos
+
+        # ----------------------------------------------------------------
+        # Step 5 — Evaluate in sandbox
+        # ----------------------------------------------------------------
+        p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=progress)
+        logger.info(
+            "[PSO] task=%s iter=%d particle=%d fitness=%.4f pbest=%.4f (%.1fs)",
+            _task_id, iteration + 1, p.particle_id,
+            p.fitness, p.pbest_fitness, time.time() - _p_t0,
+        )
+
+        # ----------------------------------------------------------------
+        # Step 6 — Update personal best
+        # ----------------------------------------------------------------
+        if p.fitness > p.pbest_fitness:
+            p.update_pbest(p.code, p.pos, p.fitness)
+            logger.info(
+                "[PSO] task=%s iter=%d particle=%d new pbest=%.4f",
+                _task_id, iteration + 1, p.particle_id, p.pbest_fitness,
+            )
+
+        return {
+            "particle_id":   p.particle_id,
+            "role":          p.role_name,
+            "fitness":       p.fitness,
+            "pbest_fitness": p.pbest_fitness,
+            "n_candidates":  len(cand_results),
+            "elapsed":       time.time() - _p_t0,
+        }
 
     # ------------------------------------------------------------------
     # Core PSO loop
@@ -586,151 +803,62 @@ class PSOOrchestrator:
                 "particles":     [],
             }
 
+            # ----------------------------------------------------------------
+            # Async PSO: snapshot gbest ONCE at the start of this iteration.
+            # All particles see the same gbest so they update independently
+            # and concurrently — matches the standard async-PSO formulation.
+            # Step 7 (global best update) runs in the main thread after all
+            # futures complete.
+            # ----------------------------------------------------------------
+            gbest_snap_code    = gbest_code
+            gbest_snap_pos     = gbest_pos.copy()
+            gbest_snap_fitness = gbest_fitness
+
+            with ThreadPoolExecutor(max_workers=self.n_particles) as executor:
+                futures = {
+                    executor.submit(
+                        self._particle_step,
+                        p,
+                        gbest_snap_code,
+                        gbest_snap_pos,
+                        gbest_snap_fitness,
+                        task,
+                        task_description,
+                        training_examples,
+                        w_eff,
+                        progress,
+                        _task_id,
+                        iteration,
+                    ): p
+                    for p in swarm
+                }
+
+                early_solved = False
+                for future in as_completed(futures):
+                    try:
+                        particle_log = future.result()
+                    except Exception as exc:
+                        p = futures[future]
+                        particle_log = {
+                            "particle_id":   p.particle_id,
+                            "role":          p.role_name,
+                            "fitness":       p.fitness,
+                            "pbest_fitness": p.pbest_fitness,
+                            "n_candidates":  0,
+                            "error":         str(exc),
+                        }
+                    iter_log["particles"].append(particle_log)
+
+                    # Early exit: cancel queued futures (in-flight ones run to completion)
+                    if particle_log.get("fitness", 0.0) >= 1.0:
+                        early_solved = True
+                        for f in futures:
+                            f.cancel()
+
+            # ----------------------------------------------------------------
+            # Step 7 — Update global best (main thread, after all particles done)
+            # ----------------------------------------------------------------
             for p in swarm:
-                _p_t0 = time.time()
-                dim = len(p.pos)
-
-                # ------------------------------------------------------------
-                # Step 1 — PSO velocity update (continuous embedding space)
-                # ------------------------------------------------------------
-                r1 = np.random.rand(dim).astype(np.float32)
-                r2 = np.random.rand(dim).astype(np.float32)
-
-                if len(p.velocity) != dim:
-                    p.velocity = np.zeros(dim, dtype=np.float32)
-                if len(gbest_pos) != dim:
-                    gbest_pos_d = np.zeros(dim, dtype=np.float32)
-                else:
-                    gbest_pos_d = gbest_pos
-
-                p.velocity = (
-                    w_eff * p.velocity
-                    + self.c1 * r1 * (p.pbest_pos - p.pos)
-                    + self.c2 * r2 * (gbest_pos_d - p.pos)
-                )
-
-                target_pos = p.pos + p.velocity
-                # Keep target on the unit hypersphere (embeddings are normalised)
-                t_norm = np.linalg.norm(target_pos)
-                if t_norm > 0:
-                    target_pos = target_pos / t_norm
-
-                # ------------------------------------------------------------
-                # Step 2 — LLM generates K candidate mutations
-                # ------------------------------------------------------------
-                diff_str = _format_eval_diff(p.last_eval, max_pairs=len(task["train"]))
-
-                logger.info(
-                    "[PSO] task=%s iter=%d particle=%d role=%s mutation starting",
-                    _task_id, iteration + 1, p.particle_id, p.role_name,
-                )
-                _mut_t0 = time.time()
-                try:
-                    candidates = self._pso_coder.generate_mutations(
-                        task_description=task_description,
-                        training_context=training_examples,
-                        current_code=p.code,
-                        current_fitness=p.fitness,
-                        pbest_code=p.pbest_code,
-                        pbest_fitness=p.pbest_fitness,
-                        gbest_code=gbest_code,
-                        gbest_fitness=gbest_fitness,
-                        role_name=p.role_name,
-                        role_description=p.role_desc,
-                        eval_diff=diff_str,
-                    )
-                    logger.info(
-                        "[PSO] task=%s iter=%d particle=%d mutation done candidates=%d (%.1fs)",
-                        _task_id, iteration + 1, p.particle_id, len(candidates),
-                        time.time() - _mut_t0,
-                    )
-                except Exception as exc:
-                    logger.info(
-                        "[PSO] task=%s iter=%d particle=%d mutation FAILED: %s: %s (%.1fs)",
-                        _task_id, iteration + 1, p.particle_id,
-                        type(exc).__name__, exc, time.time() - _mut_t0,
-                    )
-                    if self.debug:
-                        print(f"  [PSO] Mutation failed for particle {p.particle_id}: {exc}")
-                    candidates = [p.pbest_code]
-
-                # ------------------------------------------------------------
-                # Step 3 — Generate-and-Project: fitness-first hybrid selection
-                # Evaluate all candidates in sandbox first (fast).
-                # If any improve, pick by fitness (skip most embeddings).
-                # Otherwise embed all and pick by PSO proximity.
-                # ------------------------------------------------------------
-                best_candidate = p.pbest_code  # safe fallback
-                best_emb       = p.pbest_pos.copy()
-
-                # (code, emb_or_None, dist_or_inf, fitness, eval_result)
-                cand_results: list[tuple[str, np.ndarray | None, float, float, dict]] = []
-                for cand in candidates:
-                    if not cand or not cand.strip():
-                        continue
-                    fit, eval_res = self._eval_fitness(cand, task, progress=progress)
-                    cand_results.append((cand, None, float("inf"), fit, eval_res))
-
-                if cand_results:
-                    # Priority 1: any candidate strictly improves → pick best fitness.
-                    # Only embed the winner (saves k-1 embedding calls).
-                    improving = [t for t in cand_results if t[3] > p.fitness + 1e-6]
-                    if improving:
-                        winner_code, _, _, _, winner_eval = max(improving, key=lambda x: x[3])
-                        best_emb = self._pos_from_eval(winner_code, task, winner_eval)
-                        best_candidate = winner_code
-                    else:
-                        # Priority 2: no improvement — embed all for PSO exploration.
-                        enriched = []
-                        for c, _, _, f, eval_res in cand_results:
-                            e = self._pos_from_eval(c, task, eval_res, fallback_random=False)
-                            if e is None or len(e) != len(target_pos):
-                                continue
-                            d = cosine(e, target_pos)
-                            enriched.append((c, e, d, f))
-                        if enriched:
-                            best_c, best_e, _, _ = min(enriched, key=lambda x: x[2])
-                            best_candidate = best_c
-                            best_emb       = best_e
-
-                # ------------------------------------------------------------
-                # Step 4 — Update particle state
-                # ------------------------------------------------------------
-                prev_pos   = p.pos.copy()
-                p.code     = best_candidate
-                p.pos      = best_emb
-                # Recompute actual velocity as displacement (more stable)
-                if len(p.pos) == len(prev_pos):
-                    p.velocity = p.pos - prev_pos
-
-                # ------------------------------------------------------------
-                # Step 5 — Evaluate in sandbox
-                # ------------------------------------------------------------
-                p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=progress)
-                logger.info(
-                    "[PSO] task=%s iter=%d particle=%d fitness=%.4f pbest=%.4f (%.1fs)",
-                    _task_id, iteration + 1, p.particle_id,
-                    p.fitness, p.pbest_fitness, time.time() - _p_t0,
-                )
-
-                # ------------------------------------------------------------
-                # Step 6 — Update personal best
-                # ------------------------------------------------------------
-                if p.fitness > p.pbest_fitness:
-                    p.update_pbest(p.code, p.pos, p.fitness)
-                    logger.info(
-                        "[PSO] task=%s iter=%d particle=%d new pbest=%.4f",
-                        _task_id, iteration + 1, p.particle_id, p.pbest_fitness,
-                    )
-                    if self.debug:
-                        print(
-                            f"  Particle {p.particle_id} pbest update: "
-                            f"{p.pbest_fitness:.4f}"
-                        )
-
-                # ------------------------------------------------------------
-                # Step 7 — Update global best
-                # ------------------------------------------------------------
                 if p.fitness > gbest_fitness:
                     gbest_code    = p.code
                     gbest_pos     = p.pos.copy()
@@ -744,14 +872,12 @@ class PSOOrchestrator:
                             f"  *** New gbest! Particle {p.particle_id}: "
                             f"{gbest_fitness:.4f} ***"
                         )
-
-                iter_log["particles"].append({
-                    "particle_id":   p.particle_id,
-                    "role":          p.role_name,
-                    "fitness":       p.fitness,
-                    "pbest_fitness": p.pbest_fitness,
-                    "n_candidates":  len(cand_results),
-                })
+            if self.debug:
+                best_p = max(swarm, key=lambda pp: pp.fitness)
+                print(
+                    f"  Best this iter: particle {best_p.particle_id} "
+                    f"fitness={best_p.fitness:.4f}  gbest={gbest_fitness:.4f}"
+                )
 
             iter_log["gbest_fitness"] = gbest_fitness
             log.append(iter_log)

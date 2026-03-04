@@ -854,3 +854,95 @@ class TestCompressGrid:
         g[5, 5] = 7
         result = _compress_grid(g)
         assert "(5,5)=7" in result
+
+
+# ---------------------------------------------------------------------------
+# _brief_error_desc helper
+# ---------------------------------------------------------------------------
+
+from agents.pso_orchestrator import _brief_error_desc
+
+
+class TestBriefErrorDesc:
+    """Unit tests for the _brief_error_desc() helper."""
+
+    def test_runtime_error_detected(self):
+        eval_result = {
+            "pairs": [{"error": "NameError: name 'x' is not defined", "predicted": None, "expected": None}],
+            "n_correct": 0, "n_total": 1,
+        }
+        desc = _brief_error_desc(eval_result, 0.0)
+        assert "runtime error" in desc
+        assert "NameError" in desc
+
+    def test_shape_mismatch_detected(self):
+        pred = np.zeros((3, 3), dtype=np.int32)
+        exp  = np.zeros((9, 9), dtype=np.int32)
+        eval_result = {
+            "pairs": [{"error": None, "predicted": pred, "expected": exp}],
+            "n_correct": 0, "n_total": 1,
+        }
+        desc = _brief_error_desc(eval_result, 0.0)
+        assert "wrong dimensions" in desc
+        assert "3" in desc and "9" in desc
+
+    def test_partial_correct_shows_count(self):
+        pred = np.ones((2, 2), dtype=np.int32)
+        exp  = np.ones((2, 2), dtype=np.int32)
+        eval_result = {
+            "pairs": [{"error": None, "predicted": pred, "expected": exp}],
+            "n_correct": 1, "n_total": 3,
+        }
+        desc = _brief_error_desc(eval_result, 0.33)
+        assert "1/3" in desc
+
+    def test_empty_pairs_returns_fitness(self):
+        desc = _brief_error_desc({"pairs": []}, 0.25)
+        assert "0.25" in desc or "fitness" in desc
+
+    def test_runtime_error_takes_priority_over_shape(self):
+        """Runtime error should be reported even if shape also differs."""
+        pred = np.zeros((3, 3), dtype=np.int32)
+        exp  = np.zeros((9, 9), dtype=np.int32)
+        eval_result = {
+            "pairs": [{"error": "IndexError: out of range", "predicted": pred, "expected": exp}],
+            "n_correct": 0, "n_total": 1,
+        }
+        desc = _brief_error_desc(eval_result, 0.0)
+        assert "runtime error" in desc
+
+    def test_error_message_truncated(self):
+        long_msg = "A" * 200
+        eval_result = {
+            "pairs": [{"error": long_msg, "predicted": None, "expected": None}],
+            "n_correct": 0, "n_total": 1,
+        }
+        desc = _brief_error_desc(eval_result, 0.0)
+        assert len(desc) < 200  # must be truncated
+
+
+# ---------------------------------------------------------------------------
+# Particle.failed_history field
+# ---------------------------------------------------------------------------
+
+class TestParticleFailedHistory:
+    """Particle.failed_history is initialised and can be appended to."""
+
+    def test_failed_history_default_empty(self):
+        p = Particle(particle_id=0, role_name="r", role_desc="d")
+        assert p.failed_history == []
+
+    def test_failed_history_independent_across_instances(self):
+        p1 = Particle(particle_id=0, role_name="r", role_desc="d")
+        p2 = Particle(particle_id=1, role_name="r", role_desc="d")
+        p1.failed_history.append(("code", 0.1, "error"))
+        assert p2.failed_history == []
+
+    def test_failed_history_can_store_tuples(self):
+        p = Particle(particle_id=0, role_name="r", role_desc="d")
+        p.failed_history.append(("def transform(g): return g", 0.05, "wrong dims"))
+        assert len(p.failed_history) == 1
+        snippet, fit, err = p.failed_history[0]
+        assert "transform" in snippet
+        assert fit == 0.05
+        assert "wrong dims" in err
