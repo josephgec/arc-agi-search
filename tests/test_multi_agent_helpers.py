@@ -948,7 +948,7 @@ class TestCodeDeduplication:
             agent = MultiAgent(max_cycles=6, use_decomposer=False, use_verifier=False)
 
         call_count = [0]
-        def _fake_coder_generate(hyp, fb=None, training_context=None, temperature=None):
+        def _fake_coder_generate(hyp, fb=None, training_context=None, temperature=None, **kw):
             call_count[0] += 1
             # Always return the same code regardless of feedback
             return f"```python\n{code_once}```"
@@ -990,7 +990,7 @@ class TestCodeDeduplication:
             MockClient.return_value = MagicMock(model="mock")
             agent = MultiAgent(max_cycles=8, use_decomposer=False, use_verifier=False)
 
-        def _fake_coder(hyp, fb=None, training_context=None, temperature=None):
+        def _fake_coder(hyp, fb=None, training_context=None, temperature=None, **kw):
             code = codes[min(call_idx[0], len(codes) - 1)]
             call_idx[0] += 1
             return f"```python\n{code}```"

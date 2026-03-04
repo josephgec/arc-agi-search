@@ -537,3 +537,86 @@ class TestSolveExceptionPaths:
         result = agent.solve(SIMPLE_TASK)
         # Loop continues after critic exception
         assert "log" in result
+
+
+# ---------------------------------------------------------------------------
+# prior_coder_failures passed to Coder after Critic→coder route
+# ---------------------------------------------------------------------------
+
+class TestPriorCoderFailures:
+    """Verify prior_coder_failures accumulates and is passed to Coder.generate()."""
+
+    def _make_failing_task(self):
+        """Task where WRONG_CODE produces wrong output."""
+        return {
+            "train": [
+                {"input":  np.array([[1, 2], [3, 4]], dtype=np.int32),
+                 "output": np.array([[1, 2], [3, 4]], dtype=np.int32)},
+            ],
+            "test": [
+                {"input": np.array([[1, 2], [3, 4]], dtype=np.int32)},
+            ],
+        }
+
+    def test_prior_failures_passed_after_critic_coder_route(self):
+        """After Critic routes to coder, next Coder call receives prior_failures."""
+        agent = make_agent(
+            code_responses=[
+                "```python\n" + WRONG_CODE + "\n```",   # first attempt → fails
+                "```python\n" + IDENTITY_CODE + "\n```", # second attempt → succeeds
+            ],
+            critic_responses=[
+                {"route": ROUTE_CODER, "feedback": "fix the dimensions"},
+            ],
+            max_cycles=9,
+        )
+        agent.solve(self._make_failing_task())
+
+        # The second Coder call should have received prior_failures
+        calls = agent._coder.generate.call_args_list
+        assert len(calls) >= 2
+        _, second_kwargs = calls[1]
+        prior = second_kwargs.get("prior_failures")
+        assert prior is not None and len(prior) >= 1
+        # The snippet from the first attempt should be in the list
+        first_snippet, first_feedback = prior[0]
+        assert "transform" in first_snippet
+        assert "fix the dimensions" in first_feedback
+
+    def test_prior_failures_reset_on_hypothesis_change(self):
+        """When Critic routes to hypothesizer, prior_failures resets for new hyp."""
+        agent = make_agent(
+            code_responses=[
+                "```python\n" + WRONG_CODE + "\n```",    # hyp 0, attempt 1
+                "```python\n" + WRONG_CODE + "\n```",    # hyp 0, attempt 2 (stuck)
+                "```python\n" + WRONG_CODE + "\n```",    # hyp 0, attempt 3 (stuck)
+                "```python\n" + IDENTITY_CODE + "\n```", # hyp 1 → success
+            ],
+            critic_responses=[
+                {"route": ROUTE_HYPOTHESIZER, "feedback": "wrong rule"},
+            ],
+            max_cycles=12,
+        )
+        agent.solve(self._make_failing_task())
+
+        calls = agent._coder.generate.call_args_list
+        # Find the call that corresponds to hyp 1 (the one that gets IDENTITY_CODE)
+        # It should have prior_failures=None or [] (fresh slate)
+        last_call = calls[-1]
+        _, last_kwargs = last_call
+        prior = last_kwargs.get("prior_failures")
+        # After hypothesis reset, prior_failures must be empty/None
+        assert prior is None or prior == []
+
+    def test_first_coder_call_has_no_prior_failures(self):
+        """The very first Coder call has no prior failure history."""
+        agent = make_agent(
+            code_responses=["```python\n" + IDENTITY_CODE + "\n```"],
+            max_cycles=5,
+        )
+        agent.solve(self._make_failing_task())
+
+        first_call = agent._coder.generate.call_args_list[0]
+        _, first_kwargs = first_call
+        prior = first_kwargs.get("prior_failures")
+        assert prior is None or prior == []

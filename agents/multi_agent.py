@@ -764,16 +764,17 @@ class MultiAgent:
         task_description: str        = _format_task_description(task)
         training_examples: str       = _format_training_examples(task)
         training_examples_coder: str = _format_training_examples_coder(task)
-        hypotheses:        list[str] = []
-        hyp_index:         int       = 0
-        prev_hyp_index:    int       = -1   # tracks hypothesis transitions
-        hyp_feedback:      str | None = None
-        coder_feedback:    str | None = None
-        prev_n_correct:    int        = -1
-        no_improve_count:  int        = 0
-        coder_attempt:     int        = 0
-        decomp_tried:      bool       = False
-        verifier_attempts: int        = 0
+        hypotheses:          list[str]             = []
+        hyp_index:           int                   = 0
+        prev_hyp_index:      int                   = -1   # tracks hypothesis transitions
+        hyp_feedback:        str | None             = None
+        coder_feedback:      str | None             = None
+        prior_coder_failures: list[tuple[str, str]] = []   # (code_snippet, critic_feedback)
+        prev_n_correct:      int                   = -1
+        no_improve_count:    int                   = 0
+        coder_attempt:       int                   = 0
+        decomp_tried:        bool                  = False
+        verifier_attempts:   int                   = 0
 
         while cycle < self.max_cycles:
 
@@ -822,10 +823,11 @@ class MultiAgent:
             # the Hypothesizer.  This ensures no_improve_count starts from zero
             # for every hypothesis, so stuck-detection works correctly.
             if hyp_index != prev_hyp_index:
-                coder_attempt    = 0
-                prev_n_correct   = -1
-                no_improve_count = 0
-                prev_hyp_index   = hyp_index
+                coder_attempt        = 0
+                prev_n_correct       = -1
+                no_improve_count     = 0
+                prev_hyp_index       = hyp_index
+                prior_coder_failures = []   # fresh slate for new hypothesis
 
             current_hypothesis = hypotheses[hyp_index]
             coder_attempt += 1
@@ -845,6 +847,7 @@ class MultiAgent:
                     current_hypothesis, coder_feedback,
                     training_context=training_examples_coder,
                     temperature=temperature,
+                    prior_failures=prior_coder_failures or None,
                 )
                 logger.info("[stage] Coder done (%.1fs)", time.time() - _t0)
             except Exception as e:
@@ -1045,6 +1048,12 @@ class MultiAgent:
                 decomp_tried  = False
             else:
                 coder_feedback = critic_result["feedback"]
+                # Record as negative example so the next Coder call avoids
+                # repeating this implementation pattern.
+                _snippet = "\n".join(code.splitlines()[:8])
+                prior_coder_failures.append((_snippet, critic_result["feedback"]))
+                if len(prior_coder_failures) > 3:
+                    prior_coder_failures = prior_coder_failures[-3:]
 
         _best_fitness = best_n_correct / max(len(task["train"]), 1)
         logger.info(

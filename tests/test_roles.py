@@ -446,3 +446,167 @@ class TestPSOCoderFallbackFence:
         )
         assert len(results) >= 1
         assert "def transform" in results[0]
+
+
+# ---------------------------------------------------------------------------
+# Coder prior_failures negative-example injection
+# ---------------------------------------------------------------------------
+
+class TestCoderPriorFailures:
+    """Coder.generate() with prior_failures= populates the prompt correctly."""
+
+    def _get_content(self, llm) -> str:
+        return llm.generate.call_args[0][1][0]["content"]
+
+    def test_prior_failures_appear_in_prompt(self):
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        coder.generate(
+            "some hypothesis",
+            prior_failures=[
+                ("def transform(g):\n    return g", "wrong output dimensions"),
+            ],
+        )
+        content = self._get_content(llm)
+        assert "PREVIOUSLY FAILED IMPLEMENTATIONS" in content
+        assert "wrong output dimensions" in content
+        assert "def transform" in content
+
+    def test_multiple_prior_failures_all_appear(self):
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        failures = [
+            ("def transform(g):\n    return g * 2", "wrong colors"),
+            ("def transform(g):\n    return rotate(g)", "wrong shape"),
+            ("def transform(g):\n    return flip(g)", "partial match"),
+        ]
+        coder.generate("hypothesis", prior_failures=failures)
+        content = self._get_content(llm)
+        assert "wrong colors" in content
+        assert "wrong shape" in content
+        assert "partial match" in content
+        # All three indexed entries present
+        assert "[1]" in content
+        assert "[2]" in content
+        assert "[3]" in content
+
+    def test_no_prior_failures_no_section(self):
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        coder.generate("hypothesis")
+        content = self._get_content(llm)
+        assert "PREVIOUSLY FAILED" not in content
+
+    def test_empty_prior_failures_list_no_section(self):
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        coder.generate("hypothesis", prior_failures=[])
+        content = self._get_content(llm)
+        assert "PREVIOUSLY FAILED" not in content
+
+    def test_prior_failures_appear_before_critic_feedback(self):
+        """Failed history should precede current Critic feedback."""
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        coder.generate(
+            "hypothesis",
+            feedback="fix the crop bounds",
+            prior_failures=[("def transform(g): pass", "crashes on empty grid")],
+        )
+        content = self._get_content(llm)
+        failed_pos = content.index("PREVIOUSLY FAILED")
+        critic_pos = content.index("CRITIC FEEDBACK")
+        assert failed_pos < critic_pos
+
+    def test_snippet_truncated_to_8_lines(self):
+        """Only first 8 lines of a long code snippet are included."""
+        long_code = "\n".join(f"    line_{i} = {i}" for i in range(20))
+        llm = make_llm(VALID_CODE_RESPONSE)
+        coder = Coder(llm)
+        coder.generate("hypothesis", prior_failures=[(long_code, "too slow")])
+        content = self._get_content(llm)
+        assert "line_7" in content     # 8th line (0-indexed) present
+        assert "line_8" not in content  # 9th line truncated
+
+
+# ---------------------------------------------------------------------------
+# PSOCoder failed_examples negative-example injection
+# ---------------------------------------------------------------------------
+
+class TestPSOCoderFailedExamples:
+    """PSOCoder.generate_mutations() with failed_examples= populates the prompt."""
+
+    def _get_content(self, llm) -> str:
+        return llm.generate.call_args[0][1][0]["content"]
+
+    def _call(self, llm, failed_examples=None):
+        pso_coder = PSOCoder(llm, k=2)
+        pso_coder.generate_mutations(
+            task_description="TASK_DESC",
+            training_context="TRAIN_CTX",
+            current_code="def transform(g): return g",
+            current_fitness=0.2,
+            pbest_code="def transform(g): return g",
+            pbest_fitness=0.3,
+            gbest_code="def transform(g): return rotate(g)",
+            gbest_fitness=0.5,
+            role_name="test_role",
+            role_description="test description",
+            failed_examples=failed_examples,
+        )
+
+    def test_failed_examples_appear_in_prompt(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        self._call(llm, failed_examples=[
+            ("def transform(g):\n    return g[::-1]", 0.1, "wrong dimensions 3x3≠9x9"),
+        ])
+        content = self._get_content(llm)
+        assert "PREVIOUSLY FAILED APPROACHES" in content
+        assert "wrong dimensions 3x3≠9x9" in content
+        assert "0.1000" in content
+
+    def test_multiple_failed_examples_all_appear(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        self._call(llm, failed_examples=[
+            ("def transform(g): return g", 0.0, "runtime error: index out of bounds"),
+            ("def transform(g): return rotate(g)", 0.2, "1/3 pairs correct"),
+            ("def transform(g): return flip(g)", 0.15, "wrong colors"),
+        ])
+        content = self._get_content(llm)
+        assert "runtime error: index out of bounds" in content
+        assert "1/3 pairs correct" in content
+        assert "wrong colors" in content
+        assert "[1]" in content
+        assert "[3]" in content
+
+    def test_no_failed_examples_no_section(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        self._call(llm, failed_examples=None)
+        content = self._get_content(llm)
+        assert "PREVIOUSLY FAILED APPROACHES" not in content
+
+    def test_empty_failed_examples_no_section(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        self._call(llm, failed_examples=[])
+        content = self._get_content(llm)
+        assert "PREVIOUSLY FAILED APPROACHES" not in content
+
+    def test_fitness_value_shown_for_each_entry(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        self._call(llm, failed_examples=[
+            ("def transform(g): return g", 0.1234, "some error"),
+        ])
+        content = self._get_content(llm)
+        assert "0.1234" in content
+
+    def test_failed_section_appears_before_ref_code(self):
+        """Failed history should precede the reference (pbest/gbest) code."""
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        self._call(llm, failed_examples=[
+            ("def transform(g): return g", 0.05, "all wrong"),
+        ])
+        content = self._get_content(llm)
+        failed_pos = content.index("PREVIOUSLY FAILED APPROACHES")
+        # Reference code sections start with "Personal best code:" or "Best code so far"
+        ref_pos = content.index("Personal best code:")
+        assert failed_pos < ref_pos

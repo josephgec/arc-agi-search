@@ -185,6 +185,7 @@ class Coder:
         feedback:         str | None = None,
         training_context: str | None = None,
         temperature:      float | None = None,
+        prior_failures:   list[tuple[str, str]] | None = None,
     ) -> str:
         """Return raw LLM response containing a ```python``` code block.
 
@@ -193,10 +194,22 @@ class Coder:
             feedback:          Optional Critic feedback on a previous code attempt.
             training_context:  Formatted string of all training pairs.
             temperature:       Override the client's default temperature.
+            prior_failures:    List of (code_snippet, what_went_wrong) from
+                               previous failed attempts.  Shown as explicit
+                               negative examples so the Coder avoids them.
         """
         content = f"Hypothesis:\n{hypothesis}"
         if training_context:
             content += f"\n\n{training_context}"
+        if prior_failures:
+            lines = [
+                "\n--- PREVIOUSLY FAILED IMPLEMENTATIONS — do NOT repeat these patterns ---"
+            ]
+            for i, (snippet, why) in enumerate(prior_failures, 1):
+                short = "\n".join(snippet.splitlines()[:8])
+                lines.append(f"\n[{i}] What went wrong: {why}")
+                lines.append(f"Code snippet:\n```python\n{short}\n```")
+            content += "\n".join(lines)
         if feedback:
             content += (
                 "\n\n--- CRITIC FEEDBACK ---\n"
@@ -440,11 +453,18 @@ class PSOCoder:
         role_description:  str,
         eval_diff:         str | None = None,
         temperature:       float | None = None,
+        failed_examples:   list[tuple[str, float, str]] | None = None,
     ) -> list[str]:
         """Return up to self.k candidate code strings.
 
         The caller embeds them and selects the one closest to the PSO
         target position vector.
+
+        Args:
+            failed_examples: List of (code_snippet, fitness, error_description)
+                             from previously tried candidates that were below
+                             pbest.  Shown to the LLM as explicit negative
+                             examples to avoid.
         """
         k   = self.k
         sys = (
@@ -459,6 +479,17 @@ class PSOCoder:
                 + eval_diff
                 + "\n\n"
             )
+
+        failed_section = ""
+        if failed_examples:
+            lines = [
+                "--- PREVIOUSLY FAILED APPROACHES — do NOT repeat these patterns ---"
+            ]
+            for i, (snippet, fit, err_desc) in enumerate(failed_examples, 1):
+                short = "\n".join(snippet.splitlines()[:8])
+                lines.append(f"[{i}] Fitness: {fit:.4f} — {err_desc}")
+                lines.append(f"```python\n{short}\n```")
+            failed_section = "\n".join(lines) + "\n\n"
 
         # Deduplicate when pbest == gbest (avoid confusing the LLM with duplicates)
         if pbest_code.strip() == gbest_code.strip():
@@ -494,6 +525,7 @@ class PSOCoder:
             f"Personal best fitness: {pbest_fitness:.4f} / 1.0000\n"
             f"Global best fitness  : {gbest_fitness:.4f} / 1.0000\n\n"
             + diff_section
+            + failed_section
             + ref_section
             + f"Generate {k} distinct `transform` functions.  "
             f"Use these {k} different strategies:\n"
