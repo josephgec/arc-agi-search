@@ -946,3 +946,224 @@ class TestParticleFailedHistory:
         assert "transform" in snippet
         assert fit == 0.05
         assert "wrong dims" in err
+
+
+# ---------------------------------------------------------------------------
+# seed_particles
+# ---------------------------------------------------------------------------
+
+class TestSeedParticles:
+    """PSOOrchestrator.seed_particles() pre-seeds particle init codes."""
+
+    def test_seed_codes_stored(self):
+        orch = make_orchestrator()
+        orch.seed_particles([IDENTITY_CODE, IDENTITY_CODE])
+        assert len(orch._seed_codes) == 2
+        assert orch._seed_codes[0] == IDENTITY_CODE
+
+    def test_seeded_particle_skips_llm_init(self):
+        """Particle 0 uses the seed code; _init_particle_code is not called for it."""
+        orch = make_orchestrator(n_particles=2, max_iterations=1)
+        orch.seed_particles([IDENTITY_CODE])
+
+        init_particle_ids: list[int] = []
+
+        def _track_init(p, *args, **kwargs):
+            init_particle_ids.append(p.particle_id)
+            return IDENTITY_CODE, True
+
+        orch._init_particle_code = _track_init
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate   = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+
+        orch.solve(SIMPLE_TASK)
+
+        # Particle 0 was seeded → LLM init must NOT have been called for it
+        assert 0 not in init_particle_ids
+        # Particle 1 had no seed → LLM init WAS called
+        assert 1 in init_particle_ids
+
+    def test_seeded_particle_code_becomes_initial_code(self):
+        """The seeded code ends up as particle 0's starting code."""
+        SEED = "def transform(g):\n    return g[::-1]"
+        orch = make_orchestrator(n_particles=1, max_iterations=1)
+        orch.seed_particles([SEED])
+
+        captured_codes: list[str] = []
+        orig_eval = orch._eval_fitness
+
+        def _capturing_eval(code, task, progress=None):
+            captured_codes.append(code)
+            return orig_eval(code, task, progress)
+
+        orch._eval_fitness = _capturing_eval
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate   = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+
+        orch.solve(SIMPLE_TASK)
+
+        # The seed code must have been evaluated (at init)
+        assert SEED in captured_codes
+
+    def test_seed_consumed_after_solve(self):
+        """_seed_codes is reset to [] once solve() consumes it."""
+        orch = make_orchestrator(n_particles=1, max_iterations=1)
+        orch.seed_particles([IDENTITY_CODE])
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate   = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+        orch.solve(SIMPLE_TASK)
+        assert orch._seed_codes == []
+
+    def test_empty_string_seed_falls_back_to_llm(self):
+        """An empty-string seed for a particle falls back to normal LLM init."""
+        orch = make_orchestrator(n_particles=2, max_iterations=1)
+        orch.seed_particles([""])  # empty seed for particle 0
+
+        init_particle_ids: list[int] = []
+
+        def _track_init(p, *args, **kwargs):
+            init_particle_ids.append(p.particle_id)
+            return IDENTITY_CODE, True
+
+        orch._init_particle_code = _track_init
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate   = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+
+        orch.solve(SIMPLE_TASK)
+
+        # Empty seed → particle 0 falls back to LLM
+        assert 0 in init_particle_ids
+
+    def test_excess_seeds_ignored_no_crash(self):
+        """More seeds than n_particles is silently ignored."""
+        orch = make_orchestrator(n_particles=1, max_iterations=1)
+        orch.seed_particles([IDENTITY_CODE, IDENTITY_CODE, IDENTITY_CODE])
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate   = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+        result = orch.solve(SIMPLE_TASK)
+        assert "log" in result
+
+
+# ---------------------------------------------------------------------------
+# Staleness early-exit detection
+# ---------------------------------------------------------------------------
+
+_STALE_EVAL_RES = {"pairs": [], "n_correct": 0, "n_total": 1, "all_correct": False}
+
+
+def _noop_particle_step(p, *args, **kwargs) -> dict:
+    """Stand-in for _particle_step that never improves any particle."""
+    return {
+        "particle_id":   p.particle_id,
+        "role":          p.role_name,
+        "fitness":       p.fitness,
+        "pbest_fitness": p.pbest_fitness,
+        "n_candidates":  0,
+    }
+
+
+def _make_stale_orch(max_iterations: int = 10) -> PSOOrchestrator:
+    """Orchestrator whose particles never improve: init fitness = 0.3 forever."""
+    orch = make_orchestrator(n_particles=2, max_iterations=max_iterations)
+    orch._llm.embed_code     = MagicMock(return_value=unit_vec(768))
+    orch._llm.generate       = MagicMock(
+        return_value=f"```python\n{IDENTITY_CODE}\n```"
+    )
+    orch._eval_fitness        = MagicMock(return_value=(0.3, _STALE_EVAL_RES))
+    orch._init_particle_code  = MagicMock(return_value=(IDENTITY_CODE, True))
+    orch._particle_step       = _noop_particle_step
+    return orch
+
+
+class TestStalenessDetection:
+    """PSO breaks out of the iteration loop after 3 flat iterations."""
+
+    def test_staleness_terminates_after_3_flat_iterations(self):
+        """Loop must stop after ≤3 main iterations when gbest never improves."""
+        orch   = _make_stale_orch(max_iterations=10)
+        result = orch.solve(SIMPLE_TASK)
+
+        # Only count main per-iteration logs (they have a "particles" key).
+        # Crossover/reinit entries also carry "iteration" but not "particles".
+        iter_logs = [e for e in result["log"] if "particles" in e]
+        assert len(iter_logs) <= 3
+        assert result["success"] is False
+
+    def test_staleness_does_not_fire_when_gbest_keeps_improving(self):
+        """When gbest improves by >0.01 each iteration, all iters run."""
+        orch = make_orchestrator(n_particles=2, max_iterations=3)
+        orch._llm.embed_code    = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate      = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+        orch._eval_fitness       = MagicMock(return_value=(0.2, _STALE_EVAL_RES))
+        orch._init_particle_code = MagicMock(return_value=(IDENTITY_CODE, True))
+
+        # Each call to _particle_step bumps every particle's fitness by +0.15
+        # so gbest always improves by more than 0.01.
+        _counter = [0]
+
+        def _improving_step(p, *args, **kwargs):
+            _counter[0] += 1
+            p.fitness = min(0.2 + _counter[0] * 0.15, 0.95)
+            p.last_eval = _STALE_EVAL_RES
+            if p.fitness > p.pbest_fitness:
+                p.update_pbest(p.code, p.pos, p.fitness)
+            return {
+                "particle_id":   p.particle_id,
+                "role":          p.role_name,
+                "fitness":       p.fitness,
+                "pbest_fitness": p.pbest_fitness,
+                "n_candidates":  0,
+            }
+
+        orch._particle_step = _improving_step
+        result = orch.solve(SIMPLE_TASK)
+
+        iter_logs = [e for e in result["log"] if "particles" in e]
+        # Should NOT have terminated early — ran all 3 iterations
+        assert len(iter_logs) == 3
+
+    def test_staleness_counter_resets_on_improvement(self):
+        """2 flat iters → improvement → 3 more flat → terminates at iter 5+."""
+        orch = make_orchestrator(n_particles=1, max_iterations=10)
+        orch._llm.embed_code    = MagicMock(return_value=unit_vec(768))
+        orch._llm.generate      = MagicMock(
+            return_value=f"```python\n{IDENTITY_CODE}\n```"
+        )
+        orch._eval_fitness       = MagicMock(return_value=(0.2, _STALE_EVAL_RES))
+        orch._init_particle_code = MagicMock(return_value=(IDENTITY_CODE, True))
+
+        # iter 1 & 2: flat (0.2). iter 3: big jump (+0.3 → 0.5). iters 4-6: flat again.
+        _iter = [0]
+
+        def _staged_step(p, *args, **kwargs):
+            _iter[0] += 1
+            p.fitness = 0.5 if _iter[0] == 3 else 0.2
+            p.last_eval = _STALE_EVAL_RES
+            if p.fitness > p.pbest_fitness:
+                p.update_pbest(p.code, p.pos, p.fitness)
+            return {
+                "particle_id":   p.particle_id,
+                "role":          p.role_name,
+                "fitness":       p.fitness,
+                "pbest_fitness": p.pbest_fitness,
+                "n_candidates":  0,
+            }
+
+        orch._particle_step = _staged_step
+        result = orch.solve(SIMPLE_TASK)
+
+        iter_logs = [e for e in result["log"] if "particles" in e]
+        # The improvement at iter 3 reset the counter → must run more than 3 iters total
+        assert len(iter_logs) > 3

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """CLI entry point for multi-agent ARC-AGI solvers.
 
-Supports three strategies selectable via --strategy:
-  multi    — Hypothesizer → Coder → Critic feedback loop (default)
-  ensemble — Multiple Orchestrator runs with majority voting
-  pso      — Particle Swarm Optimization swarm (see run_pso.py for full options)
-  single   — Simple single-agent baseline
+Supports five strategies selectable via --strategy:
+  multi      — Hypothesizer → Coder → Critic feedback loop (default)
+  ensemble   — Multiple Orchestrator runs with majority voting
+  pso        — Particle Swarm Optimization swarm (see run_pso.py for full options)
+  single     — Simple single-agent baseline
+  two_phase  — Fast MultiAgent (phase 1) then seed-PSO if unsolved (phase 2)
 
 Usage examples
 --------------
@@ -18,6 +19,10 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy ensemble
 # PSO swarm:
 python run_multi_agent.py --task data/training/007bbfb7.json --strategy pso \\
     --pso-n-particles 6 --pso-max-iterations 10
+
+# Two-phase (fast 7b MultiAgent → PSO seeded with best code):
+python run_multi_agent.py --task data/training/007bbfb7.json --strategy two_phase \\
+    --coder-model qwen2.5-coder:7b
 
 # Run on a directory:
 python run_multi_agent.py --task-dir data/training/ --max-tasks 20
@@ -56,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
     # Strategy
     p.add_argument("--strategy", default="multi",
-                   choices=["multi", "ensemble", "pso", "single"],
+                   choices=["multi", "ensemble", "pso", "single", "two_phase"],
                    help="Solving strategy.")
 
     # Shared LLM config
@@ -93,6 +98,85 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--debug",     action="store_true")
 
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Two-phase orchestrator
+# ---------------------------------------------------------------------------
+
+class TwoPhaseOrchestrator:
+    """Run a fast MultiAgent pass (phase 1), then seed PSO if unsolved (phase 2).
+
+    Phase 1 uses ``phase1_model`` (typically the 7b coder) with only
+    ``phase1_cycles`` cycles so it completes quickly.  If it succeeds, the
+    PSO phase is skipped entirely.  If it fails, the best code found is
+    passed to ``PSOOrchestrator.seed_particles()`` so PSO starts from an
+    already-reasonable solution rather than from random initialisation.
+    """
+
+    def __init__(
+        self,
+        backend:            str        = "ollama",
+        model:              str | None = None,
+        phase1_model:       str | None = None,
+        coder_model:        str | None = None,
+        critic_model:       str | None = None,
+        phase1_cycles:      int        = 5,
+        timeout:            float      = 120.0,
+        debug:              bool       = False,
+        pso_n_particles:    int        = 6,
+        pso_max_iterations: int        = 10,
+        pso_k_candidates:   int        = 10,
+        pso_w:              float      = 0.5,
+        pso_c1:             float      = 1.5,
+        pso_c2:             float      = 1.5,
+        embed_model:        str        = "nomic-embed-text",
+        temperature:        float      = 0.6,
+        max_tokens:         int        = 8192,
+    ) -> None:
+        # Phase 1 uses the fast model (e.g. qwen2.5-coder:7b)
+        _p1_model = phase1_model or coder_model or model
+        self._multi = MultiAgent(
+            backend=backend,
+            model=_p1_model,
+            coder_model=coder_model or _p1_model,
+            critic_model=critic_model,
+            decomposer_model=critic_model,
+            verifier_model=critic_model,
+            timeout=timeout,
+            debug=debug,
+            max_cycles=phase1_cycles,
+        )
+        # Phase 2 uses the full reasoner model
+        self._pso = PSOOrchestrator(
+            backend=backend,
+            model=model,
+            embed_model=embed_model,
+            n_particles=pso_n_particles,
+            max_iterations=pso_max_iterations,
+            k_candidates=pso_k_candidates,
+            w=pso_w,
+            c1=pso_c1,
+            c2=pso_c2,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            debug=debug,
+        )
+        self.model   = self._pso.model
+        self.backend = backend
+
+    def solve(self, task: dict) -> dict:
+        """Run phase 1 (MultiAgent), then phase 2 (PSO) if unsolved."""
+        phase1 = self._multi.solve(task)
+        if phase1.get("success"):
+            return phase1
+
+        best_code = phase1.get("code") or ""
+        if best_code:
+            self._pso.seed_particles([best_code])
+
+        return self._pso.solve(task)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +217,26 @@ def build_solver(args: argparse.Namespace):
             max_tokens=args.max_tokens,
             timeout=args.timeout,
             debug=args.debug,
+        )
+    elif args.strategy == "two_phase":
+        return TwoPhaseOrchestrator(
+            backend=args.backend,
+            model=args.model,
+            phase1_model=args.coder_model,
+            coder_model=args.coder_model,
+            critic_model=args.critic_model,
+            phase1_cycles=5,
+            timeout=args.timeout,
+            debug=args.debug,
+            pso_n_particles=args.pso_n_particles,
+            pso_max_iterations=args.pso_max_iterations,
+            pso_k_candidates=args.pso_k_candidates,
+            pso_w=args.pso_w,
+            pso_c1=args.pso_c1,
+            pso_c2=args.pso_c2,
+            embed_model=args.pso_embed_model,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
         )
     else:  # "multi"
         return MultiAgent(

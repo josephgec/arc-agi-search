@@ -304,10 +304,36 @@ class PSOOrchestrator:
         self._sandbox_cache:  dict[str, dict]       = {}
         self._behavior_cache: dict[str, np.ndarray] = {}
         self._cache_lock = threading.Lock()
+        # Codes to use as starting solutions for the first N particles on the
+        # next solve() call.  Consumed (reset to []) at the start of solve()
+        # so a subsequent call on a new task initialises via LLM as normal.
+        self._seed_codes: list[str] = []
 
         # Expose for CLI / logging
         self.backend  = backend
         self.model    = self._llm.model
+
+    # ------------------------------------------------------------------
+    # Public seeding API
+    # ------------------------------------------------------------------
+
+    def seed_particles(self, initial_codes: list[str]) -> None:
+        """Pre-seed particle initialization codes for the next solve() call.
+
+        Call this *before* solve().  For the first
+        ``min(len(initial_codes), n_particles)`` particles the provided code
+        string is used as the starting solution instead of asking the LLM.
+        Remaining particles still initialize normally via ``_init_particle_code``.
+
+        The seed list is consumed (reset to ``[]``) at the start of ``solve()``
+        so a subsequent call on a different task starts fresh.
+
+        Args:
+            initial_codes: List of Python ``transform`` source strings.  An
+                           empty string or ``None`` entry causes that particle
+                           to fall back to normal LLM initialisation.
+        """
+        self._seed_codes = list(initial_codes)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -684,6 +710,9 @@ class PSOOrchestrator:
         # do not bleed into this task (important when reusing the orchestrator).
         self._sandbox_cache.clear()
         self._behavior_cache.clear()
+        # Consume seed codes for this call only; subsequent calls start fresh.
+        seed_codes = self._seed_codes
+        self._seed_codes = []
 
         task_description  = _format_task_description(task)
         training_examples = _format_training_examples(task)
@@ -724,22 +753,33 @@ class PSOOrchestrator:
                 print(f"  [PSO] Hypothesis generation failed: {exc}")
 
         for p in swarm:
-            seed_hyp = hypotheses[p.particle_id % len(hypotheses)] if hypotheses else None
             logger.info(
                 "[PSO] task=%s init particle=%d role=%s",
                 _task_id, p.particle_id, p.role_name,
             )
             _t0 = time.time()
-            p.code, generated = self._init_particle_code(
-                p, task_description, training_examples, hypothesis=seed_hyp
-            )
-            if generated:
-                p.pos = self._embed(p.code)
+            # Use a seeded code (e.g. from a prior MultiAgent phase) if provided
+            # for this particle; otherwise ask the LLM as normal.
+            if seed_codes and p.particle_id < len(seed_codes) and seed_codes[p.particle_id]:
+                p.code    = seed_codes[p.particle_id]
+                p.pos     = self._embed(p.code)
+                generated = True
+                logger.info(
+                    "[PSO] task=%s init particle=%d using seed code (len=%d)",
+                    _task_id, p.particle_id, len(p.code),
+                )
             else:
-                # LLM call failed (likely timeout): use a random unit vector to
-                # preserve swarm diversity and avoid a cascaded embedding timeout.
-                p.pos = _random_unit_vec()
-                time.sleep(10)  # backoff so Ollama can drain the timed-out request
+                seed_hyp = hypotheses[p.particle_id % len(hypotheses)] if hypotheses else None
+                p.code, generated = self._init_particle_code(
+                    p, task_description, training_examples, hypothesis=seed_hyp
+                )
+                if generated:
+                    p.pos = self._embed(p.code)
+                else:
+                    # LLM call failed (likely timeout): use a random unit vector to
+                    # preserve swarm diversity and avoid a cascaded embedding timeout.
+                    p.pos = _random_unit_vec()
+                    time.sleep(10)  # backoff so Ollama can drain the timed-out request
             p.velocity = np.zeros_like(p.pos)
             p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=0.0)
             if self.embed_mode == "behavioral":
@@ -780,6 +820,10 @@ class PSOOrchestrator:
         stagnation_count   = 0
         prev_gbest         = gbest_fitness
         stagnation_limit   = max(2, self.max_iterations // 3)
+        # Staleness tracking for early exit: break if gbest hasn't improved
+        # by more than 0.01 over 3 consecutive iterations.
+        _staleness_count = 0
+        _staleness_gbest = gbest_fitness
 
         for iteration in range(self.max_iterations):
             # Adaptive inertia: linearly anneal w from self.w → self.w*0.4
@@ -975,6 +1019,27 @@ class PSOOrchestrator:
                     worst.pbest_fitness = -1.0   # reset personal best to explore fresh
                     worst.update_pbest(worst.code, worst.pos, worst.fitness)
                     stagnation_count = 0
+
+            # ----------------------------------------------------------------
+            # Staleness early-exit: gbest must improve by >0.01 each iteration
+            # or we terminate after 3 flat iterations.
+            # ----------------------------------------------------------------
+            if gbest_fitness > _staleness_gbest + 0.01:
+                _staleness_count = 0
+                _staleness_gbest = gbest_fitness
+            else:
+                _staleness_count += 1
+                if _staleness_count >= 3:
+                    logger.info(
+                        "[pso] Stagnation detected after %d iterations, terminating",
+                        iteration + 1,
+                    )
+                    if self.debug:
+                        print(
+                            f"[PSO] Stagnation detected after {iteration + 1} "
+                            "iterations, terminating"
+                        )
+                    break
 
         if self.debug:
             print(f"\n[PSO] Budget exhausted.  Best fitness: {gbest_fitness:.4f}")
