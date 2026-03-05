@@ -610,3 +610,67 @@ class TestPSOCoderFailedExamples:
         # Reference code sections start with "Personal best code:" or "Best code so far"
         ref_pos = content.index("Personal best code:")
         assert failed_pos < ref_pos
+
+
+class TestPSOCoderPairFitnessAndHypothesis:
+    """PSOCoder.generate_mutations() pair_fitness_scores= and hypothesis= params."""
+
+    def _call_and_get_content(self, llm, **kwargs):
+        pso_coder = PSOCoder(llm, k=2)
+        pso_coder.generate_mutations(
+            task_description="TASK_DESC",
+            training_context="TRAIN_CTX",
+            current_code="def transform(g): return g",
+            current_fitness=0.3,
+            pbest_code="def transform(g): return g",
+            pbest_fitness=0.4,
+            gbest_code="def transform(g): return rotate(g)",
+            gbest_fitness=0.6,
+            role_name="test_role",
+            role_description="test description",
+            **kwargs,
+        )
+        return llm.generate.call_args[0][1][0]["content"]
+
+    def test_pair_fitness_section_present(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        content = self._call_and_get_content(llm, pair_fitness_scores=[0.8, 0.1, 0.9])
+        assert "PER-PAIR FITNESS" in content
+        assert "0.8000" in content
+        assert "0.1000" in content
+        assert "0.9000" in content
+
+    def test_weakest_pair_marked(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        content = self._call_and_get_content(llm, pair_fitness_scores=[0.8, 0.1, 0.9])
+        assert "WEAKEST" in content
+        # The weakest marker should be on line containing pair 2 (0.1)
+        pair2_line = next(l for l in content.splitlines() if "0.1000" in l)
+        assert "WEAKEST" in pair2_line
+
+    def test_pair_fitness_absent_by_default(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        content = self._call_and_get_content(llm)
+        assert "PER-PAIR FITNESS" not in content
+
+    def test_hypothesis_section_present(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        content = self._call_and_get_content(llm, hypothesis="Satellites collapse toward anchor.")
+        assert "FRESH HYPOTHESIS" in content
+        assert "Satellites collapse toward anchor." in content
+
+    def test_hypothesis_absent_by_default(self):
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        content = self._call_and_get_content(llm)
+        assert "FRESH HYPOTHESIS" not in content
+
+    def test_pair_fitness_before_ref_code(self):
+        """Per-pair section should appear before reference code."""
+        llm = make_llm(K_MUTATIONS_RESPONSE)
+        content = self._call_and_get_content(llm, pair_fitness_scores=[1.0, 0.0])
+        pair_pos = content.index("PER-PAIR FITNESS")
+        ref_pos  = min(
+            content.index("Personal best code:") if "Personal best code:" in content else len(content),
+            content.index("Best code so far")    if "Best code so far"    in content else len(content),
+        )
+        assert pair_pos < ref_pos

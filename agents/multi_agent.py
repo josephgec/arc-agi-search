@@ -329,6 +329,57 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
                     notes.append(f"  [Structural] Output has a repeating {T}×{T} tile pattern")
                     break
 
+    # Movement detection: same color count in input and output but at different positions
+    # → cells appear to MOVE (e.g. satellites compressing toward an anchor).
+    anchor_colors: dict[int, set] = {}  # colors that don't move at all
+    moving_colors: list[int] = []
+    for color in sorted(in_colors & out_colors - {0}):
+        in_pos  = set(map(tuple, np.argwhere(inp == color).tolist()))
+        out_pos = set(map(tuple, np.argwhere(out == color).tolist()))
+        if in_pos == out_pos:
+            anchor_colors[color] = in_pos  # fixed / anchor
+        elif len(in_pos) == len(out_pos):
+            moved = len(in_pos) - len(in_pos & out_pos)
+            moving_colors.append(color)
+            notes.append(
+                f"  [Structural] Color {color}: same count ({len(in_pos)}) in input and output "
+                f"but {moved} cell(s) at DIFFERENT positions — these cells appear to MOVE."
+            )
+        elif len(in_pos) > len(out_pos):
+            notes.append(
+                f"  [Structural] Color {color}: {len(in_pos)} cells in input → {len(out_pos)} "
+                "in output (cells DISAPPEAR — possible merging or masking)."
+            )
+        else:
+            notes.append(
+                f"  [Structural] Color {color}: {len(in_pos)} cells in input → {len(out_pos)} "
+                "in output (cells APPEAR — possible expansion or replication)."
+            )
+
+    # Satellite-anchor proximity: if moving colors end up adjacent to anchor colors in output
+    if anchor_colors and moving_colors:
+        all_anchor_pos = set().union(*anchor_colors.values())
+        _dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        for color in moving_colors:
+            out_pos = set(map(tuple, np.argwhere(out == color).tolist()))
+            adj = sum(
+                1 for r, c in out_pos
+                if any((r + dr, c + dc) in all_anchor_pos for dr, dc in _dirs)
+            )
+            if adj == len(out_pos) and len(out_pos) > 0:
+                anchor_list = sorted(anchor_colors)
+                notes.append(
+                    f"  [Structural] In output, ALL {len(out_pos)} cell(s) of color {color} "
+                    f"are immediately adjacent to anchor color(s) {anchor_list} — "
+                    "STRONG HINT: satellites compress/collapse toward the anchor."
+                )
+            elif adj > 0:
+                anchor_list = sorted(anchor_colors)
+                notes.append(
+                    f"  [Structural] In output, {adj}/{len(out_pos)} cell(s) of color {color} "
+                    f"are adjacent to anchor color(s) {anchor_list}."
+                )
+
     return "\n".join(notes) if notes else None
 
 

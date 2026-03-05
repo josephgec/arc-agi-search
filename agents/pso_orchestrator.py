@@ -579,6 +579,18 @@ class PSOOrchestrator:
             "[PSO] task=%s iter=%d particle=%d role=%s mutation starting",
             _task_id, iteration + 1, p.particle_id, p.role_name,
         )
+        # Compute per-pair fitness scores from last eval for targeted mutation
+        _pair_scores: list[float] | None = None
+        _last_pairs = p.last_eval.get("pairs", [])
+        if _last_pairs:
+            from arc.evaluate import calculate_continuous_fitness
+            _pair_scores = [
+                0.0 if pr.get("error") else calculate_continuous_fitness(
+                    pr.get("predicted"), pr.get("expected")
+                )
+                for pr in _last_pairs
+            ]
+
         _mut_t0 = time.time()
         try:
             candidates = self._pso_coder.generate_mutations(
@@ -594,6 +606,7 @@ class PSOOrchestrator:
                 role_description=p.role_desc,
                 eval_diff=diff_str,
                 failed_examples=p.failed_history or None,
+                pair_fitness_scores=_pair_scores,
             )
             logger.info(
                 "[PSO] task=%s iter=%d particle=%d mutation done candidates=%d (%.1fs)",

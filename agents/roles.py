@@ -44,6 +44,15 @@ Rules:
 - Number them exactly: "1.", "2.", "3." on their own lines.
 - Do NOT write any Python code.
 - Do NOT repeat the same idea with minor wording changes.
+
+Important categories to consider (pay attention to [Structural] hints in the examples):
+- MOVEMENT / ATTRACTION: Do non-zero cells change position between input and output?
+  If so, consider: do they compress toward a fixed "anchor" cell?  Do they encode
+  a direction (displacement from anchor → which adjacent cell to occupy)?
+- SATELLITE patterns: Some colors may act as "anchors" (stay fixed) while others
+  are "satellites" (move, collapse, or reflect relative to the anchor).
+- DIRECTION ENCODING: If scattered cells surround an anchor, their direction
+  (up/down/left/right from anchor) may determine where they land in the output.
 """
 
 _CODER_SYSTEM = (
@@ -51,24 +60,57 @@ _CODER_SYSTEM = (
     "Translate the given hypothesis into a Python function called `transform` that\n"
     "takes `input_grid: np.ndarray` and returns `np.ndarray`.\n\n"
     + _DSL_REFERENCE
-    + "\nRules:\n"
-    "- Return ONLY a single ```python \u2026 ``` code block.\n"
-    "- The function must be called `transform`.\n"
-    "- Use only the DSL primitives listed above plus plain Python/numpy.\n"
-    "- The function must handle every training example shown.\n"
-    "- No print statements, no side effects, no I/O.\n"
-    "- CRITICAL: Always clamp array indices near grid edges:\n"
-    "    rows, cols = grid.shape\n"
-    "    r_min, r_max = max(0, r-1), min(rows, r+2)\n"
-    "    c_min, c_max = max(0, c-1), min(cols, c+2)\n"
-    "  Never use grid[r-1:r+2] without clamping. Use the safe_neighbors()\n"
-    "  helper when you need a cell's neighbourhood.\n"
-    "\nMANDATORY OUTPUT FORMAT: You MUST wrap your code in a fenced block:\n"
-    "```python\n"
-    "def transform(input_grid):\n"
-    "    \u2026\n"
-    "```\n"
-    "Do NOT output code outside a fenced block. This is required.\n"
+    + """
+OUTPUT SHAPE — determine this BEFORE writing any logic:
+  Check every training pair. Common cases:
+    Same shape: output_grid = np.zeros(input_grid.shape, dtype=np.int32)
+    Scaled N×:  output_grid = np.zeros((rows*N, cols*N), dtype=np.int32)
+    Cropped:    output_grid = np.zeros(out_shape, dtype=np.int32)
+  Add a comment at the top of your function stating the shape rule.
+
+CRITICAL BUG TO AVOID — sequential color replacement corrupts itself:
+  WRONG:  grid[grid==1]=2; grid[grid==2]=1  # second line overwrites the first!
+  RIGHT:  out = input_grid.copy()
+          out[input_grid==1] = 2
+          out[input_grid==2] = 1           # read from original, write to copy
+
+COMMON PATTERNS:
+  Anchor+satellite: For each scattered satellite cell, compute (dr, dc) from nearest
+    anchor cell. Dominant axis: if abs(dr)>=abs(dc) → vertical dir (up/down), else
+    horizontal (left/right). Place satellite color at anchor ± 1 step in that direction.
+    out = np.zeros_like(input_grid)
+    for anchor in anchor_positions:
+        out[anchor] = anchor_color
+        for sat_r, sat_c in satellite_positions:
+            dr = sat_r - anchor[0]; dc = sat_c - anchor[1]
+            if abs(dr) >= abs(dc): nr, nc = anchor[0] + np.sign(dr), anchor[1]
+            else:                  nr, nc = anchor[0], anchor[1] + np.sign(dc)
+            out[nr, nc] = satellite_color
+  Region fill: flood_fill(grid, r, c, color) for connected area; use fill_enclosed_regions()
+    for cells fully enclosed by a border color.
+  Object rank-sort: sorted(find_objects(g), key=get_size) — process in ascending size order.
+  Cross/plus around center (r,c): place color at (r-1,c),(r+1,c),(r,c-1),(r,c+1).
+
+Rules:
+- Return ONLY a single ```python ... ``` code block.
+- The function must be called `transform`.
+- Use only the DSL primitives listed above plus plain Python/numpy.
+- The function must handle every training example shown.
+- No print statements, no side effects, no I/O.
+- CRITICAL: Always clamp array indices near grid edges:
+    rows, cols = grid.shape
+    r_min, r_max = max(0, r-1), min(rows, r+2)
+    c_min, c_max = max(0, c-1), min(cols, c+2)
+  Never use grid[r-1:r+2] without clamping. Use the safe_neighbors()
+  helper when you need a cell's neighbourhood.
+
+MANDATORY OUTPUT FORMAT: You MUST wrap your code in a fenced block:
+```python
+def transform(input_grid):
+    ...
+```
+Do NOT output code outside a fenced block. This is required.
+"""
 )
 
 _CRITIC_SYSTEM = """\
@@ -103,11 +145,28 @@ _PSO_CODER_SYSTEM = (
     "Before generating each function, briefly reason about what the current\n"
     "solutions get right, what they get wrong, and how to fix the root cause.\n\n"
     + _DSL_REFERENCE
-    + "\nRules:\n"
-    "- Generate exactly {k} code blocks, each in its own ```python \u2026 ``` fence.\n"
-    "- Name the functions `transform_1`, `transform_2`, \u2026 `transform_{k}`.\n"
+    + "\nOUTPUT SHAPE — determine this BEFORE writing any logic:\n"
+    "  Check every training pair. Common cases:\n"
+    "    Same shape: output_grid = np.zeros(input_grid.shape, dtype=np.int32)\n"
+    "    Scaled N times: output_grid = np.zeros((rows*N, cols*N), dtype=np.int32)\n"
+    "    Cropped: output_grid = np.zeros(out_shape, dtype=np.int32)\n\n"
+    "CRITICAL BUG TO AVOID — sequential color replacement corrupts itself:\n"
+    "  WRONG:  grid[grid==1]=2; grid[grid==2]=1  # second line overwrites the first!\n"
+    "  RIGHT:  out = input_grid.copy()\n"
+    "          out[input_grid==1] = 2\n"
+    "          out[input_grid==2] = 1  # read from original, write to copy\n\n"
+    "COMMON PATTERNS:\n"
+    "  Anchor+satellite: compute (dr,dc) from satellite to anchor. Dominant axis:\n"
+    "    abs(dr)>=abs(dc) -> vertical (up/down), else horizontal (left/right).\n"
+    "    Place satellite color at anchor +- 1 step in that direction.\n"
+    "  Region fill: flood_fill(grid,r,c,color); fill_enclosed_regions() for cavities.\n"
+    "  Object rank-sort: sorted(find_objects(g), key=get_size) — ascending size.\n"
+    "  Cross/plus at (r,c): place color at (r-1,c),(r+1,c),(r,c-1),(r,c+1).\n"
+    "\nRules:\n"
+    "- Generate exactly {k} code blocks, each in its own ```python ... ``` fence.\n"
+    "- Name the functions `transform_1`, `transform_2`, ... `transform_{k}`.\n"
     "- Each must be complete and executable (takes np.ndarray, returns np.ndarray).\n"
-    "- Each variation should try a DIFFERENT strategy or fix \u2014 not minor wording tweaks.\n"
+    "- Each variation should try a DIFFERENT strategy or fix — not minor wording tweaks.\n"
     "- Do NOT hardcode specific cell coordinates or shape-based if-else branches.\n"
     "- Prefer solutions that fix the systematic root cause of the listed failures.\n"
     "- No print, no I/O, no side effects.\n"
@@ -120,7 +179,7 @@ _PSO_CODER_SYSTEM = (
     "\nMANDATORY OUTPUT FORMAT: You MUST wrap each function in a fenced block:\n"
     "```python\n"
     "def transform_1(input_grid):\n"
-    "    \u2026\n"
+    "    ...\n"
     "```\n"
     "Do NOT output code outside fenced blocks. This is required.\n"
 )
@@ -441,19 +500,21 @@ class PSOCoder:
 
     def generate_mutations(
         self,
-        task_description:  str,
-        training_context:  str,
-        current_code:      str,
-        current_fitness:   float,
-        pbest_code:        str,
-        pbest_fitness:     float,
-        gbest_code:        str,
-        gbest_fitness:     float,
-        role_name:         str,
-        role_description:  str,
-        eval_diff:         str | None = None,
-        temperature:       float | None = None,
-        failed_examples:   list[tuple[str, float, str]] | None = None,
+        task_description:   str,
+        training_context:   str,
+        current_code:       str,
+        current_fitness:    float,
+        pbest_code:         str,
+        pbest_fitness:      float,
+        gbest_code:         str,
+        gbest_fitness:      float,
+        role_name:          str,
+        role_description:   str,
+        eval_diff:          str | None = None,
+        temperature:        float | None = None,
+        failed_examples:    list[tuple[str, float, str]] | None = None,
+        pair_fitness_scores: list[float] | None = None,
+        hypothesis:         str | None = None,
     ) -> list[str]:
         """Return up to self.k candidate code strings.
 
@@ -461,10 +522,14 @@ class PSOCoder:
         target position vector.
 
         Args:
-            failed_examples: List of (code_snippet, fitness, error_description)
-                             from previously tried candidates that were below
-                             pbest.  Shown to the LLM as explicit negative
-                             examples to avoid.
+            failed_examples:     List of (code_snippet, fitness, error_description)
+                                 from previously tried candidates that were below
+                                 pbest.  Shown to the LLM as explicit negative
+                                 examples to avoid.
+            pair_fitness_scores: Per-training-pair fitness list, e.g. [0.8, 0.2, 0.9].
+                                 Highlights which specific pairs are hardest to fix.
+            hypothesis:          Optional fresh hypothesis from the Hypothesizer to
+                                 guide mutations toward a new strategy.
         """
         k   = self.k
         sys = (
@@ -517,6 +582,24 @@ class PSOCoder:
             for i in range(k)
         )
 
+        # Per-pair fitness breakdown — highlights the weakest training pairs
+        pair_section = ""
+        if pair_fitness_scores:
+            pair_lines = ["--- PER-PAIR FITNESS (focus mutations on failing pairs) ---"]
+            for idx, pf in enumerate(pair_fitness_scores):
+                marker = " ← WEAKEST" if pf == min(pair_fitness_scores) else ""
+                pair_lines.append(f"  Pair {idx+1}: {pf:.4f}{marker}")
+            pair_section = "\n".join(pair_lines) + "\n\n"
+
+        # Fresh hypothesis to guide a new strategy direction
+        hyp_section = ""
+        if hypothesis:
+            hyp_section = (
+                "--- FRESH HYPOTHESIS (try implementing this new approach) ---\n"
+                + hypothesis
+                + "\n\n"
+            )
+
         content = (
             f"{task_description}\n\n"
             f"{training_context}\n\n"
@@ -524,8 +607,10 @@ class PSOCoder:
             f"Current code fitness : {current_fitness:.4f} / 1.0000\n"
             f"Personal best fitness: {pbest_fitness:.4f} / 1.0000\n"
             f"Global best fitness  : {gbest_fitness:.4f} / 1.0000\n\n"
+            + pair_section
             + diff_section
             + failed_section
+            + hyp_section
             + ref_section
             + f"Generate {k} distinct `transform` functions.  "
             f"Use these {k} different strategies:\n"

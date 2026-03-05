@@ -822,6 +822,62 @@ class TestStructuralNoteDownscale:
         assert "1/2" in note
 
 
+class TestStructuralNoteSatelliteAnchor:
+    """Tests for movement detection and satellite-anchor proximity hints."""
+
+    def test_moved_cells_detected(self):
+        """Color with same count but different positions triggers movement note."""
+        inp = np.zeros((5, 5), dtype=np.int32)
+        out = np.zeros((5, 5), dtype=np.int32)
+        inp[0, 0] = 3  # satellite far from anchor
+        out[2, 2] = 3  # moved to near anchor
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "MOVE" in note
+        assert "3" in note
+
+    def test_anchor_stays_in_place(self):
+        """A color that doesn't move is NOT reported as moving."""
+        inp = np.zeros((5, 5), dtype=np.int32)
+        out = np.zeros((5, 5), dtype=np.int32)
+        inp[2, 2] = 1  # anchor stays
+        out[2, 2] = 1
+        inp[0, 0] = 3  # satellite moves
+        out[2, 1] = 3
+        note = _structural_note(inp, out)
+        # Color 1 is anchor → should not appear in a "MOVE" note
+        move_lines = [l for l in (note or "").splitlines() if "MOVE" in l]
+        assert all("1" not in l or "Color 3" in l for l in move_lines)
+
+    def test_satellite_adjacent_to_anchor_hint(self):
+        """When moved cells are adjacent to anchor in output, strong hint fires."""
+        inp = np.zeros((5, 5), dtype=np.int32)
+        out = np.zeros((5, 5), dtype=np.int32)
+        # anchor: color 2 at (2, 2)
+        inp[2, 2] = 2; out[2, 2] = 2
+        # satellite: color 3 far in input, adjacent to anchor in output
+        inp[0, 0] = 3
+        out[1, 2] = 3  # adjacent (above) anchor
+        note = _structural_note(inp, out)
+        assert note is not None
+        assert "satellites compress" in note.lower() or "STRONG HINT" in note
+
+    def test_partial_adjacency_softer_hint(self):
+        """Only some moved cells adjacent → softer hint (not STRONG)."""
+        inp = np.zeros((7, 7), dtype=np.int32)
+        out = np.zeros((7, 7), dtype=np.int32)
+        inp[2, 2] = 2; out[2, 2] = 2   # anchor
+        inp[0, 0] = 3                   # far satellite 1
+        inp[0, 6] = 3                   # far satellite 2
+        out[1, 2] = 3                   # satellite 1 → adjacent
+        out[0, 4] = 3                   # satellite 2 → NOT adjacent
+        note = _structural_note(inp, out)
+        assert note is not None
+        # Should report partial adjacency but NOT the "STRONG HINT" message
+        assert "STRONG HINT" not in (note or "")
+        assert "adjacent" in note.lower()
+
+
 # ---------------------------------------------------------------------------
 # _format_training_examples — adaptive grid format (lines 342-349)
 # ---------------------------------------------------------------------------
