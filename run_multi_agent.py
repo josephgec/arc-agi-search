@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import threading
 import sys
 import time
 from pathlib import Path
@@ -260,15 +261,22 @@ def solve_task(solver, task_path: Path, task_timeout: int = 0) -> dict:
     task = load_task(task_path)
     t0   = time.time()
 
+    # Use a daemon thread + SIGINT to enforce the wall-clock limit.
+    # signal.alarm() + SIGALRM is unreliable when the main thread is blocked
+    # inside a C-level socket.recv() (Ollama streaming); SIGINT reliably
+    # interrupts blocking sockets in CPython by raising KeyboardInterrupt.
+    _timer: threading.Timer | None = None
     if task_timeout > 0:
-        def _handler(signum, frame):
-            raise TimeoutError(f"Task exceeded {task_timeout}s wall-clock limit")
-        old = signal.signal(signal.SIGALRM, _handler)
-        signal.alarm(task_timeout)
+        def _kill():
+            import os
+            os.kill(os.getpid(), signal.SIGINT)
+        _timer = threading.Timer(task_timeout, _kill)
+        _timer.daemon = True
+        _timer.start()
 
     try:
         result = solver.solve(task)
-    except TimeoutError as exc:
+    except (KeyboardInterrupt, TimeoutError) as exc:
         return {
             "task":         str(task_path),
             "success":      False,
@@ -277,12 +285,11 @@ def solve_task(solver, task_path: Path, task_timeout: int = 0) -> dict:
             "code":         "",
             "prediction":   None,
             "gbest_fitness": None,
-            "error":        str(exc),
+            "error":        f"Task exceeded {task_timeout}s wall-clock limit",
         }
     finally:
-        if task_timeout > 0:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old)
+        if _timer is not None:
+            _timer.cancel()
 
     elapsed = time.time() - t0
 
