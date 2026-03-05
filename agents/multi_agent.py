@@ -395,6 +395,213 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
     return "\n".join(notes) if notes else None
 
 
+def _cross_pair_notes(pairs: list[tuple[np.ndarray, np.ndarray]]) -> str | None:
+    """Detect patterns that span ALL training pairs (run once per task).
+
+    Checks four cross-pair signals:
+    1. Color permutation / fixed swap pairs (e.g. 1↔5, 2↔6)
+    2. Output symmetry (4-way, horizontal, vertical)
+    3. Consistent input→output scale ratio
+    4. Block selection (output is one of K equal blocks from input)
+    """
+    if not pairs:
+        return None
+    notes: list[str] = []
+
+    # ------------------------------------------------------------------
+    # 1. Color permutation / swap analysis
+    # ------------------------------------------------------------------
+    all_mappings: list[dict[int, int]] = []
+    for inp, out in pairs:
+        mapping: dict[int, int] = {}
+        # Positional color mapping only makes sense when shapes match
+        if inp.shape == out.shape:
+            for color in np.unique(inp):
+                c = int(color)
+                mask = inp == c
+                out_vals = np.unique(out[mask])
+                if len(out_vals) == 1:
+                    mapping[c] = int(out_vals[0])
+        all_mappings.append(mapping)
+
+    if all_mappings:
+        # Build consistent per-color mapping (same target in every pair)
+        all_colors: set[int] = set()
+        for m in all_mappings:
+            all_colors.update(m.keys())
+
+        consistent_maps: dict[int, int] = {}
+        for color in sorted(all_colors):
+            target = None
+            ok = True
+            for m in all_mappings:
+                if color not in m:
+                    ok = False
+                    break
+                if target is None:
+                    target = m[color]
+                elif m[color] != target:
+                    ok = False
+                    break
+            if ok and target is not None:
+                consistent_maps[color] = target
+
+        # Detect symmetric swap pairs A↔B
+        swap_pairs: list[tuple[int, int]] = []
+        seen: set[int] = set()
+        for a, b in sorted(consistent_maps.items()):
+            if a in seen or b in seen:
+                continue
+            if a != b and consistent_maps.get(b) == a:
+                swap_pairs.append((a, b))
+                seen.add(a)
+                seen.add(b)
+
+        if swap_pairs:
+            swap_str = ", ".join(f"{a}↔{b}" for a, b in swap_pairs)
+            notes.append(
+                f"[Cross-pair] FIXED COLOR SWAP detected across ALL pairs: {swap_str}. "
+                "The rule applies a global color-swap table to every cell. "
+                "Implement as: out = input_grid.copy(); swap each pair using a "
+                "lookup dict (read from original, write to copy — never swap in-place)."
+            )
+        elif consistent_maps:
+            changed = {a: b for a, b in consistent_maps.items() if a != b}
+            if changed:
+                map_str = ", ".join(f"{a}→{b}" for a, b in sorted(changed.items()))
+                notes.append(
+                    f"[Cross-pair] Consistent color mapping across ALL pairs: {map_str}."
+                )
+
+    # ------------------------------------------------------------------
+    # 2. Output symmetry detection
+    # ------------------------------------------------------------------
+    h_sym_all = True
+    v_sym_all = True
+    fourfold_all = True
+    for _, out in pairs:
+        h = np.array_equal(out, np.fliplr(out))
+        v = np.array_equal(out, np.flipud(out))
+        if not h:
+            h_sym_all = False
+        if not v:
+            v_sym_all = False
+        if not (h and v):
+            fourfold_all = False
+
+    if fourfold_all:
+        notes.append(
+            "[Cross-pair] ALL outputs have 4-way (horizontal + vertical) reflection "
+            "symmetry — the rule likely constructs a mirrored/tiled output "
+            "(e.g. tile input then flip, or stack original + h-flipped + v-flipped + both)."
+        )
+    elif h_sym_all:
+        notes.append(
+            "[Cross-pair] ALL outputs have horizontal (left-right) symmetry — "
+            "the rule likely mirrors the output around a vertical axis."
+        )
+    elif v_sym_all:
+        notes.append(
+            "[Cross-pair] ALL outputs have vertical (top-bottom) symmetry — "
+            "the rule likely mirrors the output around a horizontal axis."
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Consistent output/input scale ratio
+    # ------------------------------------------------------------------
+    if len(pairs) >= 2:
+        ratios: list[int | None] = []
+        for inp, out in pairs:
+            ih, iw = inp.shape
+            oh, ow = out.shape
+            if oh > ih and ow > iw and oh % ih == 0 and ow % iw == 0 and oh // ih == ow // iw:
+                ratios.append(oh // ih)
+            else:
+                ratios.append(None)
+
+        if all(r is not None and r == ratios[0] for r in ratios) and ratios[0] is not None:
+            N = ratios[0]
+            ih, iw = pairs[0][0].shape
+            notes.append(
+                f"[Cross-pair] ALL pairs: input {ih}×{iw} → output {ih*N}×{iw*N} "
+                f"(N={N}× scale) — consistent integer scale across all training pairs."
+            )
+
+    # ------------------------------------------------------------------
+    # 4. Block selection hint
+    # ------------------------------------------------------------------
+    if len(pairs) >= 2:
+        inp0, out0 = pairs[0]
+        ih0, iw0 = inp0.shape
+        oh0, ow0 = out0.shape
+
+        if ih0 > oh0 and iw0 == ow0 and oh0 > 0 and ih0 % oh0 == 0:
+            K = ih0 // oh0
+            block_hint = True
+            for inp, out in pairs:
+                ih, iw = inp.shape
+                oh, ow = out.shape
+                if iw != ow or oh == 0 or ih % oh != 0 or ih // oh != K:
+                    block_hint = False
+                    break
+                if not any(
+                    np.array_equal(inp[k * oh:(k + 1) * oh, :], out)
+                    for k in range(K)
+                ):
+                    block_hint = False
+                    break
+
+            if block_hint:
+                notes.append(
+                    f"[Cross-pair] Output IS one of {K} equal horizontal blocks from "
+                    f"input — the rule SELECTS a block (possibly based on pattern "
+                    "uniqueness, color count, non-zero cell count, or another property)."
+                )
+
+    return "\n".join(notes) if notes else None
+
+
+def _format_grid_comparison(
+    actual: np.ndarray | None,
+    expected: np.ndarray,
+    inp: np.ndarray,
+    max_size: int = 10,
+) -> str:
+    """Render input, expected, and actual output for Critic context.
+
+    Grids are capped at max_size×max_size. If actual == input, prepends
+    an identity-transform warning.
+    """
+    def _cap(g: np.ndarray) -> np.ndarray:
+        return g[:max_size, :max_size]
+
+    parts: list[str] = []
+
+    if actual is not None and np.array_equal(actual, inp):
+        parts.append(
+            "⚠ CODE APPEARS TO BE IDENTITY TRANSFORM — output equals input unchanged. "
+            "The transform() function is not modifying the grid at all."
+        )
+
+    parts.append(
+        f"Input ({inp.shape[0]}×{inp.shape[1]}):\n{format_grid_visual(_cap(inp))}"
+    )
+    parts.append(
+        f"Expected ({expected.shape[0]}×{expected.shape[1]}):\n{format_grid_visual(_cap(expected))}"
+    )
+
+    if actual is None:
+        parts.append("Actual: (no output — runtime error or exception)")
+    else:
+        parts.append(
+            f"Actual ({actual.shape[0]}×{actual.shape[1]}):\n{format_grid_visual(_cap(actual))}"
+        )
+        same = np.array_equal(actual, expected)
+        parts.append(f"Match: {'YES' if same else 'NO'}")
+
+    return "\n\n".join(parts)
+
+
 def _format_training_examples(task: dict) -> str:
     """Visual format for all roles except Coder (no raw numpy arrays)."""
     lines = ["Training examples (use these to verify your implementation):"]
@@ -827,6 +1034,13 @@ class MultiAgent:
         task_description: str        = _format_task_description(task)
         training_examples: str       = _format_training_examples(task)
         training_examples_coder: str = _format_training_examples_coder(task)
+
+        # Cross-pair structural analysis (appended once to task description)
+        cross_notes = _cross_pair_notes(
+            [(p["input"], p["output"]) for p in task["train"]]
+        )
+        if cross_notes:
+            task_description += f"\n\n[Cross-pair analysis]\n{cross_notes}"
         hypotheses:          list[str]             = []
         hyp_index:           int                   = 0
         prev_hyp_index:      int                   = -1   # tracks hypothesis transitions
@@ -1075,10 +1289,23 @@ class MultiAgent:
             logger.info("[stage] Critic starting (cycle=%d)", cycle)
             _t0 = time.time()
             try:
+                spatial_diff = _format_spatial_diff(eval_result)
+                # Append training pair 0 grid comparison so Critic can
+                # detect identity-transform and other systematic bugs.
+                _pair0 = eval_result.get("pairs", [{}])[0] if eval_result.get("pairs") else {}
+                if _pair0 and not _pair0.get("correct"):
+                    _exp0 = _pair0.get("expected")
+                    _act0 = _pair0.get("predicted")
+                    _inp0 = task["train"][0]["input"]
+                    if _exp0 is not None:
+                        spatial_diff += (
+                            "\n\nTraining pair 0 comparison:\n"
+                            + _format_grid_comparison(_act0, _exp0, _inp0)
+                        )
                 critic_result = self._critic.analyze(
                     current_hypothesis, code,
                     _format_error_info(eval_result),
-                    _format_spatial_diff(eval_result),
+                    spatial_diff,
                 )
                 logger.info(
                     "[stage] Critic done route=%s (%.1fs)",

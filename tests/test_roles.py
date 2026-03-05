@@ -163,6 +163,20 @@ class TestCoder:
         # System prompt should mention DSL functions
         assert "crop" in system_arg or "rotate" in system_arg or "DSL" in system_arg
 
+    def test_defensive_coding_guard_in_coder_prompt(self):
+        """_CODER_SYSTEM must contain defensive empty-collection guard."""
+        from agents.roles import _CODER_SYSTEM
+        assert "if not objects" in _CODER_SYSTEM
+        assert "find_objects" in _CODER_SYSTEM
+
+    def test_defensive_coding_guard_in_pso_coder_prompt(self):
+        """_PSO_CODER_SYSTEM must also contain the defensive guard."""
+        from agents.roles import _PSO_CODER_SYSTEM
+        # _PSO_CODER_SYSTEM uses {k} placeholder — format it first
+        sys_text = _PSO_CODER_SYSTEM.format(k=5)
+        assert "if not objects" in sys_text
+        assert "find_objects" in sys_text
+
 
 # ---------------------------------------------------------------------------
 # Critic

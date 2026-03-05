@@ -53,6 +53,19 @@ Important categories to consider (pay attention to [Structural] hints in the exa
   are "satellites" (move, collapse, or reflect relative to the anchor).
 - DIRECTION ENCODING: If scattered cells surround an anchor, their direction
   (up/down/left/right from anchor) may determine where they land in the output.
+- COLOR PERMUTATION / SWAP: Check if output colors are always a permutation of
+  input colors. If the [Cross-pair analysis] shows consistent swap pairs
+  (e.g. 1↔5, 2↔6), the rule may be a FIXED GLOBAL SWAP TABLE applied to every
+  cell. Implement with a dict mapping each color to its partner — never swap
+  in-place, always read from the original and write to a copy.
+- OUTPUT SYMMETRY: If [Cross-pair analysis] reports all outputs have 4-way,
+  horizontal, or vertical symmetry, the rule likely CONSTRUCTS a symmetric
+  output (e.g. tile the input then mirror, or concatenate original + flipped
+  halves). The output shape will typically be 2× the input in one or both dims.
+- BLOCK SELECTION: If the input is evenly divided into stacked equal-height
+  blocks and [Cross-pair analysis] reports the output IS one of those blocks,
+  the rule SELECTS a block based on some discriminating property (e.g. highest
+  non-zero cell count, most unique colors, specific color present, etc.).
 """
 
 _CODER_SYSTEM = (
@@ -73,6 +86,17 @@ CRITICAL BUG TO AVOID — sequential color replacement corrupts itself:
   RIGHT:  out = input_grid.copy()
           out[input_grid==1] = 2
           out[input_grid==2] = 1           # read from original, write to copy
+
+DEFENSIVE CODING — always guard against empty collections:
+  objects = find_objects(input_grid)
+  if not objects:
+      return input_grid.copy()   # bail out rather than crash
+  # Never call max()/min() on an empty list — check first.
+
+  Similarly guard filtered results:
+  large = [o for o in objects if get_size(o) > 10]
+  if not large:
+      large = objects  # fallback: use all objects
 
 COMMON PATTERNS:
   Anchor+satellite: For each scattered satellite cell, compute (dr, dc) from nearest
@@ -155,6 +179,15 @@ _PSO_CODER_SYSTEM = (
     "  RIGHT:  out = input_grid.copy()\n"
     "          out[input_grid==1] = 2\n"
     "          out[input_grid==2] = 1  # read from original, write to copy\n\n"
+    "DEFENSIVE CODING — always guard against empty collections:\n"
+    "  objects = find_objects(input_grid)\n"
+    "  if not objects:\n"
+    "      return input_grid.copy()   # bail out rather than crash\n"
+    "  # Never call max()/min() on an empty list — check first.\n\n"
+    "  Similarly guard filtered results:\n"
+    "  large = [o for o in objects if get_size(o) > 10]\n"
+    "  if not large:\n"
+    "      large = objects  # fallback: use all objects\n\n"
     "COMMON PATTERNS:\n"
     "  Anchor+satellite: compute (dr,dc) from satellite to anchor. Dominant axis:\n"
     "    abs(dr)>=abs(dc) -> vertical (up/down), else horizontal (left/right).\n"

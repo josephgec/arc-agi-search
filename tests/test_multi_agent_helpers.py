@@ -26,6 +26,8 @@ from agents.multi_agent import (
     _diff_annotation,
     _structural_note,
     _output_shape_constraint,
+    _cross_pair_notes,
+    _format_grid_comparison,
 )
 
 
@@ -1071,6 +1073,131 @@ class TestCodeDeduplication:
 
         # Both distinct codes should reach the sandbox
         assert mock_eval.call_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# _cross_pair_notes
+# ---------------------------------------------------------------------------
+
+class TestCrossPairNotes:
+    def test_color_swap_detected(self):
+        """Pairs where 1→5 and 5→1 → reports FIXED COLOR SWAP 1↔5."""
+        inp1 = np.array([[1, 5]], dtype=np.int32)
+        out1 = np.array([[5, 1]], dtype=np.int32)
+        inp2 = np.array([[5, 1]], dtype=np.int32)
+        out2 = np.array([[1, 5]], dtype=np.int32)
+        result = _cross_pair_notes([(inp1, out1), (inp2, out2)])
+        assert result is not None
+        assert "1↔5" in result or "5↔1" in result
+        assert "SWAP" in result.upper()
+
+    def test_output_symmetry_4way(self):
+        """All outputs are 4-way symmetric → reports 4-way symmetry hint."""
+        # 2×2 grid that is symmetric both ways: [[1,1],[1,1]]
+        inp = np.array([[0, 1]], dtype=np.int32)
+        out = np.array([[1, 1], [1, 1]], dtype=np.int32)
+        result = _cross_pair_notes([(inp, out), (inp, out)])
+        assert result is not None
+        assert "4-way" in result.lower() or "fourfold" in result.lower() or "horizontal + vertical" in result.lower()
+
+    def test_scale_ratio_detected(self):
+        """All pairs 3×3 → 6×6 → reports 2× scale."""
+        inp = np.ones((3, 3), dtype=np.int32)
+        out = np.ones((6, 6), dtype=np.int32)
+        result = _cross_pair_notes([(inp, out), (inp, out)])
+        assert result is not None
+        assert "2" in result
+        assert "scale" in result.lower() or "×" in result
+
+    def test_block_selection_detected(self):
+        """9×3 input, output matches one 3×3 block → reports block hint."""
+        row = np.array([[1, 2, 3]], dtype=np.int32)
+        block0 = np.tile(row, (3, 1))          # rows 0-2: [[1,2,3]]*3
+        block1 = np.tile(row * 2, (3, 1))      # rows 3-5: [[2,4,6]]*3
+        block2 = np.tile(row * 3, (3, 1))      # rows 6-8: [[3,6,9]]*3
+        inp = np.vstack([block0, block1, block2])
+        # Output is block1 for both pairs
+        result = _cross_pair_notes([(inp, block1), (inp, block1)])
+        assert result is not None
+        assert "block" in result.lower()
+        assert "3" in result  # K=3 blocks
+
+    def test_returns_none_for_no_pattern(self):
+        """Random dissimilar pairs → no cross-pair notes."""
+        inp1 = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        out1 = np.array([[5, 6], [7, 8]], dtype=np.int32)
+        inp2 = np.array([[8, 7], [6, 5]], dtype=np.int32)
+        out2 = np.array([[4, 3], [2, 1]], dtype=np.int32)
+        # Colors don't consistently map the same way across pairs
+        result = _cross_pair_notes([(inp1, out1), (inp2, out2)])
+        # Should not crash; result may be None or contain something but no swap detected
+        # Just verify it doesn't raise an exception
+        assert result is None or isinstance(result, str)
+
+    def test_empty_pairs_returns_none(self):
+        assert _cross_pair_notes([]) is None
+
+    def test_single_pair_no_crash(self):
+        inp = np.array([[1, 2]], dtype=np.int32)
+        out = np.array([[2, 1]], dtype=np.int32)
+        # Single pair — swap analysis runs but consistency check trivially passes
+        result = _cross_pair_notes([(inp, out)])
+        # No crash; result may contain swap note
+        assert result is None or isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# _format_grid_comparison
+# ---------------------------------------------------------------------------
+
+class TestFormatGridComparison:
+    def test_identity_flag_when_actual_equals_input(self):
+        """When actual == input, the identity warning must appear."""
+        inp = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        exp = np.array([[5, 6], [7, 8]], dtype=np.int32)
+        actual = inp.copy()  # identity transform
+        result = _format_grid_comparison(actual, exp, inp)
+        assert "IDENTITY" in result.upper()
+
+    def test_no_identity_flag_when_actual_differs(self):
+        """When actual != input, no identity warning."""
+        inp = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        exp = np.array([[5, 6], [7, 8]], dtype=np.int32)
+        actual = np.array([[5, 6], [7, 8]], dtype=np.int32)
+        result = _format_grid_comparison(actual, exp, inp)
+        assert "IDENTITY" not in result.upper()
+
+    def test_none_actual_shows_error_message(self):
+        """When actual is None, shows error message."""
+        inp = np.array([[1, 2]], dtype=np.int32)
+        exp = np.array([[3, 4]], dtype=np.int32)
+        result = _format_grid_comparison(None, exp, inp)
+        assert "runtime error" in result.lower() or "no output" in result.lower()
+
+    def test_shows_match_yes_when_correct(self):
+        """When actual == expected, shows YES match."""
+        inp = np.array([[1, 2]], dtype=np.int32)
+        exp = np.array([[3, 4]], dtype=np.int32)
+        actual = np.array([[3, 4]], dtype=np.int32)
+        result = _format_grid_comparison(actual, exp, inp)
+        assert "YES" in result
+
+    def test_shows_match_no_when_wrong(self):
+        """When actual != expected, shows NO match."""
+        inp = np.array([[1, 2]], dtype=np.int32)
+        exp = np.array([[3, 4]], dtype=np.int32)
+        actual = np.array([[5, 6]], dtype=np.int32)
+        result = _format_grid_comparison(actual, exp, inp)
+        assert "NO" in result
+
+    def test_large_grid_capped(self):
+        """Grids larger than 10×10 are capped without crashing."""
+        inp = np.zeros((20, 20), dtype=np.int32)
+        exp = np.ones((20, 20), dtype=np.int32)
+        actual = np.zeros((20, 20), dtype=np.int32)
+        result = _format_grid_comparison(actual, exp, inp)
+        assert isinstance(result, str)
+        assert len(result) > 0
 
 
 class TestOrchestratorInit:
