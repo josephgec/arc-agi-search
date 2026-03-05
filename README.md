@@ -62,7 +62,7 @@ arc-agi-search/
 │   ├── single_agent.py         ← Single-agent baseline
 │   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
 │
-├── tests/                      ← 603 tests, 94% coverage
+├── tests/                      ← 618 tests, 94% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -279,20 +279,33 @@ After retrieval: vec = vec / ||vec||₂     # L2 normalise to unit sphere
 Six role classes, each wrapping an `LLMClient` with a purpose-built system prompt:
 
 ```
-Hypothesizer   generates 3 competing natural-language hypotheses
-               about the transformation rule
+Hypothesizer   generates 3 competing natural-language hypotheses about the
+               transformation rule. System prompt includes six pattern
+               categories: MOVEMENT/ATTRACTION, SATELLITE, DIRECTION
+               ENCODING, COLOR PERMUTATION/SWAP, OUTPUT SYMMETRY, and
+               BLOCK SELECTION. Categories reference [Cross-pair analysis]
+               hints injected by the orchestrator so the model can detect
+               global swap tables, mirrored outputs, and block selection.
 
-Coder          translates one hypothesis into a Python transform()
-               function using only the DSL primitives.
+Coder          translates one hypothesis into a Python transform() function
+               using only the DSL primitives.
                prior_failures= parameter: a rolling window of up to 3
                (code_snippet, critic_feedback) pairs from previous failed
                attempts under the same hypothesis, injected into the prompt
                as explicit negative examples so the model avoids repeating
                broken patterns.
+               Includes a DEFENSIVE CODING section: guard find_objects()
+               with `if not objects: return input_grid.copy()` and any
+               filtered list with a fallback to avoid max()/min() on empty
+               collections.
 
 Critic         reads the error diff and decides:
                ROUTE: hypothesizer  ← hypothesis is fundamentally wrong
                ROUTE: coder         ← implementation bug, same hypothesis
+               Now also receives a grid-comparison block (Input / Expected /
+               Actual side-by-side, capped at 10×10) and an explicit
+               ⚠ IDENTITY TRANSFORM warning when the code returns the input
+               unchanged, enabling detection of no-op bugs.
 
 Decomposer     fires on stagnation (≥2 consecutive non-improving cycles);
                decomposes the task into sub-goals to break the agent out
@@ -302,11 +315,12 @@ Verifier       gates success — re-reads the code and training pairs and
                confirms all_correct before the loop exits; fail-safe
                (returns passes=True) on any malformed or missing response
 
-PSOCoder       generates K distinct Python functions that blend the
-               logic of pbest and gbest to move toward the PSO target.
+PSOCoder       generates K distinct Python functions that blend the logic of
+               pbest and gbest to move toward the PSO target.
                failed_examples= parameter: list of (snippet, fitness, error)
                tuples shown before the reference code so the model avoids
                repeating candidates that already proved ineffective.
+               Also includes DEFENSIVE CODING guards (same as Coder).
 ```
 
 ---
@@ -318,8 +332,8 @@ A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 a
 ```
 ┌────────────────┐
 │  Hypothesizer  │◄──── feedback (if critic says: try new hypothesis)
-│  generates 3   │
-│  hypotheses    │
+│  generates 3   │◄──── [Cross-pair analysis] hints (color swaps, symmetry,
+│  hypotheses    │       scale ratio, block selection — see below)
 └───────┬────────┘
         │ hyp[0]
         ▼
@@ -330,7 +344,7 @@ A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 a
         │ fails
         ▼
 ┌────────────────┐     ROUTE=hypothesizer ──► advance hyp index
-│     Critic     │     (uses spatial diff: direction, region, color names)
+│     Critic     │     (spatial diff + grid comparison + identity warning)
 │  diagnoses     │     ROUTE=coder ──────────► Coder retries with feedback
 └───────┬────────┘
         │ stagnation (≥2 non-improving cycles)
@@ -339,6 +353,17 @@ A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 a
 │  Decomposer    │──── breaks task into sub-goals ──► Hypothesizer restart
 └────────────────┘
 ```
+
+**Cross-pair analysis** (`_cross_pair_notes`): runs once per task before the first Hypothesizer call and appends a `[Cross-pair analysis]` block to the task description. Detects four cross-example signals:
+
+| Signal | What it catches |
+|---|---|
+| **Fixed color swap** | `A→B` in pair 1, `B→A` in pair 2 → `FIXED SWAP: A↔B` hint |
+| **Output symmetry** | All outputs identical under `np.fliplr`/`np.flipud` → 4-way/H/V hint |
+| **Scale ratio** | All pairs `H×W → H·N × W·N` for the same integer N → "N× scale" hint |
+| **Block selection** | Output matches one of K equal horizontal blocks in the input → "selects a block" hint |
+
+**Critic grid comparison** (`_format_grid_comparison`): appended to the Critic's diff context for training pair 0. Renders Input / Expected / Actual grids (capped at 10×10) and prepends `⚠ CODE APPEARS TO BE IDENTITY TRANSFORM` when `actual == input`, enabling detection of no-op bugs where the code returns the input unchanged.
 
 `compute_spatial_diff()` produces natural-language feedback (e.g. *"object shifted 2 rows down"*, *"bottom-right region: 3 wrong cells (expected blue, got red)"*) that the Critic uses to generate targeted fix instructions.
 
@@ -907,7 +932,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy two_phas
 ## Running Tests
 
 ```bash
-# Run all 603 tests
+# Run all 618 tests
 python -m pytest
 
 # With coverage report
