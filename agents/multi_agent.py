@@ -367,11 +367,23 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
                 if any((r + dr, c + dc) in all_anchor_pos for dr, dc in _dirs)
             )
             if adj == len(out_pos) and len(out_pos) > 0:
-                anchor_list = sorted(anchor_colors)
+                # Find which specific anchor this satellite is closest to in OUTPUT
+                nearest: dict[int, int] = {}  # anchor_color → count adjacent to it
+                for ac, apos in anchor_colors.items():
+                    cnt = sum(
+                        1 for r, c in out_pos
+                        if any((r + dr, c + dc) in apos for dr, dc in _dirs)
+                    )
+                    if cnt:
+                        nearest[ac] = cnt
+                anchor_detail = " and ".join(
+                    f"color {ac} (×{cnt})" for ac, cnt in sorted(nearest.items())
+                )
                 notes.append(
                     f"  [Structural] In output, ALL {len(out_pos)} cell(s) of color {color} "
-                    f"are immediately adjacent to anchor color(s) {anchor_list} — "
-                    "STRONG HINT: satellites compress/collapse toward the anchor."
+                    f"are immediately adjacent to anchor(s): {anchor_detail} — "
+                    f"STRONG HINT: color {color} satellites collapse/compress toward their anchor. "
+                    f"Color {color} = SATELLITE. Anchor colors = {sorted(anchor_colors)} = FIXED."
                 )
             elif adj > 0:
                 anchor_list = sorted(anchor_colors)
