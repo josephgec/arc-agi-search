@@ -518,8 +518,7 @@ class PSOCoder:
     ) -> list[str]:
         """Return up to self.k candidate code strings.
 
-        The caller embeds them and selects the one closest to the PSO
-        target position vector.
+        The caller evaluates them in the sandbox and selects the highest-fitness one.
 
         Args:
             failed_examples:     List of (code_snippet, fitness, error_description)

@@ -10,8 +10,8 @@ mathematical optimizer (PSO) with a *discrete* LLM code generator via a
   1. PSO computes a *target vector* in continuous embedding space.
   2. The LLM generates K candidate code strings by intelligently blending
      the particle's personal-best and the swarm's global-best solutions.
-  3. We embed all K candidates and select the one whose embedding is
-     *closest* (cosine distance) to the PSO target vector.
+  3. We evaluate all K candidates in the sandbox and select the one with
+     the highest fitness score.
 
 This decouples search direction (math) from solution generation (LLM), so
 the swarm systematically explores the semantic space of programs rather than
@@ -50,7 +50,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 import numpy as np
-from scipy.spatial.distance import cosine
 
 from arc import sandbox
 from arc.evaluate import calculate_continuous_fitness, calculate_complexity_penalty
@@ -622,41 +621,32 @@ class PSOOrchestrator:
             candidates = [p.pbest_code]
 
         # ----------------------------------------------------------------
-        # Step 3 — Generate-and-Project: fitness-first hybrid selection
+        # Step 3 — Fitness-first candidate selection
+        # Always pick the highest-fitness candidate.  Cosine-distance
+        # selection is removed: embedding-space proximity has no
+        # semantic correspondence to program correctness, so it provides
+        # no useful signal beyond "pick a variation of pbest/gbest."
         # ----------------------------------------------------------------
         best_candidate = p.pbest_code
         best_emb       = p.pbest_pos.copy()
 
-        cand_results: list[tuple[str, np.ndarray | None, float, float, dict]] = []
+        cand_results: list[tuple[str, float, dict]] = []
         for cand in candidates:
             if not cand or not cand.strip():
                 continue
             fit, eval_res = self._eval_fitness(cand, task, progress=progress)
-            cand_results.append((cand, None, float("inf"), fit, eval_res))
+            cand_results.append((cand, fit, eval_res))
 
         if cand_results:
-            improving = [t for t in cand_results if t[3] > p.fitness + 1e-6]
-            if improving:
-                winner_code, _, _, _, winner_eval = max(improving, key=lambda x: x[3])
-                best_emb = self._pos_from_eval(winner_code, task, winner_eval)
-                best_candidate = winner_code
-            else:
-                enriched = []
-                for c, _, _, f, eval_res in cand_results:
-                    e = self._pos_from_eval(c, task, eval_res, fallback_random=False)
-                    if e is None or len(e) != len(target_pos):
-                        continue
-                    d = cosine(e, target_pos)
-                    enriched.append((c, e, d, f))
-                if enriched:
-                    best_c, best_e, _, _ = min(enriched, key=lambda x: x[2])
-                    best_candidate = best_c
-                    best_emb       = best_e
+            # Always pick highest-fitness candidate (may or may not beat current pos)
+            winner_code, winner_fit, winner_eval = max(cand_results, key=lambda x: x[1])
+            best_candidate = winner_code
+            best_emb = self._pos_from_eval(winner_code, task, winner_eval)
 
         # ----------------------------------------------------------------
         # Step 3b — Record failed candidates in particle history
         # ----------------------------------------------------------------
-        for _cand_code, _, _, _cand_fit, _cand_eval in cand_results:
+        for _cand_code, _cand_fit, _cand_eval in cand_results:
             if _cand_fit < p.pbest_fitness:
                 _err = _brief_error_desc(_cand_eval, _cand_fit)
                 _snippet = "\n".join(_cand_code.splitlines()[:8])
