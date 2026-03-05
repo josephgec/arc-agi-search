@@ -64,15 +64,18 @@ echo ""
 # ---------------------------------------------------------------------------
 # OLLAMA_FLASH_ATTENTION  — fused attention kernel; critical speedup on M-series
 # OLLAMA_KV_CACHE_TYPE    — q8_0 halves KV memory vs f16 with negligible quality loss
-#                           Memory: models ~25 GB + KV 6×q8 ~6 GB + embed ~0.3 GB
-#                           + system ~4 GB ≈ 35 GB of 64 GB (~29 GB headroom)
-# OLLAMA_NUM_PARALLEL     — simultaneous token streams; 6 fills headroom on M1 Ultra
+# OLLAMA_NUM_PARALLEL     — MUST be 1 for deepseek-r1:32b on 64 GB M1 Ultra.
+#                           deepseek-r1:32b (32.8B, context 131072) KV memory:
+#                             parallel=6 → KV = 104 GB → forces CPU-only → ~15 min/call
+#                             parallel=1 → KV =  17 GB → 65/65 GPU layers → ~2 min/call
+#                           Metal reports 51.8 GiB available for GPU; model weights need
+#                           ~20 GB, so parallel=1 with 17 GB KV leaves ~15 GB headroom.
 # OLLAMA_MAX_LOADED_MODELS — keep reasoner + coder both hot in VRAM
-# Lower OLLAMA_NUM_PARALLEL or set OLLAMA_MAX_LOADED_MODELS=1 if you hit OOM.
+#                           deepseek 47.6 GB + qwen 7.3 GB = 54.9 GB — fits with parallel=1
 
 export OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
 export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-"q8_0"}
-export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-6}
+export OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
 export OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
 # Never unload idle models — prevents the 30-60s reload penalty that blows past timeouts
 # Unconditional: must be set before ollama serve starts; conditional form preserves
