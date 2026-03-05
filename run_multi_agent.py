@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
                    help="Override model for Critic/Decomposer/Verifier roles")
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--max-tokens",  type=int,   default=8192)
-    p.add_argument("--timeout",     type=float, default=120.0)
+    p.add_argument("--timeout",     type=float, default=600.0)
     p.add_argument("--max-cycles",  type=int,   default=9)
 
     # Ensemble-specific
