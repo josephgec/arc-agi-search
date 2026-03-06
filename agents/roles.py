@@ -114,6 +114,31 @@ COMMON PATTERNS:
     for cells fully enclosed by a border color.
   Object rank-sort: sorted(find_objects(g), key=get_size) — process in ascending size order.
   Cross/plus around center (r,c): place color at (r-1,c),(r+1,c),(r,c-1),(r,c+1).
+  4-way reflected tiling (when [Cross-pair analysis] shows 4-way symmetry AND
+    output is 2× input size — do NOT just scale pixels, use actual reflections):
+      rows, cols = input_grid.shape
+      top_right   = np.fliplr(input_grid)
+      bottom_left = np.flipud(input_grid)
+      bottom_right = np.flipud(np.fliplr(input_grid))
+      return np.block([[input_grid, top_right],
+                       [bottom_left, bottom_right]])
+  Diagonal ray cast from a cell (r,c) in direction (dr,dc) until grid edge:
+      for d in range(1, max(rows, cols)):
+          nr, nc = r + dr*d, c + dc*d
+          if not (0 <= nr < rows and 0 <= nc < cols): break
+          out[nr, nc] = color
+  Diagonal extension of cross/star (add cells at the 4 diagonal neighbors):
+      for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+          nr, nc = r + dr, c + dc
+          if 0 <= nr < rows and 0 <= nc < cols:
+              out[nr, nc] = color
+  Ring expansion by inner size (ring outer frame expands by N = inner dimension):
+      # Find inner fill region (solid rectangle inside the ring)
+      # inner_h, inner_w = size of the inner solid block
+      # Expand outer ring outward by inner_h (or inner_w) in each direction
+      # Swap: former ring cells → inner color; former inner → ring color
+      new_out = np.zeros((rows + 2*inner_h, cols + 2*inner_w), dtype=np.int32)
+      # Fill new outer ring with inner_color, then place old ring as inner fill
 
 Rules:
 - Return ONLY a single ```python ... ``` code block.
@@ -150,14 +175,35 @@ ROUTE: coder          ← use this when the hypothesis is correct but the code i
 FEEDBACK:
 <one concise paragraph of actionable feedback for the chosen agent>
 
+ROUTING GUIDE — be decisive:
+  Route → HYPOTHESIZER when any of the following are true:
+  • The predicted output has a QUALITATIVELY different structure from expected:
+      - Output is symmetric but expected is asymmetric (or vice versa)
+      - Output is a simple scale/tile but expected is a reflection/rotation
+      - Output returns the input unchanged (identity) but transformation is needed
+      - Output selects the wrong object or region entirely
+      - Every cell is wrong (not just a few off-by-one errors)
+  • The same wrong spatial pattern appears across multiple consecutive attempts —
+      the code is consistently wrong in the same way despite Coder fixes.
+  • The code correctly implements the hypothesis but the hypothesis is wrong:
+      look at the "Training pair 0 comparison" — if Actual matches what the
+      hypothesis predicts but not what Expected shows, the hypothesis is wrong.
+
+  Route → CODER when:
+  • The overall output structure is correct but specific cells have wrong values.
+  • There is a runtime error, off-by-one, boundary crash, or minor logic bug.
+  • The code does not implement the stated hypothesis (implementation gap).
+  • Only a few cells differ and the spatial diff shows a fixable local error.
+
 Rules:
 - ROUTE must be exactly "hypothesizer" or "coder" (lowercase).
 - FEEDBACK must immediately follow on the next line.
 - Be specific: quote actual cell values, mention which pairs fail, suggest fixes.
 
-You will receive a spatial diff describing WHERE errors occur geometrically.
-Use spatially-grounded language in your feedback: reference directions
-(left/right/up/down), color names, and object positions rather than raw cell coordinates.
+You will receive a spatial diff describing WHERE errors occur geometrically,
+plus a "Training pair 0 comparison" showing Input / Expected / Actual grids.
+Use spatially-grounded language: reference directions (left/right/up/down),
+color names, and object positions rather than raw cell coordinates.
 """
 
 _PSO_CODER_SYSTEM = (
@@ -195,6 +241,16 @@ _PSO_CODER_SYSTEM = (
     "  Region fill: flood_fill(grid,r,c,color); fill_enclosed_regions() for cavities.\n"
     "  Object rank-sort: sorted(find_objects(g), key=get_size) — ascending size.\n"
     "  Cross/plus at (r,c): place color at (r-1,c),(r+1,c),(r,c-1),(r,c+1).\n"
+    "  4-way reflected tiling (4-way symmetry AND 2× output size — use reflections, NOT pixel scaling):\n"
+    "    top_right = np.fliplr(input_grid)\n"
+    "    bottom_left = np.flipud(input_grid)\n"
+    "    bottom_right = np.flipud(np.fliplr(input_grid))\n"
+    "    return np.block([[input_grid, top_right], [bottom_left, bottom_right]])\n"
+    "  Diagonal ray from (r,c) in direction (dr,dc): for d in range(1,max(rows,cols)):\n"
+    "    nr,nc=r+dr*d,c+dc*d; if not(0<=nr<rows and 0<=nc<cols): break; out[nr,nc]=color\n"
+    "  Diagonal extension: add neighbors at (-1,-1),(-1,1),(1,-1),(1,1) of each nonzero cell.\n"
+    "  Ring expansion: inner_h,inner_w = size of solid inner block; expand outer ring outward\n"
+    "    by inner_h/inner_w; swap inner/outer colors; grow output by 2*inner in each dim.\n"
     "\nRules:\n"
     "- Generate exactly {k} code blocks, each in its own ```python ... ``` fence.\n"
     "- Name the functions `transform_1`, `transform_2`, ... `transform_{k}`.\n"

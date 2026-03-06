@@ -1200,6 +1200,138 @@ class TestFormatGridComparison:
         assert len(result) > 0
 
 
+# ---------------------------------------------------------------------------
+# _structural_note — solid rectangle detection
+# ---------------------------------------------------------------------------
+
+class TestStructuralNoteSolidRectangle:
+    def test_solid_rectangle_detected(self):
+        """A color forming a solid filled bbox should trigger the hint."""
+        # 5×5 grid with a 2×3 solid rectangle of color 3 embedded
+        inp = np.zeros((5, 5), dtype=np.int32)
+        inp[1:3, 1:4] = 3  # solid 2×3 block
+        out = np.zeros((5, 5), dtype=np.int32)
+        result = _structural_note(inp, out)
+        assert result is not None
+        assert "SOLID" in result
+        assert "3" in result  # color 3 mentioned
+
+    def test_non_solid_not_detected(self):
+        """Scattered cells that don't fill their bbox shouldn't trigger."""
+        inp = np.zeros((5, 5), dtype=np.int32)
+        inp[0, 0] = 1
+        inp[4, 4] = 1  # two isolated cells — bbox is 5×5 but only 2 cells filled
+        out = np.zeros((5, 5), dtype=np.int32)
+        result = _structural_note(inp, out)
+        # Should NOT report solid rectangle (2 cells ≠ 25 bbox cells)
+        assert result is None or "SOLID" not in result
+
+    def test_full_grid_fill_excluded(self):
+        """A color that fills the entire grid (bbox == grid) is excluded (too large)."""
+        inp = np.ones((4, 4), dtype=np.int32)
+        out = np.ones((4, 4), dtype=np.int32)
+        result = _structural_note(inp, out)
+        # Full-grid fill is excluded by the bbox_area < inp.size // 2 guard
+        assert result is None or "SOLID" not in result
+
+
+# ---------------------------------------------------------------------------
+# _structural_note — diagonal extension detection
+# ---------------------------------------------------------------------------
+
+class TestStructuralNoteDiagonalExtension:
+    def test_diagonal_adjacent_new_cells_detected(self):
+        """New cells that are all diagonally adjacent to input cells → hint."""
+        inp = np.zeros((5, 5), dtype=np.int32)
+        inp[2, 2] = 1  # single center cell
+        out = np.zeros((5, 5), dtype=np.int32)
+        out[2, 2] = 1  # keep center
+        out[1, 1] = 1  # diagonal neighbor
+        out[1, 3] = 1  # diagonal neighbor
+        out[3, 1] = 1  # diagonal neighbor
+        out[3, 3] = 1  # diagonal neighbor
+        result = _structural_note(inp, out)
+        assert result is not None
+        assert "diagonal" in result.lower() or "DIAGONAL" in result
+
+    def test_orthogonal_new_cells_not_diagonal(self):
+        """New cells orthogonally adjacent only — should not trigger diagonal hint."""
+        inp = np.zeros((5, 5), dtype=np.int32)
+        inp[2, 2] = 1
+        out = np.zeros((5, 5), dtype=np.int32)
+        out[2, 2] = 1
+        out[1, 2] = 1  # up (orthogonal)
+        out[3, 2] = 1  # down (orthogonal)
+        result = _structural_note(inp, out)
+        # These are orthogonal, not diagonal — no diagonal hint
+        assert result is None or "DIAGONAL" not in result.upper()
+
+
+# ---------------------------------------------------------------------------
+# Repeated-prediction escalation in solve()
+# ---------------------------------------------------------------------------
+
+class TestRepeatedPredictionEscalation:
+    """When the Coder produces the same wrong prediction 3× in a row, the
+    orchestrator should escalate to the next hypothesis without calling Critic."""
+
+    def _make_task(self):
+        train_inp = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        train_out = np.array([[5, 6], [7, 8]], dtype=np.int32)
+        return {
+            "train": [{"input": train_inp, "output": train_out}],
+            "test":  [{"input": train_inp}],
+        }
+
+    def test_repeated_prediction_skips_critic(self):
+        """Three identical predictions should skip the Critic and move to next hyp."""
+        from unittest.mock import patch, MagicMock
+        from agents.multi_agent import MultiAgent
+
+        # Fixed wrong prediction (always same structure)
+        wrong_pred = np.array([[9, 9], [9, 9]], dtype=np.int32)
+
+        with patch("agents.multi_agent.LLMClient") as MockClient:
+            mock_llm = MagicMock()
+            mock_llm.model = "mock"
+            mock_llm.generate.side_effect = [
+                # Hypothesizer
+                "1. The output inverts colors.\n\n2. Rotate 90 degrees.\n\n3. Flip horizontally and vertically.",
+                # 3 Coder responses (all produce same wrong result)
+                "```python\ndef transform(input_grid):\n    return input_grid * 0 + 9\n```",
+                "```python\ndef transform(input_grid):\n    return input_grid * 0 + 9\n```",
+                "```python\ndef transform(input_grid):\n    return input_grid * 0 + 9\n```",
+            ]
+            MockClient.return_value = mock_llm
+
+            critic_calls = []
+
+            with patch("agents.multi_agent.sandbox.evaluate_code") as mock_eval, \
+                 patch("agents.multi_agent.sandbox.compute_spatial_diff", return_value="diff"):
+                mock_eval.return_value = {
+                    "all_correct": False,
+                    "n_correct": 0, "n_total": 1,
+                    "pairs": [{"correct": False,
+                               "predicted": wrong_pred,
+                               "expected": np.array([[5, 6], [7, 8]], dtype=np.int32),
+                               "error": None}],
+                }
+
+                agent = MultiAgent(max_cycles=6, use_verifier=False, use_decomposer=False)
+                # Patch critic to track calls
+                orig_analyze = agent._critic.analyze
+                def tracking_analyze(*args, **kwargs):
+                    critic_calls.append(1)
+                    return {"route": "coder", "feedback": "fix it"}
+                agent._critic.analyze = tracking_analyze
+
+                agent.solve(self._make_task())
+
+        # After 3 identical predictions the repeated-rut logic fires, skipping Critic
+        # So Critic should be called fewer times than total Coder attempts
+        assert len(critic_calls) < 3
+
+
 class TestOrchestratorInit:
     def test_init_computes_max_cycles(self):
         from unittest.mock import patch, MagicMock

@@ -177,6 +177,42 @@ class TestCoder:
         assert "if not objects" in sys_text
         assert "find_objects" in sys_text
 
+    def test_reflected_tiling_pattern_in_coder_prompt(self):
+        """_CODER_SYSTEM must contain the 4-way reflected tiling pattern."""
+        from agents.roles import _CODER_SYSTEM
+        assert "np.fliplr" in _CODER_SYSTEM
+        assert "np.flipud" in _CODER_SYSTEM
+        assert "np.block" in _CODER_SYSTEM
+
+    def test_reflected_tiling_in_pso_coder_prompt(self):
+        """_PSO_CODER_SYSTEM must also contain reflected tiling."""
+        from agents.roles import _PSO_CODER_SYSTEM
+        sys_text = _PSO_CODER_SYSTEM.format(k=5)
+        assert "np.fliplr" in sys_text
+        assert "np.flipud" in sys_text
+
+    def test_diagonal_ray_pattern_in_coder_prompt(self):
+        """_CODER_SYSTEM must contain the diagonal ray casting pattern."""
+        from agents.roles import _CODER_SYSTEM
+        assert "diagonal" in _CODER_SYSTEM.lower() or "Diagonal" in _CODER_SYSTEM
+
+    def test_ring_expansion_pattern_in_coder_prompt(self):
+        """_CODER_SYSTEM must contain ring expansion guidance."""
+        from agents.roles import _CODER_SYSTEM
+        assert "Ring expansion" in _CODER_SYSTEM or "ring" in _CODER_SYSTEM.lower()
+
+    def test_critic_system_contains_qualitative_routing(self):
+        """_CRITIC_SYSTEM must contain qualitative routing guidance."""
+        from agents.roles import _CRITIC_SYSTEM
+        assert "QUALITATIVELY" in _CRITIC_SYSTEM or "qualitatively" in _CRITIC_SYSTEM
+        assert "HYPOTHESIZER" in _CRITIC_SYSTEM or "hypothesizer" in _CRITIC_SYSTEM
+
+    def test_critic_system_contains_structural_routing_cues(self):
+        """_CRITIC_SYSTEM must mention symmetric/scaling as hypothesizer signals."""
+        from agents.roles import _CRITIC_SYSTEM
+        assert "symmetric" in _CRITIC_SYSTEM.lower()
+        assert "structure" in _CRITIC_SYSTEM.lower()
+
 
 # ---------------------------------------------------------------------------
 # Critic

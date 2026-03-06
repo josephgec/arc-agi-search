@@ -392,6 +392,67 @@ def _structural_note(inp: np.ndarray, out: np.ndarray) -> str | None:
                     f"are adjacent to anchor color(s) {anchor_list}."
                 )
 
+    # ------------------------------------------------------------------
+    # Solid rectangle detection: a color whose bbox is completely filled
+    # (no outliers) — likely an embedded object to extract or isolate.
+    # ------------------------------------------------------------------
+    for color in sorted(in_colors - {0}):
+        mask = inp == color
+        cell_count = int(mask.sum())
+        if cell_count < 2:
+            continue
+        nz = np.argwhere(mask)
+        r1, r2 = int(nz[:, 0].min()), int(nz[:, 0].max())
+        c1, c2 = int(nz[:, 1].min()), int(nz[:, 1].max())
+        bbox_area = (r2 - r1 + 1) * (c2 - c1 + 1)
+        if cell_count == bbox_area and bbox_area < inp.size // 2:
+            notes.append(
+                f"  [Structural] Color {color}: forms a SOLID {r2-r1+1}×{c2-c1+1} "
+                f"rectangle at rows {r1}–{r2}, cols {c1}–{c2} "
+                f"({cell_count} cells fill the bbox completely). "
+                "Hint: the rule may EXTRACT or ISOLATE this rectangle on a blank background."
+            )
+
+    # ------------------------------------------------------------------
+    # Diagonal extension detection: new cells in output that aren't in
+    # input, all lying on 45° diagonals from existing input cells.
+    # ------------------------------------------------------------------
+    if inp.shape == out.shape:
+        inp_nz = set(map(tuple, np.argwhere(inp != 0).tolist()))
+        out_nz = set(map(tuple, np.argwhere(out != 0).tolist()))
+        new_cells = out_nz - inp_nz
+        if new_cells and inp_nz:
+            _diag_dirs = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+            diag_adj = sum(
+                1 for r, c in new_cells
+                if any((r + dr, c + dc) in inp_nz for dr, dc in _diag_dirs)
+            )
+            if diag_adj == len(new_cells):
+                notes.append(
+                    f"  [Structural] All {len(new_cells)} new cell(s) in output are "
+                    "DIAGONALLY adjacent (45°) to input non-zero cells — "
+                    "hint: the rule extends non-zero cells along diagonal directions. "
+                    "Consider casting diagonal rays or adding diagonal neighbors."
+                )
+            # Also check for collinear diagonal chains (ray pattern)
+            elif len(new_cells) >= 4:
+                # Check if new cells lie on any 45° line through an input cell
+                ray_cells = 0
+                for ir, ic in inp_nz:
+                    for dr, dc in _diag_dirs:
+                        for d in range(1, max(inp.shape)):
+                            nr, nc = ir + dr * d, ic + dc * d
+                            if not (0 <= nr < inp.shape[0] and 0 <= nc < inp.shape[1]):
+                                break
+                            if (nr, nc) in new_cells:
+                                ray_cells += 1
+                if ray_cells == len(new_cells):
+                    notes.append(
+                        f"  [Structural] All {len(new_cells)} new cell(s) in output lie "
+                        "on DIAGONAL RAYS extending from input non-zero cells — "
+                        "hint: cast a ray from each input cell along a diagonal direction."
+                    )
+
     return "\n".join(notes) if notes else None
 
 
@@ -972,7 +1033,7 @@ class MultiAgent:
         critic_temperature:       float      = 0.2,
         hypothesizer_max_tokens:  int        = 8192,
         coder_max_tokens:         int        = 4096,
-        critic_max_tokens:        int        = 4096,
+        critic_max_tokens:        int        = 1024,
         decomposer_max_tokens:    int        = 4096,
         verifier_max_tokens:      int        = 4096,
         timeout:                  float      = 120.0,
@@ -1052,6 +1113,10 @@ class MultiAgent:
         coder_attempt:       int                   = 0
         decomp_tried:        bool                  = False
         verifier_attempts:   int                   = 0
+        # Repeated-prediction tracker: if the same predicted structure appears
+        # 3 consecutive times, force escalation to the next hypothesis without
+        # calling the Critic (the Coder is stuck in a structural rut).
+        _pred_hashes:        list[str]             = []
 
         while cycle < self.max_cycles:
 
@@ -1105,6 +1170,7 @@ class MultiAgent:
                 no_improve_count     = 0
                 prev_hyp_index       = hyp_index
                 prior_coder_failures = []   # fresh slate for new hypothesis
+                _pred_hashes         = []   # reset repeated-prediction tracker
 
             current_hypothesis = hypotheses[hyp_index]
             coder_attempt += 1
@@ -1254,7 +1320,47 @@ class MultiAgent:
                 no_improve_count = 0
             prev_n_correct = n_correct
 
+            # Track prediction structure for repeated-rut detection.
+            # A "prediction hash" captures shape + element sum + corner values
+            # — enough to detect structurally identical wrong outputs without
+            # being sensitive to minor value differences.
+            _pair0_pred = eval_result.get("pairs", [{}])[0].get("predicted") if eval_result.get("pairs") else None
+            if _pair0_pred is not None:
+                _ph = f"{_pair0_pred.shape}:{int(_pair0_pred.sum())}:{_pair0_pred.flat[0]}"
+                _pred_hashes.append(_ph)
+            else:
+                _pred_hashes.append("none")
+
+            # If 3 consecutive predictions have identical structure, the Coder
+            # is stuck in a structural rut — skip the Critic and escalate.
             _hypothesis_stuck = (n_correct == 0 and no_improve_count >= 2)
+
+            # Repeated-prediction rut: if 3 consecutive predictions are structurally
+            # identical AND we are not already in the stuck→Decomposer path
+            # (which handles the n_correct=0 stagnation case separately).
+            if (len(_pred_hashes) >= 3
+                    and len(set(_pred_hashes[-3:])) == 1
+                    and not eval_result["all_correct"]
+                    and not _hypothesis_stuck):
+                if self.debug:
+                    print(
+                        f"[debug] Repeated prediction structure ({_pred_hashes[-1]}) "
+                        f"— skipping Critic, escalating to next hypothesis"
+                    )
+                logger.info(
+                    "[stage] Repeated prediction rut detected — forcing hypothesizer escalation"
+                )
+                log.append({
+                    "cycle":    cycle,
+                    "agent":    "critic",
+                    "route":    ROUTE_HYPOTHESIZER,
+                    "feedback": "Repeated prediction structure — forced escalation",
+                })
+                hyp_index    += 1
+                coder_attempt = 0
+                decomp_tried  = False
+                _pred_hashes  = []
+                continue
             if _hypothesis_stuck:
                 if self.use_decomposer and not decomp_tried:
                     if self.debug:
