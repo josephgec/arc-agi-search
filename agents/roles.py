@@ -66,6 +66,25 @@ Important categories to consider (pay attention to [Structural] hints in the exa
   blocks and [Cross-pair analysis] reports the output IS one of those blocks,
   the rule SELECTS a block based on some discriminating property (e.g. highest
   non-zero cell count, most unique colors, specific color present, etc.).
+- SATELLITE COLLAPSE TO ADJACENCY: If scattered secondary-color cells exist
+  alongside a fixed anchor object (multi-cell block), the rule may collapse
+  ALL satellites to be immediately orthogonally adjacent to the anchor — one
+  satellite per free adjacent cell, packed as close as possible. The anchor
+  stays fixed; the output has the anchor plus a ring/cluster of satellite cells
+  touching it, with zeros everywhere else.
+- HOLLOW BORDER EXTRACTION + INTERIOR FILL: If the input contains a hollow
+  rectangular frame (single color forming the border of a rectangle, interior
+  is empty/zero) AND a separate small pattern elsewhere, the rule may be:
+  (1) the output shape = the bounding box of the frame, (2) the frame is
+  redrawn as the border of the output, (3) the small secondary pattern is
+  tiled or stamped to fill the interior. Check [Cross-pair analysis] for
+  consistent output-shape changes that match border dimensions.
+- GRAVITY / PROJECTION LINES: Scattered secondary-color cells may "fall" or
+  "project" in a fixed cardinal direction (e.g. downward) and stop when they
+  hit the primary shape or grid edge, forming vertical/horizontal lines that
+  pass through or align with the shape. Each column (or row) of the shape acts
+  as an attractor: all secondary cells in that column collapse toward the shape,
+  filling in as a continuous line from their starting position to the shape edge.
 """
 
 _CODER_SYSTEM = (
@@ -139,6 +158,51 @@ COMMON PATTERNS:
       # Swap: former ring cells → inner color; former inner → ring color
       new_out = np.zeros((rows + 2*inner_h, cols + 2*inner_w), dtype=np.int32)
       # Fill new outer ring with inner_color, then place old ring as inner fill
+  Satellite collapse to adjacency (all satellites pack against the anchor object):
+      anchor_cells = set(map(tuple, np.argwhere(input_grid == anchor_color).tolist()))
+      sat_cells    = list(map(tuple, np.argwhere(input_grid == sat_color).tolist()))
+      # Collect free orthogonal neighbours of anchor, sorted by distance to centroid
+      anchor_adj = []
+      for (r, c) in anchor_cells:
+          for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+              nr, nc = r+dr, c+dc
+              if 0 <= nr < rows and 0 <= nc < cols and (nr,nc) not in anchor_cells:
+                  anchor_adj.append((nr, nc))
+      anchor_adj = sorted(set(anchor_adj))  # deduplicate
+      out = np.zeros_like(input_grid)
+      for (r,c) in anchor_cells: out[r,c] = anchor_color
+      for i, pos in enumerate(anchor_adj[:len(sat_cells)]): out[pos] = sat_color
+  Hollow border extraction + interior fill (output = border bounding box with tiled interior):
+      border_cells = np.argwhere(input_grid == border_color)
+      r0, c0 = border_cells[:,0].min(), border_cells[:,1].min()
+      r1, c1 = border_cells[:,0].max(), border_cells[:,1].max()
+      out_h, out_w = r1-r0+1, c1-c0+1
+      output_grid = np.zeros((out_h, out_w), dtype=np.int32)
+      output_grid[0,:] = output_grid[-1,:] = border_color   # top/bottom rows
+      output_grid[:,0] = output_grid[:,-1] = border_color   # left/right cols
+      # Tile the secondary pattern into the interior (rows 1..out_h-2, cols 1..out_w-2)
+      pat_cells = np.argwhere((input_grid != 0) & (input_grid != border_color))
+      if len(pat_cells):
+          pat_r0,pat_c0 = pat_cells[:,0].min(), pat_cells[:,1].min()
+          pat_r1,pat_c1 = pat_cells[:,0].max(), pat_cells[:,1].max()
+          pattern = input_grid[pat_r0:pat_r1+1, pat_c0:pat_c1+1]
+          ph, pw = pattern.shape
+          for tr in range(1, out_h-1, ph):
+              for tc in range(1, out_w-1, pw):
+                  rh = min(ph, out_h-1-tr); cw = min(pw, out_w-1-tc)
+                  output_grid[tr:tr+rh, tc:tc+cw] = pattern[:rh,:cw]
+  Gravity / projection lines (secondary cells fall toward shape along their column):
+      shape_cells = set(map(tuple, np.argwhere(input_grid == shape_color).tolist()))
+      out = input_grid.copy()
+      for r, c in np.argwhere(input_grid == secondary_color):
+          out[r, c] = 0   # erase original position
+      # For each column that contains at least one shape cell, fill secondary color
+      # from each scattered cell downward (or upward) until it reaches the shape row
+      for r, c in np.argwhere(input_grid == secondary_color):
+          step = 1 if any(sr > r for sr, sc in shape_cells if sc == c) else -1
+          nr = r + step
+          while 0 <= nr < rows and (nr, c) not in shape_cells:
+              out[nr, c] = secondary_color; nr += step
 
 Rules:
 - Return ONLY a single ```python ... ``` code block.
@@ -251,6 +315,12 @@ _PSO_CODER_SYSTEM = (
     "  Diagonal extension: add neighbors at (-1,-1),(-1,1),(1,-1),(1,1) of each nonzero cell.\n"
     "  Ring expansion: inner_h,inner_w = size of solid inner block; expand outer ring outward\n"
     "    by inner_h/inner_w; swap inner/outer colors; grow output by 2*inner in each dim.\n"
+    "  Satellite collapse to adjacency: collect free orthogonal neighbours of anchor object;\n"
+    "    sort them; place each satellite into one neighbour slot (anchor stays fixed).\n"
+    "  Hollow border extraction: border_cells=np.argwhere(grid==border_color); output shape=\n"
+    "    bounding box of border; redraw border in output; tile secondary pattern in interior.\n"
+    "  Gravity projection: for each secondary cell at (r,c) find direction toward shape;\n"
+    "    draw a line of secondary color from (r,c) to the shape edge along that column/row.\n"
     "\nRules:\n"
     "- Generate exactly {k} code blocks, each in its own ```python ... ``` fence.\n"
     "- Name the functions `transform_1`, `transform_2`, ... `transform_{k}`.\n"

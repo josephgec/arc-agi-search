@@ -1031,10 +1031,10 @@ class MultiAgent:
         hypothesizer_temperature: float      = 0.6,
         coder_temperature:        float      = 0.1,
         critic_temperature:       float      = 0.2,
-        hypothesizer_max_tokens:  int        = 8192,
+        hypothesizer_max_tokens:  int        = 1536,
         coder_max_tokens:         int        = 4096,
         critic_max_tokens:        int        = 1024,
-        decomposer_max_tokens:    int        = 4096,
+        decomposer_max_tokens:    int        = 256,
         verifier_max_tokens:      int        = 4096,
         timeout:                  float      = 120.0,
         debug:                    bool       = False,
@@ -1079,13 +1079,21 @@ class MultiAgent:
         self.critic_max_tokens        = critic_max_tokens
         self.model                    = self.hypothesizer_model
 
-    def solve(self, task: dict) -> dict:
+    def solve(self, task: dict, task_timeout: float = 0.0) -> dict:
         log:            list[dict] = []
         best_code:      str | None = None
         best_n_correct: int        = -1
         cycle:          int        = 0
         task_start:     float      = time.time()
         tried_codes:    set[str]   = set()    # deduplication across all coder attempts
+
+        # Persist best partial result so the timeout handler in run_multi_agent.py
+        # can retrieve and submit it rather than returning prediction=null.
+        self._partial_best: dict = {"code": None, "n_correct": -1}
+
+        def _budget_ok() -> bool:
+            """True if ≥110s remain in the task budget (enough for one more LLM call)."""
+            return task_timeout <= 0 or (time.time() - task_start) < (task_timeout - 110)
         # Short identifier for log lines — hash of first training pair input
         _task_id = hex(abs(hash(str(task["train"][0]["input"].tolist()))))[-8:]
 
@@ -1121,13 +1129,16 @@ class MultiAgent:
         while cycle < self.max_cycles:
 
             if not hypotheses or hyp_index >= len(hypotheses):
+                if not _budget_ok():
+                    logger.info("[stage] Budget exhausted — skipping Hypothesizer, exiting loop")
+                    break
                 cycle += 1
                 if cycle > self.max_cycles:
                     break
                 logger.info("[stage] Hypothesizer starting (cycle=%d)", cycle)
                 _t0 = time.time()
                 try:
-                    hyp_response = self._hypothesizer.generate(task_description, hyp_feedback)
+                    hyp_response = self._hypothesizer.generate(task_description, hyp_feedback, n=5)
                     logger.info("[stage] Hypothesizer done (%.1fs)", time.time() - _t0)
                 except Exception as e:
                     logger.info(
@@ -1138,7 +1149,7 @@ class MultiAgent:
                     break
 
                 hyp_feedback = None
-                hypotheses   = _parse_hypotheses(hyp_response, max_n=3)
+                hypotheses   = _parse_hypotheses(hyp_response, max_n=5)
                 hyp_index    = 0
 
                 log.append({
@@ -1256,6 +1267,7 @@ class MultiAgent:
             if n_correct > best_n_correct:
                 best_n_correct = n_correct
                 best_code      = code
+                self._partial_best = {"code": code, "n_correct": n_correct}
 
             log.append({
                 "cycle":            cycle,
@@ -1362,7 +1374,10 @@ class MultiAgent:
                 _pred_hashes  = []
                 continue
             if _hypothesis_stuck:
-                if self.use_decomposer and not decomp_tried:
+                # Only invoke Decomposer when there is partial progress (some training
+                # pairs correct).  When n_correct == 0 across all attempts the hypothesis
+                # is fundamentally wrong — skip Decomposer and go straight to next hyp.
+                if self.use_decomposer and not decomp_tried and best_n_correct > 0 and _budget_ok():
                     if self.debug:
                         print(f"[debug] Stuck — invoking Decomposer")
                     try:
@@ -1389,6 +1404,9 @@ class MultiAgent:
                     decomp_tried  = False
                 continue
 
+            if not _budget_ok():
+                logger.info("[stage] Budget exhausted — skipping Critic, exiting loop")
+                break
             cycle += 1
             if cycle > self.max_cycles:
                 break

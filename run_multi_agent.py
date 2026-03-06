@@ -275,15 +275,26 @@ def solve_task(solver, task_path: Path, task_timeout: int = 0) -> dict:
         _timer.start()
 
     try:
-        result = solver.solve(task)
+        result = solver.solve(task, task_timeout=float(task_timeout))
     except (KeyboardInterrupt, TimeoutError) as exc:
+        # Try to salvage a partial prediction from the best code seen so far
+        partial   = getattr(solver, "_partial_best", {})
+        part_code = partial.get("code")
+        part_pred = None
+        if part_code and task.get("test"):
+            try:
+                out, err = sandbox.execute(part_code, task["test"][0]["input"])
+                if out is not None and not err:
+                    part_pred = grid_to_list(out)
+            except Exception:
+                pass
         return {
             "task":         str(task_path),
             "success":      False,
             "test_correct": None,
             "elapsed_s":    round(time.time() - t0, 2),
-            "code":         "",
-            "prediction":   None,
+            "code":         part_code or "",
+            "prediction":   part_pred,
             "gbest_fitness": None,
             "error":        f"Task exceeded {task_timeout}s wall-clock limit",
         }

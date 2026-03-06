@@ -1011,7 +1011,7 @@ class TestCodeDeduplication:
             # Always return the same code regardless of feedback
             return f"```python\n{code_once}```"
 
-        def _fake_hyp_generate(desc, feedback=None):
+        def _fake_hyp_generate(desc, feedback=None, **kw):
             return "1. The output is the input copied unchanged for all training examples."
 
         agent._hypothesizer.generate = _fake_hyp_generate

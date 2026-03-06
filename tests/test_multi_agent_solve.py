@@ -326,36 +326,29 @@ class TestResultSchema:
 # ---------------------------------------------------------------------------
 
 class TestDecomposerIntegration:
-    def test_decomposer_called_when_stuck_at_zero(self):
-        """Decomposer invoked after stagnation (n_correct=0, no_improve_count>=2).
+    def test_decomposer_skipped_when_stuck_at_zero(self):
+        """Decomposer is NOT invoked when completely stuck at 0/N correct.
 
-        The stagnation state can only accumulate at hyp_index > 0, because the
-        loop resets prev_n_correct / no_improve_count when hyp_index == 0.
-        We therefore route the first Critic call to HYPOTHESIZER (advancing
-        hyp_index to 1), then route subsequent calls to CODER so stagnation
-        can accumulate.
-
-        Each wrong-code call uses a unique comment so the deduplication check
-        does not block stagnation from accumulating.
+        When best_n_correct never exceeds 0, the hypothesis is fundamentally
+        wrong — the loop should escalate directly to the next hypothesis instead
+        of wasting ~100s on a Decomposer call that cannot help.
         """
         call_count = {"n": 0}
 
         def code_side_effect(*a, **kw):
             call_count["n"] += 1
             n = call_count["n"]
-            # First 5 calls produce wrong code — each unique (avoids dedup block)
-            if n <= 5:
-                return (
-                    f"```python\n"
-                    f"def transform(input_grid):\n"
-                    f"    # attempt {n}\n"
-                    f"    return input_grid * 0\n"
-                    f"```"
-                )
-            return "```python\n" + IDENTITY_CODE + "\n```"
+            # All calls produce wrong code — each unique (avoids dedup block)
+            return (
+                f"```python\n"
+                f"def transform(input_grid):\n"
+                f"    # attempt {n}\n"
+                f"    return input_grid * 0\n"
+                f"```"
+            )
 
         critic_seq = (
-            [{"route": ROUTE_HYPOTHESIZER, "feedback": "wrong hypothesis"}]  # advance hyp_index→1
+            [{"route": ROUTE_HYPOTHESIZER, "feedback": "wrong hypothesis"}]
             + [{"route": ROUTE_CODER, "feedback": "fix"}] * 10
         )
 
@@ -367,7 +360,73 @@ class TestDecomposerIntegration:
             use_verifier=False,
         )
         agent.solve(SIMPLE_TASK)
-        # Decomposer must have been called at least once
+        # Decomposer must NOT have been called — 0/N means wrong hypothesis
+        agent._decomposer.decompose.assert_not_called()
+
+    def test_decomposer_called_with_partial_progress(self):
+        """Decomposer fires when there is partial progress (n_correct > 0) but stagnation."""
+        from unittest.mock import patch
+
+        call_count = {"n": 0}
+
+        def code_side_effect(*a, **kw):
+            call_count["n"] += 1
+            n = call_count["n"]
+            return (
+                f"```python\n"
+                f"def transform(input_grid):\n"
+                f"    # attempt {n}\n"
+                f"    return input_grid * 0\n"
+                f"```"
+            )
+
+        critic_seq = (
+            [{"route": ROUTE_HYPOTHESIZER, "feedback": "wrong hypothesis"}]
+            + [{"route": ROUTE_CODER, "feedback": "fix"}] * 10
+        )
+
+        agent = make_agent(
+            code_responses=code_side_effect,
+            critic_responses=critic_seq,
+            max_cycles=20,
+            use_decomposer=True,
+            use_verifier=False,
+        )
+
+        # Decomposer fires when n_correct drops to 0 AFTER best_n_correct > 0
+        # (regression). Sequence: hyp0 call → ROUTE_HYPOTHESIZER; then at hyp1:
+        #   eval 1: n_correct=1 (partial) → best_n_correct becomes 1
+        #   eval 2: n_correct=0 (regression) → no_improve_count=1
+        #   eval 3: n_correct=0 → no_improve_count=2 → stuck=True, best>0 → Decomposer
+        eval_seq = [
+            # hyp 0, attempt 1: n_correct=1 (Critic → hypothesizer from critic_seq)
+            {"all_correct": False, "n_correct": 1, "n_total": 2,
+             "pairs": [{"correct": True,  "predicted": np.array([[1,2],[3,4]]),
+                        "expected": np.array([[1,2],[3,4]]), "error": None},
+                       {"correct": False, "predicted": np.array([[0,0],[0,0]]),
+                        "expected": np.array([[5,6],[7,8]]), "error": None}]},
+            # hyp 1, attempt 1: n_correct=1 (partial — best_n_correct now 1)
+            {"all_correct": False, "n_correct": 1, "n_total": 2,
+             "pairs": [{"correct": True,  "predicted": np.array([[1,2],[3,4]]),
+                        "expected": np.array([[1,2],[3,4]]), "error": None},
+                       {"correct": False, "predicted": np.array([[0,0],[0,0]]),
+                        "expected": np.array([[5,6],[7,8]]), "error": None}]},
+            # hyp 1, attempt 2: n_correct=0 (regression → no_improve=1)
+            {"all_correct": False, "n_correct": 0, "n_total": 2,
+             "pairs": [{"correct": False, "predicted": np.array([[0,0],[0,0]]),
+                        "expected": np.array([[1,2],[3,4]]), "error": None},
+                       {"correct": False, "predicted": np.array([[0,0],[0,0]]),
+                        "expected": np.array([[5,6],[7,8]]), "error": None}]},
+            # hyp 1, attempt 3: n_correct=0 (no_improve=2 → stuck=True, best>0 → Decomposer)
+            {"all_correct": False, "n_correct": 0, "n_total": 2,
+             "pairs": [{"correct": False, "predicted": np.array([[0,0],[0,0]]),
+                        "expected": np.array([[1,2],[3,4]]), "error": None},
+                       {"correct": False, "predicted": np.array([[0,0],[0,0]]),
+                        "expected": np.array([[5,6],[7,8]]), "error": None}]},
+        ]
+        with patch("agents.multi_agent.sandbox.evaluate_code", side_effect=eval_seq * 5):
+            agent.solve(SIMPLE_TASK)
+
         assert agent._decomposer.decompose.called
 
     def test_decomposer_skipped_when_use_decomposer_false(self):
@@ -620,3 +679,208 @@ class TestPriorCoderFailures:
         _, first_kwargs = first_call
         prior = first_kwargs.get("prior_failures")
         assert prior is None or prior == []
+
+
+# ---------------------------------------------------------------------------
+# Budget-aware loop (task_timeout parameter) — lines 1131-1134, 1401
+# ---------------------------------------------------------------------------
+
+class TestBudgetAwareLoop:
+    def test_budget_exhausted_skips_hypothesizer(self):
+        """When task_timeout is nearly elapsed, Hypothesizer is not called."""
+        agent = make_agent(max_cycles=9, use_decomposer=False, use_verifier=False)
+        # A tiny timeout forces _budget_ok() to return False immediately
+        result = agent.solve(SIMPLE_TASK, task_timeout=0.0001)
+        # Hypothesizer never called
+        agent._hypothesizer.generate.assert_not_called()
+        assert result["success"] is False
+
+    def test_budget_exhausted_skips_critic(self):
+        """When budget runs out just before the Critic, loop exits cleanly."""
+        import itertools
+
+        # task_timeout=200; _budget_ok() returns False when elapsed >= 90
+        # Provide unlimited time values: first call returns start (0s elapsed),
+        # all subsequent calls return start+150 (budget exhausted).
+        T0 = 1000.0
+        time_vals = itertools.chain([T0], itertools.repeat(T0 + 150))
+
+        with patch("agents.multi_agent.time") as mock_time:
+            mock_time.time.side_effect = time_vals
+            agent = make_agent(
+                code_responses=["```python\n" + WRONG_CODE + "\n```"] * 20,
+                max_cycles=9,
+                use_decomposer=False,
+                use_verifier=False,
+            )
+            result = agent.solve(SIMPLE_TASK, task_timeout=200)
+
+        agent._critic.analyze.assert_not_called()
+        assert result["success"] is False
+
+    def test_partial_best_set_during_solve(self):
+        """self._partial_best is updated whenever n_correct improves."""
+        agent = make_agent(use_verifier=False, use_decomposer=False)
+        agent.solve(SIMPLE_TASK)
+        # IDENTITY_CODE passes all pairs → best code should be stored
+        assert agent._partial_best.get("code") is not None
+        assert agent._partial_best.get("n_correct", -1) >= 0
+
+
+# ---------------------------------------------------------------------------
+# Hypothesizer exception → break (lines 1133–1137)
+# ---------------------------------------------------------------------------
+
+class TestHypothesizerException:
+    def test_hypothesizer_exception_breaks_loop(self):
+        """If Hypothesizer raises, solve() breaks and returns failure."""
+        agent = make_agent(max_cycles=9, use_decomposer=False, use_verifier=False)
+        agent._hypothesizer.generate.side_effect = ConnectionError("model offline")
+
+        result = agent.solve(SIMPLE_TASK)
+
+        assert result["success"] is False
+        assert result["code"] is None or result["code"] == ""
+        # Error must be recorded in the log
+        hyp_errors = [e for e in result["log"] if e.get("agent") == "hypothesizer"
+                      and "error" in e]
+        assert len(hyp_errors) >= 1
+
+    def test_hypothesizer_empty_response_continues(self):
+        """An un-parseable Hypothesizer response is skipped (continue, not break)."""
+        call_n = {"n": 0}
+
+        def hyp_side(*a, **kw):
+            call_n["n"] += 1
+            if call_n["n"] == 1:
+                return ""   # un-parseable → no hypotheses
+            return THREE_HYPS
+
+        agent = make_agent(max_cycles=9, use_decomposer=False, use_verifier=False)
+        agent._hypothesizer.generate.side_effect = hyp_side
+
+        result = agent.solve(SIMPLE_TASK)
+        # Second call returns valid hypotheses → should still succeed
+        assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Verifier exception → fallback pass (lines 1294–1299)
+# ---------------------------------------------------------------------------
+
+class TestVerifierException:
+    def test_verifier_exception_treated_as_pass(self):
+        """A Verifier exception is caught and treated as passes=True."""
+        agent = make_agent(
+            use_verifier=True,
+            use_decomposer=False,
+        )
+        agent._verifier.verify.side_effect = RuntimeError("verifier crashed")
+
+        result = agent.solve(SIMPLE_TASK)
+        # Despite the exception, solution is accepted
+        assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Debug mode print paths (line 1456)
+# ---------------------------------------------------------------------------
+
+class TestDebugMode:
+    def test_debug_true_prints_critic_route(self, capsys):
+        """With debug=True, solve() prints 'Critic → <route>'."""
+        agent = make_agent(
+            code_responses=[
+                "```python\n" + WRONG_CODE + "\n```",
+                "```python\n" + IDENTITY_CODE + "\n```",
+            ],
+            critic_responses=[
+                {"route": ROUTE_CODER, "feedback": "fix it"},
+            ],
+            max_cycles=9,
+            use_decomposer=False,
+            use_verifier=False,
+        )
+        agent.debug = True
+        agent.solve(SIMPLE_TASK)
+
+        captured = capsys.readouterr()
+        assert "Critic" in captured.out
+
+    def test_debug_true_prints_hypothesizer_count(self, capsys):
+        """With debug=True, Hypothesizer count is printed."""
+        agent = make_agent(use_decomposer=False, use_verifier=False)
+        agent.debug = True
+        agent.solve(SIMPLE_TASK)
+        captured = capsys.readouterr()
+        assert "hypothesis" in captured.out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Critic grid-comparison context (lines 1408–1409)
+# ---------------------------------------------------------------------------
+
+class TestCriticGridComparison:
+    def test_critic_receives_grid_comparison_when_pair0_fails(self):
+        """When pair 0 fails, Critic.analyze() receives a spatial diff with
+        grid comparison text appended."""
+        agent = make_agent(
+            code_responses=[
+                "```python\n" + WRONG_CODE + "\n```",
+                "```python\n" + IDENTITY_CODE + "\n```",
+            ],
+            critic_responses=[{"route": ROUTE_CODER, "feedback": "fix"}],
+            max_cycles=9,
+            use_decomposer=False,
+            use_verifier=False,
+        )
+        agent.solve(SIMPLE_TASK)
+
+        # The spatial_diff argument passed to Critic should contain "Training pair 0"
+        assert agent._critic.analyze.called
+        call_args = agent._critic.analyze.call_args
+        # 4th positional arg is spatial_diff
+        spatial_diff_arg = call_args[0][3] if call_args[0] else call_args[1].get("spatial_diff", "")
+        assert "Training pair 0" in spatial_diff_arg
+
+
+# ---------------------------------------------------------------------------
+# _best_fitness tracked correctly in failure return (line ~1472)
+# ---------------------------------------------------------------------------
+
+class TestBestFitnessReturn:
+    def test_failure_result_has_correct_best_code(self):
+        """When solve() fails, 'code' in result is the best code seen."""
+        # Use a task where training and test outputs differ from WRONG_CODE
+        partial_task = {
+            "train": [
+                {"input":  np.array([[1]], dtype=np.int32),
+                 "output": np.array([[1]], dtype=np.int32)},
+                {"input":  np.array([[2]], dtype=np.int32),
+                 "output": np.array([[0]], dtype=np.int32)},  # WRONG_CODE gets 0 here
+            ],
+            "test": [{"input": np.array([[3]], dtype=np.int32)}],
+        }
+
+        call_n = {"n": 0}
+        def coder_side(*a, **kw):
+            call_n["n"] += 1
+            # attempt 1: IDENTITY_CODE (gets 1/2 correct)
+            # attempt 2+: WRONG_CODE (gets 0/2 — regression)
+            if call_n["n"] == 1:
+                return "```python\ndef transform(input_grid):\n    return input_grid.copy()\n```"
+            return f"```python\ndef transform(input_grid):\n    # v{call_n['n']}\n    return input_grid * 0\n```"
+
+        agent = make_agent(
+            code_responses=coder_side,
+            critic_responses=[{"route": ROUTE_CODER, "feedback": "not right"}] * 20,
+            max_cycles=9,
+            use_decomposer=False,
+            use_verifier=False,
+        )
+        result = agent.solve(partial_task)
+
+        assert result["success"] is False
+        # Best code (1/2 correct) should be stored, not the later 0/2 code
+        assert result["code"] is not None
+        assert "input_grid.copy()" in result["code"]

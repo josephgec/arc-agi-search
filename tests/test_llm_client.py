@@ -422,3 +422,117 @@ class TestOllamaThinkingFilter:
         from agents.multi_agent import _strip_thinking
         stripped = _strip_thinking(result)
         assert "def transform" in stripped
+
+
+# ---------------------------------------------------------------------------
+# Retry on URLError / timeout (lines 216, 224-234)
+# ---------------------------------------------------------------------------
+
+class TestOllamaRetry:
+    def _make_stream(self, chunks):
+        from io import BytesIO
+        import json
+        lines = b"".join(json.dumps(c).encode() + b"\n" for c in chunks)
+        stream = BytesIO(lines)
+        stream.__enter__ = lambda s: s
+        stream.__exit__  = lambda s, *a: None
+        return stream
+
+    def test_url_error_timeout_retries_once(self):
+        """A socket-timeout URLError on the first attempt triggers one retry."""
+        import socket
+        timeout_exc = URLError(socket.timeout("timed out"))
+        good_stream = self._make_stream([
+            {"message": {"content": "hello"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ])
+
+        call_count = {"n": 0}
+        def side_effect(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise timeout_exc
+            ctx = MagicMock()
+            ctx.__enter__ = lambda s: good_stream
+            ctx.__exit__  = lambda s, *a: None
+            return ctx
+
+        client = LLMClient(backend="ollama", debug=False)
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = client.generate("sys", [{"role": "user", "content": "q"}])
+
+        assert "hello" in result
+        assert call_count["n"] == 2
+
+    def test_non_timeout_url_error_raises_immediately(self):
+        """A non-timeout URLError (e.g. connection refused) raises ConnectionError."""
+        import socket
+        conn_refused = URLError("connection refused")
+
+        client = LLMClient(backend="ollama", debug=False)
+        with patch("urllib.request.urlopen", side_effect=conn_refused):
+            with pytest.raises(ConnectionError):
+                client.generate("sys", [{"role": "user", "content": "q"}])
+
+    def test_debug_mode_prints_model_name(self, capsys):
+        """With debug=True, successful Ollama call prints '[llm] ollama/<model>'."""
+        good_stream = self._make_stream([
+            {"message": {"content": "hi"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ])
+        ctx = MagicMock()
+        ctx.__enter__ = lambda s: good_stream
+        ctx.__exit__  = lambda s, *a: None
+
+        client = LLMClient(backend="ollama", debug=True)
+        with patch("urllib.request.urlopen", return_value=ctx):
+            client.generate("sys", [{"role": "user", "content": "q"}])
+
+        captured = capsys.readouterr()
+        assert "[llm] ollama/" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Anthropic backend (lines 224–234)
+# ---------------------------------------------------------------------------
+
+class TestAnthropicBackend:
+    def test_anthropic_backend_calls_anthropic_client(self):
+        """When backend='anthropic', _generate_anthropic() is used."""
+        mock_content = MagicMock()
+        mock_content.text = "anthropic response"
+        mock_response = MagicMock()
+        mock_response.content = [mock_content]
+
+        client = LLMClient.__new__(LLMClient)
+        client.backend       = "anthropic"
+        client.model         = "claude-test"
+        client.max_tokens    = 512
+        client.temperature   = 0.5
+        client.timeout       = 30.0
+        client.debug         = False
+        client._anthropic_client = MagicMock()
+        client._anthropic_client.messages.create.return_value = mock_response
+
+        result = client.generate("system prompt", [{"role": "user", "content": "hi"}])
+
+        assert result == "anthropic response"
+        client._anthropic_client.messages.create.assert_called_once()
+
+    def test_anthropic_empty_content_returns_empty_string(self):
+        """If anthropic returns empty content list, return '' not crash."""
+        mock_response = MagicMock()
+        mock_response.content = []
+
+        client = LLMClient.__new__(LLMClient)
+        client.backend       = "anthropic"
+        client.model         = "claude-test"
+        client.max_tokens    = 512
+        client.temperature   = 0.5
+        client.timeout       = 30.0
+        client.debug         = False
+        client._anthropic_client = MagicMock()
+        client._anthropic_client.messages.create.return_value = mock_response
+
+        result = client.generate("sys", [{"role": "user", "content": "q"}])
+        assert result == ""

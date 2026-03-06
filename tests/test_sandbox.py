@@ -1,6 +1,8 @@
 """Tests for arc/sandbox.py — sandboxed code execution."""
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 
@@ -448,5 +450,79 @@ class TestParamSearchStdinGuard:
              "output": np.array([[1]], dtype=np.int32)},
         ]}
         params, fitness = param_search("x = input('hi')", task)
+        assert params == {}
+        assert fitness == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# execute() exception paths (lines 225-229)
+# ---------------------------------------------------------------------------
+
+class TestExecuteExceptionPaths:
+    def test_execute_broken_pool_returns_none(self):
+        """BrokenProcessPool is caught and returns (None, error_message)."""
+        import concurrent.futures.process as cfp
+        from arc.sandbox import execute, shutdown_pool
+        with pytest.MonkeyPatch().context() as mp:
+            def fake_submit(*a, **kw):
+                raise cfp.BrokenProcessPool("crashed")
+            mp.setattr("arc.sandbox._get_pool", lambda: type("P", (), {"submit": staticmethod(fake_submit)})())
+            result, err = execute("def transform(g): return g", np.array([[1]], dtype=np.int32))
+        assert result is None
+        assert err is not None
+
+    def test_execute_unexpected_exception_returns_none(self):
+        """Unexpected exception during future.result() is caught gracefully."""
+        import concurrent.futures as cf
+        from arc.sandbox import execute
+        with pytest.MonkeyPatch().context() as mp:
+            future = MagicMock()
+            future.result.side_effect = ValueError("unexpected")
+            pool = MagicMock()
+            pool.submit.return_value = future
+            mp.setattr("arc.sandbox._get_pool", lambda: pool)
+            result, err = execute("def transform(g): return g", np.array([[1]], dtype=np.int32))
+        assert result is None
+        assert "Execution error" in (err or "")
+
+
+# ---------------------------------------------------------------------------
+# param_search() timeout / broken pool (lines 367–373)
+# ---------------------------------------------------------------------------
+
+class TestParamSearchExceptionPaths:
+    def test_param_search_timeout_returns_empty(self):
+        """TimeoutError in param_search returns ({}, 0.0)."""
+        import concurrent.futures as cf
+        from arc.sandbox import param_search
+        task = {"train": [
+            {"input":  np.array([[1]], dtype=np.int32),
+             "output": np.array([[1]], dtype=np.int32)},
+        ]}
+        with pytest.MonkeyPatch().context() as mp:
+            future = MagicMock()
+            future.result.side_effect = cf.TimeoutError()
+            pool = MagicMock()
+            pool.submit.return_value = future
+            mp.setattr("arc.sandbox._get_pool", lambda: pool)
+            params, fitness = param_search("def transform(g): return g", task)
+        assert params == {}
+        assert fitness == pytest.approx(0.0)
+
+    def test_param_search_broken_pool_returns_empty(self):
+        """BrokenProcessPool in param_search returns ({}, 0.0)."""
+        import concurrent.futures.process as cfp
+        from arc.sandbox import param_search
+        task = {"train": [
+            {"input":  np.array([[1]], dtype=np.int32),
+             "output": np.array([[1]], dtype=np.int32)},
+        ]}
+        with pytest.MonkeyPatch().context() as mp:
+            future = MagicMock()
+            future.result.side_effect = cfp.BrokenProcessPool("crashed")
+            pool = MagicMock()
+            pool.submit.return_value = future
+            mp.setattr("arc.sandbox._get_pool", lambda: pool)
+            params, fitness = param_search("def transform(g): return g", task)
         assert params == {}
         assert fitness == pytest.approx(0.0)

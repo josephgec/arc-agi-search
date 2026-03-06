@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures as cf
+import concurrent.futures.process as _cf_process  # BrokenProcessPool lives here in Python 3.9
+_BrokenProcessPool = getattr(cf, "BrokenProcessPool", _cf_process.BrokenProcessPool)
 import multiprocessing as mp
 import threading
 from typing import Any
@@ -222,7 +224,7 @@ def execute(
             f"Execution timed out after {timeout}s "
             "(infinite loop or excessive computation)"
         )
-    except cf.BrokenProcessPool:
+    except _BrokenProcessPool:
         shutdown_pool()
         return None, "Worker pool crashed; pool has been reset."
     except Exception as exc:
@@ -366,7 +368,7 @@ def param_search(
         status, value = future.result(timeout=timeout)
     except cf.TimeoutError:
         return {}, 0.0
-    except cf.BrokenProcessPool:
+    except _BrokenProcessPool:
         shutdown_pool()
         return {}, 0.0
     except Exception:
