@@ -1326,6 +1326,19 @@ class MultiAgent:
                     "log":          log,
                 }
 
+            # Fast-fail: if 0/N correct on 2nd+ attempt AND no partial progress
+            # has ever been made (best_n_correct == 0), skip the Critic and move
+            # to the next hypothesis. When there IS partial progress, let the
+            # existing stagnation/Decomposer logic handle it.
+            if n_correct == 0 and coder_attempt >= 2 and best_n_correct == 0:
+                if self.debug:
+                    print(f"[debug] 0/{eval_result['n_total']} on attempt {coder_attempt} — fast-fail to next hyp")
+                logger.info("[stage] Fast-fail: 0 correct after %d attempts — next hypothesis", coder_attempt)
+                hyp_index    += 1
+                coder_attempt = 0
+                decomp_tried  = False
+                continue
+
             if n_correct <= prev_n_correct:
                 no_improve_count += 1
             else:

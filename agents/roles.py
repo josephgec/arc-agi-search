@@ -223,6 +223,12 @@ def transform(input_grid):
     ...
 ```
 Do NOT output code outside a fenced block. This is required.
+
+MANDATORY RULES:
+- The function MUST be named `transform` with parameter `input_grid` (not input_array or grid).
+- You MUST use the DSL primitives listed above when applicable (crop, rotate, flip,
+  find_objects, bounding_box, recolor, etc.) — do NOT reimplement them from scratch.
+- input_grid is always a numpy ndarray. Return a numpy ndarray.
 """
 )
 
@@ -239,21 +245,24 @@ ROUTE: coder          ← use this when the hypothesis is correct but the code i
 FEEDBACK:
 <one concise paragraph of actionable feedback for the chosen agent>
 
-ROUTING GUIDE — be decisive:
+ROUTING GUIDE — be decisive and PREFER hypothesizer:
   Route → HYPOTHESIZER when any of the following are true:
+  • 0 out of N training pairs are correct — the hypothesis is fundamentally wrong.
+    Do NOT route to coder when zero pairs pass; the approach needs rethinking.
   • The predicted output has a QUALITATIVELY different structure from expected:
+      - Wrong output shape (different dimensions than expected)
       - Output is symmetric but expected is asymmetric (or vice versa)
       - Output is a simple scale/tile but expected is a reflection/rotation
       - Output returns the input unchanged (identity) but transformation is needed
       - Output selects the wrong object or region entirely
-      - Every cell is wrong (not just a few off-by-one errors)
   • The same wrong spatial pattern appears across multiple consecutive attempts —
       the code is consistently wrong in the same way despite Coder fixes.
   • The code correctly implements the hypothesis but the hypothesis is wrong:
       look at the "Training pair 0 comparison" — if Actual matches what the
       hypothesis predicts but not what Expected shows, the hypothesis is wrong.
 
-  Route → CODER when:
+  Route → CODER ONLY when:
+  • At least 1 training pair is correct (partial success — the hypothesis has merit).
   • The overall output structure is correct but specific cells have wrong values.
   • There is a runtime error, off-by-one, boundary crash, or minor logic bug.
   • The code does not implement the stated hypothesis (implementation gap).

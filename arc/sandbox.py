@@ -181,6 +181,12 @@ def _subprocess_worker(code: str, grid_list: list) -> tuple[str, Any]:
 
     transform_fn = namespace.get("transform")
     if transform_fn is None:
+        # Some LLMs name the function differently — check common aliases
+        for alias in ("transform_grid", "solve", "process"):
+            if alias in namespace and callable(namespace[alias]):
+                transform_fn = namespace[alias]
+                break
+    if transform_fn is None:
         user_fns = [
             v for k, v in namespace.items()
             if callable(v)
