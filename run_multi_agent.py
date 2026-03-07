@@ -362,18 +362,26 @@ def main() -> None:
             if summary.get("error"):
                 status = f"TIMEOUT ({elapsed:.0f}s)"
             else:
-                status = f"{'SOLVED' if summary['success'] else 'failed'} ({elapsed:.0f}s)"
+                tc = summary.get("test_correct")
+                if tc is True:
+                    label = "SOLVED" if summary["success"] else "test_ok(train?)"
+                else:
+                    label = "failed"
+                status = f"{label} ({elapsed:.0f}s)"
             print(status)
             # Running tally every 10 tasks
             all_results.append(summary)
             if i % 10 == 0:
-                n_so_far = sum(r["success"] for r in all_results)
+                n_test_ok = sum(bool(r.get("test_correct")) for r in all_results)
+                n_full = sum(r["success"] for r in all_results)
                 avg_t = sum(r.get("elapsed_s", 0) for r in all_results) / len(all_results)
-                print(f"  → {n_so_far}/{i} solved so far  |  avg {avg_t:.0f}s/task", flush=True)
+                print(f"  → {n_test_ok}/{i} test-correct ({n_full} full)  |  avg {avg_t:.0f}s/task", flush=True)
 
-        n_solved = sum(r["success"] for r in all_results)
-        print(f"\n{n_solved}/{len(all_results)} solved "
-              f"({100 * n_solved / max(len(all_results), 1):.1f}%)")
+        n_test_ok = sum(bool(r.get("test_correct")) for r in all_results)
+        n_full = sum(r["success"] for r in all_results)
+        print(f"\n{n_test_ok}/{len(all_results)} test-correct  "
+              f"({n_full} fully solved, "
+              f"{100 * n_test_ok / max(len(all_results), 1):.1f}%)")
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -56,13 +56,14 @@ arc-agi-search/
 │   ├── llm_client.py           ← Unified LLM + embedding API
 │   ├── roles.py                ← Hypothesizer, Coder, Critic, Decomposer, Verifier, PSOCoder
 │   ├── dsl_reference.py        ← DSL primitives reference injected into LLM context
+│   ├── formatting.py           ← Visual grid formatting (single-char colour codes for LLM prompts)
 │   ├── multi_agent.py          ← Hypothesizer → Coder → Critic loop (with Decomposer + Verifier)
 │   ├── orchestrator.py         ← Candidate-pooling wrapper (exposes fitness/perfect fields)
 │   ├── ensemble.py             ← Pixel-weighted majority-vote ensemble with self-correction
 │   ├── single_agent.py         ← Single-agent baseline
 │   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
 │
-├── tests/                      ← 618 tests, 94% coverage
+├── tests/                      ← 658 tests, 87% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -70,6 +71,8 @@ arc-agi-search/
 │
 ├── run_pso.py                  ← CLI entry point for PSO solver
 ├── run_multi_agent.py          ← Unified CLI (--strategy flag)
+├── run_batch_test.py           ← Quick 5-task batch smoke test
+├── run_single_test.py          ← Debug single-task run with verbose cycle tracking
 ├── start_ollama.sh             ← Launch Ollama with tiered model selection
 └── requirements.txt
 ```
@@ -856,7 +859,7 @@ TIER=ultra  ./start_ollama.sh      # ~25 GB — deepseek-r1:32b (reasoner) + qwe
 #   OLLAMA_FLASH_ATTENTION=1     — fused attention kernel for Apple Silicon
 #   OLLAMA_KV_CACHE_TYPE=q8_0   — halves KV memory vs f16 with negligible quality loss
 #                                  frees ~6 GB on 64 GB machines for an extra parallel slot
-#   OLLAMA_NUM_PARALLEL=6       — matches PSO swarm size; 6 concurrent LLM streams
+#   OLLAMA_NUM_PARALLEL=1       — MUST be 1 for deepseek-r1:32b on 64 GB (see start_ollama.sh)
 #   OLLAMA_KEEP_ALIVE=-1        — models stay loaded; avoids 30-60s reload penalty
 ```
 
@@ -932,7 +935,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy two_phas
 ## Running Tests
 
 ```bash
-# Run all 618 tests
+# Run all 658 tests
 python -m pytest
 
 # With coverage report
@@ -955,20 +958,21 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 
 | Module | Coverage |
 |---|---|
-| `arc/evaluate.py` | 100% |
+| `arc/evaluate.py` | 98% |
 | `arc/grid.py` | 100% |
 | `arc/dsl.py` | 99% |
+| `arc/sandbox.py` | 64% |
 | `agents/roles.py` | 97% |
 | `agents/ensemble.py` | 99% |
 | `agents/single_agent.py` | 95% |
-| `agents/orchestrator.py` | 100% |
-| `agents/multi_agent.py` | 97% |
+| `agents/orchestrator.py` | 85% |
+| `agents/multi_agent.py` | 87% |
 | `agents/pso_orchestrator.py` | 82% |
-| `agents/llm_client.py` | 91% |
-| `arc/sandbox.py` | 96% |
-| **Total** | **94%** |
+| `agents/llm_client.py` | 86% |
+| `agents/dsl_reference.py` | 100% |
+| **Total** | **87%** |
 
-> `arc/sandbox.py` subprocess worker bodies (`_subprocess_worker`, `_param_search_worker`) are tested by calling them directly in-process, giving full line coverage without requiring a real child process. The persistent `ProcessPoolExecutor` is registered with `atexit` so pytest exits cleanly without hanging.
+> `arc/sandbox.py` subprocess worker bodies (`_subprocess_worker`, `_param_search_worker`) are tested by calling them directly in-process. The persistent `ProcessPoolExecutor` is registered with `atexit` so pytest exits cleanly without hanging. Coverage is lower on this module because some error-handling paths (broken pool recovery, spatial diff edge cases) are exercised only under real multiprocessing conditions.
 
 ---
 
