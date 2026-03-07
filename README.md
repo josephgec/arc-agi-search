@@ -140,7 +140,7 @@ Key functions:
 | `load_task(path)` | Load a JSON task file → `{train: [...], test: [...]}` |
 | `grids_equal(a, b)` | True iff shape and all values match |
 | `unique_colors(grid)` | Sorted list of distinct colour values |
-| `background_color(grid)` | Always 0 (black) if present; else most-frequent |
+| `background_color(grid)` | 0 (black) if present; else most-frequent. Intentional deviation from ARC-AGI's "most-frequent" convention — 0 is the canvas colour in >95% of tasks, and hardcoding avoids misclassification on tasks where a non-zero minority colour is structurally the background |
 
 ---
 
@@ -193,7 +193,7 @@ Security guards:
 - `input()` / `sys.stdin` usage → rejected before spawning
 - Hard timeout via `future.result(timeout=t)` → timed-out worker replaced automatically by the pool
 - `BrokenProcessPool` → caught; pool reset via `shutdown_pool()`
-- No network, no file-write access (subprocess isolation)
+- Crash and infinite-loop isolation via child process + hard timeout. Network and filesystem access are **not** explicitly blocked — trust-boundary enforcement is the responsibility of the deployment environment
 
 **Parameterized CPU Search** (`param_search`): if generated code defines a `PARAM_GRID = dict(...)` mapping parameter names to lists of values, `param_search` sweeps all combinations (up to `MAX_PARAM_COMBINATIONS = 5000`) in a single sandboxed subprocess, returning the best `(params, fitness)` pair — offloading constant-guessing from the LLM to the CPU:
 
@@ -330,7 +330,7 @@ PSOCoder       generates K distinct Python functions that blend the logic of
 
 #### `agents/multi_agent.py` — Multi-Agent Orchestrator
 
-A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 added Decomposer, Verifier, spatial diffs, and near-miss candidate collection:
+A **state machine** that runs up to `max_cycles` total LLM calls (CLI: `--max-cycles`, default 9). The Decomposer fires when `no_improve_count >= 2` (hard-coded constant in the solve loop). Phases 3–4 added Decomposer, Verifier, spatial diffs, and near-miss candidate collection:
 
 ```
 ┌────────────────┐
@@ -369,6 +369,24 @@ A **state machine** that runs up to `max_cycles` total LLM calls. Phases 3–4 a
 **Critic grid comparison** (`_format_grid_comparison`): appended to the Critic's diff context for training pair 0. Renders Input / Expected / Actual grids (capped at 10×10) and prepends `⚠ CODE APPEARS TO BE IDENTITY TRANSFORM` when `actual == input`, enabling detection of no-op bugs where the code returns the input unchanged.
 
 `compute_spatial_diff()` produces natural-language feedback (e.g. *"object shifted 2 rows down"*, *"bottom-right region: 3 wrong cells (expected blue, got red)"*) that the Critic uses to generate targeted fix instructions.
+
+---
+
+#### `agents/orchestrator.py` — Pooling Orchestrator
+
+Extends `MultiAgent` with candidate collection for the Ensemble layer. Derives `max_cycles` from `n_hypotheses × (1 + max_retries × 2)`. Its `solve()` method calls the parent loop but collects every correct code string (with fitness scores) into a `candidates` list so `Ensemble` can run majority voting across them.
+
+---
+
+#### `agents/single_agent.py` — Single-Agent Baseline
+
+One-shot hypothesize → code solver with **no Critic feedback loop**. Generates 3 hypotheses, tries each once with the Coder, and returns the best result. Useful as a performance baseline and quick sanity check. Constructor takes the same LLM config as `MultiAgent` (`backend`, `model`, `temperature`, `timeout`).
+
+---
+
+#### `agents/dsl_reference.py` — DSL Reference String
+
+Single source of truth for the DSL function reference injected into all agent system prompts. Every agent (Coder, PSOCoder, Hypothesizer) sees the same function signatures and descriptions. Deliberately avoids curly braces so it can be safely used inside `.format()` calls.
 
 ---
 
@@ -498,7 +516,7 @@ This is the key innovation that solves the Inverse Mapping Problem:
 Step 1 — PSO computes target_pos in ℝ⁷⁶⁸
          (unit sphere, L2-normalised)
 
-Step 2 — LLM generates K=5 candidate functions
+Step 2 — LLM generates K=10 candidate functions
          Each is a blend of pbest_code and gbest_code
          guided by a prompt that shares both solutions
          and their fitness scores
@@ -600,7 +618,7 @@ Iteration 4  fitness=1.00  (solved ✓)
               │      └────────────┬────────────┘  │
               │                   │               │
               │      ┌────────────▼────────────┐  │
-              │      │  LLM MUTATION (K=5)     │  │
+              │      │  LLM MUTATION (K=10)    │  │
               │      │  candidates ← LLM(      │  │
               │      │    pbest_code,           │  │
               │      │    gbest_code,           │  │
@@ -850,8 +868,8 @@ pip install -r requirements.txt
 TIER=small  ./start_ollama.sh      # ~8 GB  — deepseek-r1:8b  + qwen2.5-coder:7b
 TIER=medium ./start_ollama.sh      # ~16 GB — deepseek-r1:14b + qwen2.5-coder:14b (default)
 TIER=large  ./start_ollama.sh      # ~32 GB — deepseek-r1:32b + qwen2.5-coder:32b
-TIER=ultra  ./start_ollama.sh      # ~25 GB — deepseek-r1:32b (reasoner) + qwen2.5-coder:7b (fast coder)
-                                   #          optimal for 64 GB machines — 39 GB KV cache headroom
+TIER=ultra  ./start_ollama.sh      # ~25 GB model weights — deepseek-r1:32b (reasoner) + qwen2.5-coder:7b (fast coder)
+                                   #          optimal for ≥64 GB machines — ~39 GB KV cache headroom
 # Also pulls: nomic-embed-text (embeddings, 274 MB)
 # Prints ready-to-paste CLI invocations for each strategy after startup
 
@@ -865,6 +883,10 @@ TIER=ultra  ./start_ollama.sh      # ~25 GB — deepseek-r1:32b (reasoner) + qwe
 
 ### PSO Solver
 
+> `run_pso.py` exposes PSO-specific flags (hyperparameters, swarm size) directly.
+> `run_multi_agent.py --strategy pso` wraps the same solver under the unified CLI
+> with `--pso-*` prefixed flags. Either entry point is equivalent.
+
 ```bash
 # Solve a single task with defaults (6 particles, 10 iterations)
 python run_pso.py --task data/training/007bbfb7.json
@@ -876,7 +898,7 @@ python run_pso.py --task data/training/007bbfb7.json --debug
 python run_pso.py --task data/training/007bbfb7.json \
     --n-particles 6      \   # number of particles (max 6)
     --max-iterations 15  \   # PSO iteration budget
-    --k-candidates 5     \   # LLM mutations per particle per iteration
+    --k-candidates 10    \   # LLM mutations per particle per iteration
     --w 0.5              \   # inertia weight
     --c1 1.5             \   # cognitive coefficient
     --c2 1.5             \   # social coefficient
@@ -889,9 +911,10 @@ python run_pso.py --task-dir data/training/ \
     --output results/pso_run.json
 
 # Use Anthropic backend for generation (embeddings still via Ollama)
+# Use the exact model ID from Anthropic's API (e.g. claude-sonnet-4-20250514)
 python run_pso.py --task data/training/007bbfb7.json \
     --backend anthropic \
-    --model claude-sonnet-4-6
+    --model claude-sonnet-4-20250514
 ```
 
 ### Unified CLI (all strategies)
