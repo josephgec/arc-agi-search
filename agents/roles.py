@@ -450,7 +450,6 @@ class Coder:
         return self._client.generate(
             _CODER_SYSTEM, messages,
             temperature=temperature,
-            model_override="qwen2.5-coder:7b",
         )
 
 
@@ -789,7 +788,6 @@ class PSOCoder:
         response = self._client.generate(
             sys, messages,
             temperature=temperature,
-            model_override="qwen2.5-coder:7b",
         )
 
         # Extract all python code blocks
