@@ -46,45 +46,20 @@ Rules:
 - Do NOT repeat the same idea with minor wording changes.
 
 Important categories to consider (pay attention to [Structural] hints in the examples):
-- MOVEMENT / ATTRACTION: Do non-zero cells change position between input and output?
-  If so, consider: do they compress toward a fixed "anchor" cell?  Do they encode
-  a direction (displacement from anchor → which adjacent cell to occupy)?
-- SATELLITE patterns: Some colors may act as "anchors" (stay fixed) while others
-  are "satellites" (move, collapse, or reflect relative to the anchor).
-- DIRECTION ENCODING: If scattered cells surround an anchor, their direction
-  (up/down/left/right from anchor) may determine where they land in the output.
-- COLOR PERMUTATION / SWAP: Check if output colors are always a permutation of
-  input colors. If the [Cross-pair analysis] shows consistent swap pairs
-  (e.g. 1↔5, 2↔6), the rule may be a FIXED GLOBAL SWAP TABLE applied to every
-  cell. Implement with a dict mapping each color to its partner — never swap
-  in-place, always read from the original and write to a copy.
-- OUTPUT SYMMETRY: If [Cross-pair analysis] reports all outputs have 4-way,
-  horizontal, or vertical symmetry, the rule likely CONSTRUCTS a symmetric
-  output (e.g. tile the input then mirror, or concatenate original + flipped
-  halves). The output shape will typically be 2× the input in one or both dims.
-- BLOCK SELECTION: If the input is evenly divided into stacked equal-height
-  blocks and [Cross-pair analysis] reports the output IS one of those blocks,
-  the rule SELECTS a block based on some discriminating property (e.g. highest
-  non-zero cell count, most unique colors, specific color present, etc.).
-- SATELLITE COLLAPSE TO ADJACENCY: If scattered secondary-color cells exist
-  alongside a fixed anchor object (multi-cell block), the rule may collapse
-  ALL satellites to be immediately orthogonally adjacent to the anchor — one
-  satellite per free adjacent cell, packed as close as possible. The anchor
-  stays fixed; the output has the anchor plus a ring/cluster of satellite cells
-  touching it, with zeros everywhere else.
-- HOLLOW BORDER EXTRACTION + INTERIOR FILL: If the input contains a hollow
-  rectangular frame (single color forming the border of a rectangle, interior
-  is empty/zero) AND a separate small pattern elsewhere, the rule may be:
-  (1) the output shape = the bounding box of the frame, (2) the frame is
-  redrawn as the border of the output, (3) the small secondary pattern is
-  tiled or stamped to fill the interior. Check [Cross-pair analysis] for
-  consistent output-shape changes that match border dimensions.
-- GRAVITY / PROJECTION LINES: Scattered secondary-color cells may "fall" or
-  "project" in a fixed cardinal direction (e.g. downward) and stop when they
-  hit the primary shape or grid edge, forming vertical/horizontal lines that
-  pass through or align with the shape. Each column (or row) of the shape acts
-  as an attractor: all secondary cells in that column collapse toward the shape,
-  filling in as a continuous line from their starting position to the shape edge.
+- MOVEMENT / ATTRACTION: Cells change position — compress toward an anchor,
+  encode direction, or reflect relative to a fixed object.
+- COLOR PERMUTATION / SWAP: Output colors are a permutation of input colors.
+  Look for consistent swap pairs (e.g. 1↔5) across all training pairs.
+- OUTPUT SYMMETRY: Output has mirror/rotational symmetry — tile + flip the
+  input, or concatenate original + flipped halves. Output often 2× input size.
+- BLOCK SELECTION: Input divided into equal blocks; output IS one block chosen
+  by a discriminating property (count, color, uniqueness).
+- OBJECT OPERATIONS: Find objects, sort/filter by size/color, then move, copy,
+  recolor, or remove them. Anchor objects stay fixed; satellites transform.
+- PATTERN FILL: Extract a border/frame, then tile or stamp a secondary pattern
+  inside. Or flood-fill enclosed regions with a specific color.
+- GRAVITY / PROJECTION: Cells fall in a cardinal direction until hitting an
+  obstacle or grid edge, forming lines.
 """
 
 _CODER_SYSTEM = (
@@ -682,8 +657,9 @@ class PSOCoder:
         failed_examples:    list[tuple[str, float, str]] | None = None,
         pair_fitness_scores: list[float] | None = None,
         hypothesis:         str | None = None,
+        k:                  int | None = None,
     ) -> list[str]:
-        """Return up to self.k candidate code strings.
+        """Return up to *k* candidate code strings.
 
         The caller evaluates them in the sandbox and selects the highest-fitness one.
 
@@ -696,8 +672,9 @@ class PSOCoder:
                                  Highlights which specific pairs are hardest to fix.
             hypothesis:          Optional fresh hypothesis from the Hypothesizer to
                                  guide mutations toward a new strategy.
+            k:                   Override for self.k (adaptive K from orchestrator).
         """
-        k   = self.k
+        k   = k if k is not None else self.k
         sys = (
             _PSO_CODER_SYSTEM.format(k=k)
             + f"\n\nYour particle role: {role_name} — {role_description}"

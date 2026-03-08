@@ -194,18 +194,19 @@ def calculate_continuous_fitness(
 
     Used by the PSO swarm to obtain a gradient signal beyond binary pass/fail.
 
-    When progress is None (default), uses fixed 3-component weights:
-      - Dimension score  (20%): Does the output have the right shape?
-      - Color palette    (30%): Jaccard index of unique colour sets.
-      - Pixel accuracy   (50%): Fraction of correct pixels (or IoU overlap
-                                region score when dimensions differ).
+    When progress is None (default), uses fixed 4-component weights:
+      - Dimension score    (15%): Does the output have the right shape?
+      - Color palette      (20%): Jaccard index of unique colour sets.
+      - Pixel accuracy     (30%): Fraction of correct pixels.
+      - Per-color pos. IoU (35%): Mean IoU of each color's position mask.
 
-    When progress ∈ [0, 1], uses 4-component curriculum weights that
+    When progress ∈ [0, 1], uses 5-component curriculum weights that
     transition from shape/palette matching early to pixel exactness late:
-      - Dimension score  (30%→10%)
-      - Color palette    (30%→15%)
-      - Object count     (20%→10%)
-      - Pixel accuracy   (20%→65%)
+      - Dimension score    (20%→10%)
+      - Color palette      (20%→10%)
+      - Object count       (15%→10%)
+      - Pixel accuracy     (20%→50%)
+      - Per-color pos. IoU (25%→20%)
 
     Args:
         pred_grid:   The predicted output grid (may be None on hard failure).
@@ -255,8 +256,23 @@ def calculate_continuous_fitness(
         matches        = int(np.sum(overlap_pred == overlap_target))
         pixel_score    = matches / (tr * tc)   # denominator = full target area
 
+    # -- Per-color positional IoU (same-shape only) ----------------------
+    if pr == tr and pc == tc:
+        target_uniq = set(int(c) for c in np.unique(target_grid))
+        color_ious: list[float] = []
+        for color in target_uniq:
+            pred_mask   = pred_grid == color
+            target_mask = target_grid == color
+            inter = int(np.sum(pred_mask & target_mask))
+            union = int(np.sum(pred_mask | target_mask))
+            color_ious.append(inter / union if union > 0 else 1.0)
+        color_iou_score = sum(color_ious) / len(color_ious) if color_ious else 0.0
+    else:
+        color_iou_score = 0.0
+
     if progress is None:
-        return 0.20 * dim_score + 0.30 * color_score + 0.50 * pixel_score
+        return (0.15 * dim_score + 0.20 * color_score
+                + 0.30 * pixel_score + 0.35 * color_iou_score)
 
     # -- Object count score (curriculum mode only) -----------------------
     pred_count   = _count_objects_total(pred_grid)
@@ -267,8 +283,10 @@ def calculate_continuous_fitness(
         object_score = min(pred_count, target_count) / max(pred_count, target_count)
 
     p = max(0.0, min(1.0, progress))
-    w_dim   = 0.30 - 0.20 * p   # 30%→10%
-    w_color = 0.30 - 0.15 * p   # 30%→15%
-    w_obj   = 0.20 - 0.10 * p   # 20%→10%
-    w_pixel = 0.20 + 0.45 * p   # 20%→65%
-    return w_dim * dim_score + w_color * color_score + w_obj * object_score + w_pixel * pixel_score
+    w_dim      = 0.20 - 0.10 * p   # 20%→10%
+    w_color    = 0.20 - 0.10 * p   # 20%→10%
+    w_obj      = 0.15 - 0.05 * p   # 15%→10%
+    w_pixel    = 0.20 + 0.30 * p   # 20%→50%
+    w_ciou     = 0.25 - 0.05 * p   # 25%→20%
+    return (w_dim * dim_score + w_color * color_score + w_obj * object_score
+            + w_pixel * pixel_score + w_ciou * color_iou_score)

@@ -739,8 +739,22 @@ class TestFormatEvalDiff:
         eval_res = {"pairs": [
             {"error": None, "predicted": pred, "expected": exp, "correct": False}
         ]}
-        result = _format_eval_diff(eval_res, max_mismatches=3)
+        # With visual=False, falls back to cell-level mismatches + truncation
+        result = _format_eval_diff(eval_res, max_mismatches=3, visual=False)
         assert "more wrong" in result.lower() or "…" in result
+
+    def test_visual_diff_shows_grids(self):
+        pred = np.zeros((3, 3), dtype=np.int32)
+        exp  = np.ones((3, 3), dtype=np.int32)
+        eval_res = {"pairs": [
+            {"error": None, "predicted": pred, "expected": exp, "correct": False}
+        ]}
+        result = _format_eval_diff(eval_res, visual=True)
+        assert "Your output" in result
+        assert "Expected" in result
+        # Visual grid symbols should appear
+        assert "." in result  # 0 → "."
+        assert "B" in result  # 1 → "B"
 
     def test_empty_pairs_returns_no_diff_message(self):
         result = _format_eval_diff({"pairs": []})

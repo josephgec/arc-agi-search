@@ -221,6 +221,9 @@ class Particle:
     # didn't beat pbest.  Passed to generate_mutations() so the LLM learns
     # what not to regenerate.  Capped at _FAILED_HISTORY_MAX.
     failed_history: list            = field(default_factory=list)
+    # Per-particle stagnation: incremented each iteration where pbest doesn't
+    # improve.  Used by solve() to reinitialise stagnant particles.
+    stagnation_iters: int           = 0
 
     def update_pbest(self, code: str, pos: np.ndarray, fitness: float) -> None:
         self.pbest_code    = code
@@ -544,30 +547,17 @@ class PSOOrchestrator:
         Returns a per-particle log dict for ``iter_log["particles"]``.
         """
         _p_t0 = time.time()
-        dim = len(p.pos)
 
         # ----------------------------------------------------------------
-        # Step 1 — PSO velocity update (continuous embedding space)
+        # Adaptive K: use more candidates when fitness is low (explore),
+        # fewer when fitness is high (exploit, save LLM budget).
         # ----------------------------------------------------------------
-        # Use default_rng() per call to avoid numpy global RNG races.
-        rng = np.random.default_rng()
-        r1 = rng.random(dim).astype(np.float32)
-        r2 = rng.random(dim).astype(np.float32)
-
-        if len(p.velocity) != dim:
-            p.velocity = np.zeros(dim, dtype=np.float32)
-        gbest_pos_d = gbest_snap_pos if len(gbest_snap_pos) == dim else np.zeros(dim, dtype=np.float32)
-
-        p.velocity = (
-            w_eff * p.velocity
-            + self.c1 * r1 * (p.pbest_pos - p.pos)
-            + self.c2 * r2 * (gbest_pos_d - p.pos)
-        )
-
-        target_pos = p.pos + p.velocity
-        t_norm = np.linalg.norm(target_pos)
-        if t_norm > 0:
-            target_pos = target_pos / t_norm
+        if p.pbest_fitness >= 0.7:
+            k_eff = max(2, self.k_candidates // 2)
+        elif p.pbest_fitness >= 0.4:
+            k_eff = self.k_candidates
+        else:
+            k_eff = self.k_candidates  # full budget for low fitness
 
         # ----------------------------------------------------------------
         # Step 2 — LLM generates K candidate mutations
@@ -606,6 +596,7 @@ class PSOOrchestrator:
                 eval_diff=diff_str,
                 failed_examples=p.failed_history or None,
                 pair_fitness_scores=_pair_scores,
+                k=k_eff,
             )
             logger.info(
                 "[PSO] task=%s iter=%d particle=%d mutation done candidates=%d (%.1fs)",
@@ -621,19 +612,35 @@ class PSOOrchestrator:
             candidates = [p.pbest_code]
 
         # ----------------------------------------------------------------
-        # Step 3 — Fitness-first candidate selection
-        # Always pick the highest-fitness candidate.  Cosine-distance
-        # selection is removed: embedding-space proximity has no
-        # semantic correspondence to program correctness, so it provides
-        # no useful signal beyond "pick a variation of pbest/gbest."
+        # Step 3 — Fitness-first candidate selection with pre-filter
+        # Single-pair pre-filter: test each candidate on just the first
+        # training pair.  If it crashes or produces zero fitness, skip the
+        # expensive full multi-pair evaluation.
         # ----------------------------------------------------------------
         best_candidate = p.pbest_code
-        best_emb       = p.pbest_pos.copy()
+        _n_train = len(task.get("train", []))
+        _use_prefilter = _n_train >= 2  # only useful with 2+ training pairs
 
         cand_results: list[tuple[str, float, dict]] = []
         for cand in candidates:
             if not cand or not cand.strip():
                 continue
+
+            # Pre-filter: test on first pair only
+            if _use_prefilter:
+                _single_task = {
+                    "train": task["train"][:1],
+                    "test":  task.get("test", []),
+                }
+                pre_fit, pre_res = self._eval_fitness(
+                    cand, _single_task, progress=progress
+                )
+                if pre_fit == 0.0:
+                    # Candidate crashes or produces zero fitness on pair 1;
+                    # skip full evaluation to save time.
+                    cand_results.append((cand, 0.0, pre_res))
+                    continue
+
             fit, eval_res = self._eval_fitness(cand, task, progress=progress)
             cand_results.append((cand, fit, eval_res))
 
@@ -641,7 +648,6 @@ class PSOOrchestrator:
             # Always pick highest-fitness candidate (may or may not beat current pos)
             winner_code, winner_fit, winner_eval = max(cand_results, key=lambda x: x[1])
             best_candidate = winner_code
-            best_emb = self._pos_from_eval(winner_code, task, winner_eval)
 
         # ----------------------------------------------------------------
         # Step 3b — Record failed candidates in particle history
@@ -657,11 +663,7 @@ class PSOOrchestrator:
         # ----------------------------------------------------------------
         # Step 4 — Update particle state
         # ----------------------------------------------------------------
-        prev_pos   = p.pos.copy()
-        p.code     = best_candidate
-        p.pos      = best_emb
-        if len(p.pos) == len(prev_pos):
-            p.velocity = p.pos - prev_pos
+        p.code = best_candidate
 
         # ----------------------------------------------------------------
         # Step 5 — Evaluate in sandbox
@@ -674,14 +676,17 @@ class PSOOrchestrator:
         )
 
         # ----------------------------------------------------------------
-        # Step 6 — Update personal best
+        # Step 6 — Update personal best + per-particle stagnation
         # ----------------------------------------------------------------
         if p.fitness > p.pbest_fitness:
             p.update_pbest(p.code, p.pos, p.fitness)
+            p.stagnation_iters = 0
             logger.info(
                 "[PSO] task=%s iter=%d particle=%d new pbest=%.4f",
                 _task_id, iteration + 1, p.particle_id, p.pbest_fitness,
             )
+        else:
+            p.stagnation_iters += 1
 
         return {
             "particle_id":   p.particle_id,
@@ -765,7 +770,6 @@ class PSOOrchestrator:
             # for this particle; otherwise ask the LLM as normal.
             if seed_codes and p.particle_id < len(seed_codes) and seed_codes[p.particle_id]:
                 p.code    = seed_codes[p.particle_id]
-                p.pos     = self._embed(p.code)
                 generated = True
                 logger.info(
                     "[PSO] task=%s init particle=%d using seed code (len=%d)",
@@ -776,19 +780,11 @@ class PSOOrchestrator:
                 p.code, generated = self._init_particle_code(
                     p, task_description, training_examples, hypothesis=seed_hyp
                 )
-                if generated:
-                    p.pos = self._embed(p.code)
-                else:
-                    # LLM call failed (likely timeout): use a random unit vector to
-                    # preserve swarm diversity and avoid a cascaded embedding timeout.
-                    p.pos = _random_unit_vec()
+                if not generated:
                     time.sleep(10)  # backoff so Ollama can drain the timed-out request
-            p.velocity = np.zeros_like(p.pos)
+            p.pos      = np.zeros(1, dtype=np.float32)
+            p.velocity = np.zeros(1, dtype=np.float32)
             p.fitness, p.last_eval = self._eval_fitness(p.code, task, progress=0.0)
-            if self.embed_mode == "behavioral":
-                beh_pos = self._embed_behavior(p.code, task, eval_result=p.last_eval)
-                if beh_pos is not None:
-                    p.pos = beh_pos
             p.update_pbest(p.code, p.pos, p.fitness)
             logger.info(
                 "[PSO] task=%s init particle=%d fitness=%.4f generated=%s (%.1fs)",
@@ -800,7 +796,6 @@ class PSOOrchestrator:
         # Global best
         gbest_particle = max(swarm, key=lambda p: p.pbest_fitness)
         gbest_code     = gbest_particle.pbest_code
-        gbest_pos      = gbest_particle.pbest_pos.copy()
         gbest_fitness  = gbest_particle.pbest_fitness
 
         log.append({
@@ -858,7 +853,7 @@ class PSOOrchestrator:
             # futures complete.
             # ----------------------------------------------------------------
             gbest_snap_code    = gbest_code
-            gbest_snap_pos     = gbest_pos.copy()
+            gbest_snap_pos     = np.zeros(1, dtype=np.float32)
             gbest_snap_fitness = gbest_fitness
 
             with ThreadPoolExecutor(max_workers=self.n_particles) as executor:
@@ -908,7 +903,6 @@ class PSOOrchestrator:
             for p in swarm:
                 if p.fitness > gbest_fitness:
                     gbest_code    = p.code
-                    gbest_pos     = p.pos.copy()
                     gbest_fitness = p.fitness
                     logger.info(
                         "[PSO] task=%s iter=%d particle=%d NEW GBEST=%.4f",
@@ -972,14 +966,13 @@ class PSOOrchestrator:
                             worst.code      = cross_code
                             worst.fitness   = cross_fit
                             worst.last_eval = cross_eval
-                            worst.pos       = self._pos_from_eval(cross_code, task, cross_eval)
-                            worst.velocity  = np.zeros_like(worst.pos)
+                            worst.pos       = np.zeros(1, dtype=np.float32)
+                            worst.velocity  = np.zeros(1, dtype=np.float32)
                             worst.pbest_fitness = -1.0
                             worst.update_pbest(worst.code, worst.pos, worst.fitness)
                             if worst.fitness > gbest_fitness:
-                                gbest_code, gbest_pos, gbest_fitness = (
-                                    worst.code, worst.pos.copy(), worst.fitness
-                                )
+                                gbest_code    = worst.code
+                                gbest_fitness = worst.fitness
                             stagnation_count = 0
 
                 # 2. If crossover did not resolve stagnation, fall through to existing reinit
@@ -1005,23 +998,60 @@ class PSOOrchestrator:
                     worst.code, generated = self._init_particle_code(
                         worst, task_description, training_examples, hypothesis=diverge_hyp
                     )
-                    if generated:
-                        worst.pos = self._embed(worst.code)
-                    else:
-                        worst.pos = _random_unit_vec()
-                    worst.velocity     = np.zeros_like(worst.pos)
+                    worst.pos      = np.zeros(1, dtype=np.float32)
+                    worst.velocity = np.zeros(1, dtype=np.float32)
                     worst.fitness, worst.last_eval = self._eval_fitness(
                         worst.code, task, progress=progress
                     )
-                    if self.embed_mode == "behavioral":
-                        beh_pos = self._embed_behavior(
-                            worst.code, task, eval_result=worst.last_eval
-                        )
-                        if beh_pos is not None:
-                            worst.pos = beh_pos
                     worst.pbest_fitness = -1.0   # reset personal best to explore fresh
                     worst.update_pbest(worst.code, worst.pos, worst.fitness)
                     stagnation_count = 0
+
+            # ----------------------------------------------------------------
+            # Per-particle stagnation: reinit particles stuck for 3+ iters
+            # (skip the current gbest particle — it holds the best solution)
+            # ----------------------------------------------------------------
+            _PARTICLE_STAGNATION_LIMIT = 3
+            for p in swarm:
+                if (p.stagnation_iters >= _PARTICLE_STAGNATION_LIMIT
+                        and p.pbest_fitness < gbest_fitness
+                        and len(swarm) > 1):
+                    if self.debug:
+                        print(
+                            f"  [PSO] Particle {p.particle_id} stagnant "
+                            f"({p.stagnation_iters} iters) — reinitialising"
+                        )
+                    reinit_hyp: str | None = None
+                    try:
+                        reinit_raw = self._hypothesizer.generate(
+                            task_description + "\n\n" + training_examples,
+                            feedback=(
+                                f"Previous approach (fitness={p.pbest_fitness:.3f}) "
+                                f"failed. Try a COMPLETELY DIFFERENT strategy."
+                            ),
+                            n=1,
+                        )
+                        reinit_hyps = _parse_hypotheses(reinit_raw, max_n=1)
+                        if reinit_hyps:
+                            reinit_hyp = reinit_hyps[0]
+                    except Exception:
+                        pass
+                    p.code, _ = self._init_particle_code(
+                        p, task_description, training_examples,
+                        hypothesis=reinit_hyp,
+                    )
+                    p.pos      = np.zeros(1, dtype=np.float32)
+                    p.velocity = np.zeros(1, dtype=np.float32)
+                    p.fitness, p.last_eval = self._eval_fitness(
+                        p.code, task, progress=progress
+                    )
+                    p.pbest_fitness = -1.0
+                    p.update_pbest(p.code, p.pos, p.fitness)
+                    p.stagnation_iters = 0
+                    p.failed_history = []
+                    if p.fitness > gbest_fitness:
+                        gbest_code    = p.code
+                        gbest_fitness = p.fitness
 
             # ----------------------------------------------------------------
             # Staleness early-exit: gbest must improve by >0.01 each iteration
@@ -1048,15 +1078,54 @@ class PSOOrchestrator:
             print(f"\n[PSO] Budget exhausted.  Best fitness: {gbest_fitness:.4f}")
 
         # ----------------------------------------------------------------
-        # Phase 3 — Targeted refinement when fitness is near-perfect (≥0.85)
+        # Phase 3 — Targeted refinement when fitness is promising (≥0.60)
         # ----------------------------------------------------------------
-        if 0.85 <= gbest_fitness < 1.0:
+        if 0.60 <= gbest_fitness < 1.0:
             gbest_code, gbest_fitness = self._refinement_phase(
                 gbest_code, gbest_fitness, task,
-                task_description, training_examples, log
+                task_description, training_examples, log,
+                max_attempts=8,
             )
 
         _solved = gbest_fitness >= 1.0
+
+        # ----------------------------------------------------------------
+        # Phase 4 — Particle ensemble: try all unique codes on test input
+        # If gbest fails on test, another particle's code might succeed.
+        # ----------------------------------------------------------------
+        if not _solved and len(swarm) > 1:
+            # Collect unique codes sorted by fitness (best first)
+            seen: set[str] = {gbest_code.strip()}
+            alt_codes: list[tuple[str, float]] = []
+            for p in sorted(swarm, key=lambda pp: pp.pbest_fitness, reverse=True):
+                code_key = p.pbest_code.strip()
+                if code_key and code_key not in seen:
+                    seen.add(code_key)
+                    alt_codes.append((p.pbest_code, p.pbest_fitness))
+
+            test_pair = (task.get("test") or [{}])[0]
+            test_input = test_pair.get("input")
+            test_output = test_pair.get("output")
+
+            if test_input is not None and test_output is not None:
+                # Check if gbest passes test
+                out, _ = sandbox.execute(gbest_code, test_input)
+                gbest_passes_test = out is not None and grids_equal(out, test_output)
+
+                if not gbest_passes_test:
+                    for alt_code, alt_fit in alt_codes:
+                        alt_out, _ = sandbox.execute(alt_code, test_input)
+                        if alt_out is not None and grids_equal(alt_out, test_output):
+                            if self.debug:
+                                print(
+                                    f"  [PSO] Ensemble: alt code "
+                                    f"(fitness={alt_fit:.4f}) passes test!"
+                                )
+                            gbest_code = alt_code
+                            gbest_fitness = alt_fit
+                            _solved = True
+                            break
+
         logger.info(
             "[PSO] [summary] task=%s solved=%s fitness=%.4f time=%.0fs",
             _task_id, _solved, gbest_fitness, time.time() - _task_start,

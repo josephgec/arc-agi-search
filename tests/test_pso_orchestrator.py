@@ -949,6 +949,22 @@ class TestParticleFailedHistory:
 
 
 # ---------------------------------------------------------------------------
+# Particle stagnation_iters
+# ---------------------------------------------------------------------------
+
+class TestParticleStagnationIters:
+    def test_default_zero(self):
+        p = Particle(particle_id=0, role_name="r", role_desc="d")
+        assert p.stagnation_iters == 0
+
+    def test_increments_independently(self):
+        p1 = Particle(particle_id=0, role_name="r", role_desc="d")
+        p2 = Particle(particle_id=1, role_name="r", role_desc="d")
+        p1.stagnation_iters = 3
+        assert p2.stagnation_iters == 0
+
+
+# ---------------------------------------------------------------------------
 # seed_particles
 # ---------------------------------------------------------------------------
 
@@ -1167,3 +1183,140 @@ class TestStalenessDetection:
         iter_logs = [e for e in result["log"] if "particles" in e]
         # The improvement at iter 3 reset the counter → must run more than 3 iters total
         assert len(iter_logs) > 3
+
+
+# ---------------------------------------------------------------------------
+# Adaptive K candidates
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveK:
+    """PSOCoder.generate_mutations respects the k= override."""
+
+    def test_k_override_limits_output(self):
+        from agents.roles import PSOCoder
+        coder = PSOCoder(MagicMock(), k=10)
+        # Mock generate to return many code blocks
+        blocks = "\n".join(
+            f"```python\ndef transform_{i}(g):\n    return g\n```"
+            for i in range(10)
+        )
+        coder._client.generate = MagicMock(return_value=blocks)
+
+        result = coder.generate_mutations(
+            task_description="test",
+            training_context="pair",
+            current_code="def transform(g): return g",
+            current_fitness=0.5,
+            pbest_code="def transform(g): return g",
+            pbest_fitness=0.5,
+            gbest_code="def transform(g): return g",
+            gbest_fitness=0.5,
+            role_name="test",
+            role_description="test role",
+            k=3,
+        )
+        assert len(result) <= 3
+
+    def test_k_none_uses_default(self):
+        from agents.roles import PSOCoder
+        coder = PSOCoder(MagicMock(), k=5)
+        blocks = "\n".join(
+            f"```python\ndef transform_{i}(g):\n    return g\n```"
+            for i in range(10)
+        )
+        coder._client.generate = MagicMock(return_value=blocks)
+
+        result = coder.generate_mutations(
+            task_description="test",
+            training_context="pair",
+            current_code="def transform(g): return g",
+            current_fitness=0.5,
+            pbest_code="def transform(g): return g",
+            pbest_fitness=0.5,
+            gbest_code="def transform(g): return g",
+            gbest_fitness=0.5,
+            role_name="test",
+            role_description="test role",
+        )
+        assert len(result) <= 5
+
+
+# ---------------------------------------------------------------------------
+# Single-pair pre-filter
+# ---------------------------------------------------------------------------
+
+MULTI_PAIR_TASK = {
+    "train": [
+        {"input":  np.array([[1, 2], [3, 4]], dtype=np.int32),
+         "output": np.array([[1, 2], [3, 4]], dtype=np.int32)},
+        {"input":  np.array([[5, 6], [7, 8]], dtype=np.int32),
+         "output": np.array([[5, 6], [7, 8]], dtype=np.int32)},
+    ],
+    "test": [
+        {"input":  np.array([[9, 0], [1, 2]], dtype=np.int32),
+         "output": np.array([[9, 0], [1, 2]], dtype=np.int32)},
+    ],
+}
+
+
+class TestSinglePairPrefilter:
+    """Candidates that crash on pair 1 skip full multi-pair evaluation."""
+
+    def test_crashing_candidate_skipped_via_prefilter(self):
+        orch = make_orchestrator(n_particles=1, max_iterations=1, k_candidates=2)
+        eval_calls: list[dict] = []
+        orig_eval = orch._eval_fitness
+
+        def tracking_eval(code, task, progress=None):
+            eval_calls.append({"code_len": len(code), "n_train": len(task["train"])})
+            return orig_eval(code, task, progress)
+
+        orch._eval_fitness = tracking_eval
+
+        # Generate: call 1 = hypotheses, call 2 = init (wrong code so we reach iteration),
+        # call 3 = mutation candidates (crash + identity)
+        call_count = {"n": 0}
+        def gen(system, messages, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return "1. Copy the grid unchanged."
+            if call_count["n"] == 2:
+                # Init: wrong code so fitness < 1.0 → reaches iteration loop
+                return "```python\ndef transform(g):\n    return g * 0\n```"
+            # Mutation: first crashes, second is identity
+            return (
+                "```python\ndef transform_1(g):\n    raise RuntimeError('boom')\n```\n"
+                "```python\ndef transform_2(g):\n    return g.copy()\n```"
+            )
+
+        orch._llm.generate = MagicMock(side_effect=gen)
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        result = orch.solve(MULTI_PAIR_TASK)
+
+        # The crashing candidate should have been pre-filtered (1 pair eval),
+        # not fully evaluated (2 pairs). Check that at least some calls used
+        # n_train=1 (pre-filter).
+        single_pair_calls = [c for c in eval_calls if c["n_train"] == 1]
+        assert len(single_pair_calls) >= 1
+
+    def test_prefilter_disabled_for_single_pair_task(self):
+        """Pre-filter only activates with 2+ training pairs."""
+        orch = make_orchestrator(n_particles=1, max_iterations=1, k_candidates=2)
+        eval_calls: list[int] = []
+        orig_eval = orch._eval_fitness
+
+        def tracking_eval(code, task, progress=None):
+            eval_calls.append(len(task["train"]))
+            return orig_eval(code, task, progress)
+
+        orch._eval_fitness = tracking_eval
+        orch._llm.generate = MagicMock(return_value=(
+            "```python\ndef transform(g):\n    return g.copy()\n```"
+        ))
+        orch._llm.embed_code = MagicMock(return_value=unit_vec(768))
+        orch.solve(SIMPLE_TASK)  # SIMPLE_TASK has 1 training pair
+
+        # No calls with n_train=1 that would indicate pre-filtering
+        # (the single-pair task itself has n_train=1, so pre-filter is disabled)
+        # All eval calls should use the full task
+        assert all(n == 1 for n in eval_calls)

@@ -780,8 +780,17 @@ def _format_task_description(task: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_eval_diff(eval_result: dict, max_pairs: int = 2, max_mismatches: int = 8) -> str:
-    """Format a concise diff of sandbox evaluation failures for LLM feedback."""
+def _format_eval_diff(
+    eval_result: dict,
+    max_pairs: int = 2,
+    max_mismatches: int = 8,
+    visual: bool = True,
+) -> str:
+    """Format a concise diff of sandbox evaluation failures for LLM feedback.
+
+    When *visual* is True and shapes match, includes a visual grid comparison
+    showing predicted vs expected grids so the LLM can see spatial error patterns.
+    """
     lines = []
     for i, pair in enumerate(eval_result.get("pairs", [])[:max_pairs]):
         if pair.get("error"):
@@ -797,17 +806,35 @@ def _format_eval_diff(eval_result: dict, max_pairs: int = 2, max_mismatches: int
                 f"Pair {i + 1}: wrong shape — got {pred.shape[0]}×{pred.shape[1]}, "
                 f"expected {exp.shape[0]}×{exp.shape[1]}"
             )
+            # Show visual grids even for shape mismatch (helps LLM understand)
+            if visual and pred.size <= 100 and exp.size <= 100:
+                lines.append(f"  Your output ({pred.shape[0]}×{pred.shape[1]}):")
+                for row_line in format_grid_visual(pred).split("\n")[:-1]:  # skip legend
+                    lines.append(f"    {row_line}")
+                lines.append(f"  Expected ({exp.shape[0]}×{exp.shape[1]}):")
+                for row_line in format_grid_visual(exp).split("\n")[:-1]:
+                    lines.append(f"    {row_line}")
         else:
             wrong = int(np.sum(pred != exp))
             total = int(exp.size)
             lines.append(f"Pair {i + 1}: {wrong}/{total} cells wrong")
-            mismatches = np.argwhere(pred != exp)[:max_mismatches]
-            for r, c in mismatches:
-                got_name = _COLOR_NAMES.get(int(pred[r, c]), str(pred[r, c]))
-                exp_name = _COLOR_NAMES.get(int(exp[r, c]),  str(exp[r, c]))
-                lines.append(f"  [{r},{c}]: got {pred[r,c]}({got_name}), expected {exp[r,c]}({exp_name})")
-            if wrong > max_mismatches:
-                lines.append(f"  … and {wrong - max_mismatches} more wrong cells")
+            # Visual comparison for same-shape grids
+            if visual and pred.size <= 100:
+                lines.append(f"  Your output:")
+                for row_line in format_grid_visual(pred).split("\n")[:-1]:
+                    lines.append(f"    {row_line}")
+                lines.append(f"  Expected:")
+                for row_line in format_grid_visual(exp).split("\n")[:-1]:
+                    lines.append(f"    {row_line}")
+            else:
+                # Fallback to cell-level mismatches for large grids
+                mismatches = np.argwhere(pred != exp)[:max_mismatches]
+                for r, c in mismatches:
+                    got_name = _COLOR_NAMES.get(int(pred[r, c]), str(pred[r, c]))
+                    exp_name = _COLOR_NAMES.get(int(exp[r, c]),  str(exp[r, c]))
+                    lines.append(f"  [{r},{c}]: got {pred[r,c]}({got_name}), expected {exp[r,c]}({exp_name})")
+                if wrong > max_mismatches:
+                    lines.append(f"  … and {wrong - max_mismatches} more wrong cells")
     return "\n".join(lines) if lines else "No diff available"
 
 
@@ -910,6 +937,17 @@ def _extract_code(text: str) -> str | None:
             return _truncate_to_valid_function(candidate)
         if candidate:
             return candidate
+
+    # Truncated fence: deepseek-r1 may exhaust num_predict mid-code-block,
+    # leaving an opened ```python fence with no closing ```.  Extract whatever
+    # code is there — a partial function is better than nothing.
+    trunc_match = re.search(
+        r"```(?:python|py)\s*(.*)", text, re.DOTALL | re.IGNORECASE
+    )
+    if trunc_match:
+        candidate = trunc_match.group(1).strip()
+        if "def " in candidate:
+            return _truncate_to_valid_function(candidate)
 
     return None
 
@@ -1032,7 +1070,7 @@ class MultiAgent:
         coder_temperature:        float      = 0.1,
         critic_temperature:       float      = 0.2,
         hypothesizer_max_tokens:  int        = 1536,
-        coder_max_tokens:         int        = 4096,
+        coder_max_tokens:         int        = 8192,
         critic_max_tokens:        int        = 1024,
         decomposer_max_tokens:    int        = 256,
         verifier_max_tokens:      int        = 4096,

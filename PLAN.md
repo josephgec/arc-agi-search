@@ -1,40 +1,49 @@
-# Implementation Plan
+# Implementation Plan — PSO Performance Overhaul
 
-## Baseline (overnight run)
-1/40 solved (2.5%), 746s avg/task, Critic loop never ran.
+Target: 15-20% solve rate, <300s/task
 
-## Status
-Phase: 0 (critical blockers)
-Last completed: none
-Next: 0a — Eliminate Ollama model swapping
+## Baseline
+1/10 solved (10%), 569s avg/task, code extraction fails ~50% of Coder calls.
 
-## PHASE 0 — CRITICAL BLOCKERS
-- [ ] 0a: OLLAMA_KEEP_ALIVE=-1 + pre-warm models → start_ollama.sh
-- [ ] 0b: Socket timeout 300→600s + retry logic → agents/llm_client.py
-- [ ] 0c: Edge-guard prompts + safe_neighbors DSL helper → agents/roles.py, arc/sandbox.py, agents/dsl_reference.py
-- [ ] 0d: Structured stage logging → agents/multi_agent.py, agents/pso_orchestrator.py
-→ GATE: run 10 tasks, verify Critic loop runs, <4min/task, >10% solve
+## PHASE 1 — Strip Dead Embedding Weight (Speed)
+- [x] 1a: Remove embedding calls from `_particle_step` (velocity update, cosine selection)
+- [x] 1b: Remove embedding calls from stagnation/reinit in `solve()`
+- [x] 1c: Update tests (all 658 pass, 95% coverage, pso_orchestrator 86%)
+GATE: `python -m pytest -x` — PASSED
 
-## PHASE 1 — ACCURACY
-- [ ] 1a: Visual grid format in prompts → agents/roles.py
-- [ ] 1b: Negative examples in PSOCoder prompts → agents/roles.py, agents/pso_orchestrator.py
-- [ ] 1c: DSL primitives (fill_enclosed_regions, gravity) → arc/dsl.py, arc/sandbox.py
-- [ ] 1d: Stronger memorization penalty → arc/evaluate.py
-→ GATE: run 40 tasks, verify >15% solve rate
+## PHASE 2 — Adaptive K + Single-Pair Pre-filter (Speed + Accuracy)
+- [x] 2a: Adaptive K candidates — more when fitness low, fewer when near-solved
+- [x] 2b: Single-pair pre-filter — eval cheapest pair first, skip candidate if it fails
+GATE: `python -m pytest -x` — PASSED (662 tests, 95% coverage)
 
-## PHASE 2 — SPEED
-- [ ] 2a: Model routing (7b coder, 32b reasoner) → agents/llm_client.py, agents/roles.py
-- [ ] 2b: NUM_PARALLEL=6 + q8_0 KV → start_ollama.sh
-- [ ] 2c: Sandbox ProcessPoolExecutor (8 workers) → arc/sandbox.py
-- [ ] 2d: Parallel particle updates → agents/pso_orchestrator.py
-- [ ] 2e: Two-phase multi-agent → PSO → run_multi_agent.py, agents/pso_orchestrator.py
-- [ ] 2f: Early termination + staleness → agents/pso_orchestrator.py
-→ GATE: run 40 tasks, verify <120s/task, >25% solve
+## PHASE 3 — Better PSOCoder Prompts (Accuracy)
+- [x] 3a: Visual grid comparisons in eval diff (predicted vs expected grids)
+- [x] 3b: Trim Hypothesizer pattern categories (7 concise categories)
+GATE: `python -m pytest -x` — PASSED (663 tests, 95% coverage)
 
-## PHASE 3 — ADVANCED
-- [ ] 3a: Ring topology PSO
-- [ ] 3b: Structural fitness scoring
-- [ ] 3c: Per-color F1 pixel score
-- [ ] 3d: Code-specific embeddings (mxbai-embed-large)
-- [ ] 3e: Test-time data augmentation
-- [ ] 3f: Adaptive K candidates
+## PHASE 4 — Improved Fitness Function (Accuracy)
+- [x] 4a: Per-color positional IoU scoring (35% weight in fixed mode, 25%→20% curriculum)
+GATE: `python -m pytest -x` — PASSED (663 tests)
+
+## PHASE 5 — Refinement + Stagnation (Accuracy)
+- [x] 5a: Lower refinement threshold 0.85→0.60 + max_attempts 5→8
+- [x] 5b: Per-particle stagnation (reinit after 3 flat iters, fresh hypothesis)
+GATE: `python -m pytest -x` — PASSED (663 tests)
+
+## PHASE 6 — Ensemble + Few-Shot (Accuracy)
+- [x] 6a: PSO particle ensemble (try all unique particle codes on test input)
+- [ ] 6b: Cross-task few-shot pattern library (deferred)
+GATE: `python -m pytest -x` — PASSED (665 tests, 94% coverage)
+
+## Run Results
+- **Baseline**: 1/10 (10%), 569s avg, code extraction fails ~50%
+- **Post Phase 1-6**: 2/10 (20%), 770s avg, code=True 7/10 first attempts
+  - Solved tasks: d10ecb37 (236s), 8be77c9e (266s)
+  - Remaining bottleneck: code=False on 27-34K char responses (thinking exhausts token budget)
+  - coder_max_tokens increased 4096→8192 to improve extraction rate
+
+## Next Steps (if continuing)
+- Increase coder_max_tokens further or add "BE BRIEF" instruction to Coder
+- Use qwen2.5-coder:7b for Coder role (non-thinking model, faster)
+- Reduce hypothesizer_max_tokens to save budget for Coder
+- Add retry with lower temperature on code=False
