@@ -19,6 +19,7 @@ A hybrid **Particle Swarm Optimization + LLM** architecture for the [ARC-AGI cha
 9. [Pseudocode](#pseudocode)
 10. [Running the Solver](#running-the-solver)
 11. [Running Tests](#running-tests)
+12. [MCTS Solver & Benchmarks](#mcts-solver--benchmarks)
 
 ---
 
@@ -54,6 +55,7 @@ arc-agi-search/
 ├── arc/                        ← Core library (backend-agnostic)
 │   ├── grid.py                 ← Grid type, I/O, colour utilities
 │   ├── dsl.py                  ← Pure transformation primitives
+│   ├── dsl_actions.py          ← DSL action enumeration for MCTS tree expansion
 │   ├── sandbox.py              ← Hardened subprocess code execution
 │   └── evaluate.py             ← Binary eval + continuous fitness
 │
@@ -66,9 +68,16 @@ arc-agi-search/
 │   ├── orchestrator.py         ← Candidate-pooling wrapper (exposes fitness/perfect fields)
 │   ├── ensemble.py             ← Pixel-weighted majority-vote ensemble with self-correction
 │   ├── single_agent.py         ← Single-agent baseline
-│   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
+│   ├── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
+│   └── mcts_solver.py          ← ★ LLM-free MCTS over DSL pipelines
 │
-├── tests/                      ← 646 tests, 94% coverage
+├── benchmarks/                 ← Performance benchmark infrastructure
+│   ├── task_tiers.py           ← 24 curated tasks across 6 difficulty tiers
+│   ├── run_benchmark.py        ← Benchmark runner with per-task timeout
+│   ├── analyze_results.py      ← Post-hoc analysis (histograms, speed, head-to-head)
+│   └── RESULTS.md              ← Benchmark findings
+│
+├── tests/                      ← 774 tests, 94% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -123,6 +132,7 @@ The system couples PSO swarm topology with LLM code generation. N particles with
 | `ensemble` | `Ensemble` | Highest reliability via majority voting |
 | `single` | `SingleAgent` | Quick baseline check |
 | `two_phase` | `TwoPhaseOrchestrator` | Fast MultiAgent warm-up → seeded PSO; best of both |
+| `mcts` | `MCTSSolver` | LLM-free; fast DSL pipeline search (~3s/task) |
 
 ---
 
@@ -1082,7 +1092,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy two_phas
 ## Running Tests
 
 ```bash
-# Run all 646 tests
+# Run all 774 tests
 python -m pytest
 
 # With coverage report
@@ -1108,6 +1118,7 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 | `arc/evaluate.py` | 98% |
 | `arc/grid.py` | 100% |
 | `arc/dsl.py` | 99% |
+| `arc/dsl_actions.py` | 97% |
 | `arc/sandbox.py` | 64% |
 | `agents/roles.py` | 97% |
 | `agents/ensemble.py` | 99% |
@@ -1115,6 +1126,7 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 | `agents/orchestrator.py` | 85% |
 | `agents/multi_agent.py` | 87% |
 | `agents/pso_orchestrator.py` | 82% |
+| `agents/mcts_solver.py` | 99% |
 | `agents/llm_client.py` | 86% |
 | `agents/dsl_reference.py` | 100% |
 | **Total** | **94%** |
@@ -1136,3 +1148,70 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 **Why nomic-embed-text?** It is a 768-dimensional open-weight model that runs locally via Ollama, producing high-quality code embeddings without API costs or rate limits.
 
 **Why 6 fixed roles?** Diversity in the initial population is critical for PSO to avoid premature convergence. Six specialist roles (geometric, colour, pattern, object, rule, hybrid) cover the main reasoning strategies seen across ARC tasks. More roles would increase LLM cost without proportional benefit.
+
+---
+
+## MCTS Solver & Benchmarks
+
+### MCTS Solver (`agents/mcts_solver.py`)
+
+An **LLM-free** solver that builds DSL pipelines incrementally via Monte Carlo Tree Search. Each tree level adds one DSL operation (rotate, flip, scale, recolor, etc.), composing multi-step transformations.
+
+- **Selection**: UCB1 with configurable exploration constant
+- **Expansion**: Progressive widening (C=4, α=0.5) over enumerated DSL actions
+- **Simulation**: Random rollouts up to `rollout_depth` steps
+- **Backpropagation**: Max-fitness tracking (not average)
+- **Evaluation**: Sandbox execution + continuous fitness against all training pairs
+
+```bash
+# Run MCTS on a single task
+python run_multi_agent.py --task data/training/007bbfb7.json --strategy mcts --debug
+
+# With custom parameters
+python run_multi_agent.py --task data/training/007bbfb7.json --strategy mcts \
+    --mcts-max-iterations 5000 --mcts-max-time 300 --mcts-max-depth 7
+```
+
+### Benchmark Infrastructure (`benchmarks/`)
+
+24 curated tasks across 6 difficulty tiers, verified by exhaustive search over the training set:
+
+| Tier | Description | Tasks | Example |
+|------|------------|-------|---------|
+| 1 | Single geometric op (rotate, flip) | 5 | `3c9b0459` — rotate 180° |
+| 2 | Single shape-change (scale, tile, crop) | 4 | `c59eb873` — scale ×2 |
+| 3 | Single cell-level op (gravity, symmetrize, fill) | 5 | `1e0a9b12` — gravity down |
+| 4 | Two-operation compositions | 4 | `0d3d703e` — multi-recolor chain |
+| 5 | Three+ operations | 3 | `025d127b` — symmetry + fill |
+| 6 | Hard / beyond pure DSL | 3 | `045e512c` — sorting + gravity |
+
+```bash
+# Smoke test (3 tasks)
+python -m benchmarks.run_benchmark --smoke --debug
+
+# Full tier-1 benchmark
+python -m benchmarks.run_benchmark --tiers 1 --debug
+
+# All tiers, save results
+python -m benchmarks.run_benchmark --tiers 1 2 3 4 5 6 --output results.json --debug
+
+# Analyze results
+python -m benchmarks.analyze_results results.json
+
+# Compare two runs
+python -m benchmarks.analyze_results new.json --compare baseline.json
+```
+
+### Benchmark Results (default params: 2000 iters, depth 5)
+
+| Tier | Solved | Avg Fitness | Avg Time |
+|------|--------|-------------|----------|
+| 1 (geometric) | 1/5 (20%) | 0.868 | 2.6s |
+| 2 (shape-change) | 2/4 (50%) | 0.870 | 2.0s |
+| 3 (cell-level) | 0/5 (0%) | 0.888 | 3.4s |
+| 4 (two-op) | 0/4 (0%) | 0.637 | 3.3s |
+| 5 (three-op) | 0/3 (0%) | 0.835 | 2.9s |
+| 6 (hard) | 0/3 (0%) | 0.745 | 3.6s |
+| **Total** | **3/24 (12.5%)** | **0.814** | **2.9s** |
+
+See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for detailed analysis including near-misses, bottleneck analysis, and improvement ideas.
