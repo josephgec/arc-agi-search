@@ -1,6 +1,6 @@
 # ARC-AGI PSO Swarm Solver
 
-A hybrid **Particle Swarm Optimization + LLM** architecture for the [ARC-AGI challenge](https://github.com/fchollet/ARC-AGI). Standard LLM agent loops get stuck in repetitive generation cycles (local minima). This system escapes that trap by coupling a *continuous* mathematical optimizer (PSO) with a *discrete* LLM code generator via a **Generate-and-Project bridge**.
+A hybrid **Particle Swarm Optimization + LLM** architecture for the [ARC-AGI challenge](https://github.com/fchollet/ARC-AGI). Standard LLM agent loops get stuck in repetitive generation cycles (local minima). This system escapes that trap by coupling PSO swarm topology (pbest/gbest sharing, stagnation reinit, crossover) with LLM code generation via a **Mutation-and-Select bridge**.
 
 ---
 
@@ -13,7 +13,7 @@ A hybrid **Particle Swarm Optimization + LLM** architecture for the [ARC-AGI cha
    - [arc/ — Core Library](#arc--core-library)
    - [agents/ — Agent Layer](#agents--agent-layer)
 5. [The PSO Algorithm in Detail](#the-pso-algorithm-in-detail)
-6. [The Generate-and-Project Bridge](#the-generate-and-project-bridge)
+6. [The Mutation-and-Select Bridge](#the-mutation-and-select-bridge)
 7. [Continuous Fitness Function](#continuous-fitness-function)
 8. [Workflow Diagrams](#workflow-diagrams)
 9. [Pseudocode](#pseudocode)
@@ -24,20 +24,25 @@ A hybrid **Particle Swarm Optimization + LLM** architecture for the [ARC-AGI cha
 
 ## The Core Idea
 
-The **Inverse Mapping Problem**: it is easy to embed Python code into a continuous vector space, but mathematically impossible to decode an arbitrary floating-point target vector back into valid code.
+Standard single-agent LLM loops produce one solution at a time and get stuck in local minima — generating minor variations of the same wrong code. PSO escapes this by maintaining a **swarm of N particles**, each with a specialist role, exploring different regions of the solution space simultaneously.
 
-**Solution — Generate-and-Project:**
+**How the swarm works:**
 
 ```
-PSO target vector  ──────────────────────────────────────────────────────┐
-                                                                          │
-LLM generates K candidate code strings                                    │
-      │                                                                   │
-      ▼                                                                   ▼
-embed each candidate ──► pick the candidate whose embedding is closest to target
+N particles, each with a specialist role (geometric, color, pattern, ...)
+      │
+      ▼
+Each particle generates K candidate mutations
+  informed by pbest_code (personal best) and gbest_code (global best)
+      │
+      ▼
+Sandbox evaluates all K candidates → select highest-fitness winner
+      │
+      ▼
+Update pbest / gbest → share knowledge across swarm → iterate
 ```
 
-This decouples **search direction** (done mathematically by PSO) from **solution generation** (done semantically by the LLM). The swarm systematically explores the latent space of programs rather than randomly sampling.
+This decouples **search direction** (PSO swarm topology sharing pbest/gbest) from **solution generation** (LLM code mutations). The swarm systematically explores the space of programs rather than randomly sampling. Diversity comes from specialist roles, stagnation recovery via crossover and reinitialisation, and parallel exploration across particles.
 
 ---
 
@@ -63,7 +68,7 @@ arc-agi-search/
 │   ├── single_agent.py         ← Single-agent baseline
 │   └── pso_orchestrator.py     ← ★ PSO swarm solver (main contribution)
 │
-├── tests/                      ← 658 tests, 87% coverage
+├── tests/                      ← 646 tests, 94% coverage
 │
 ├── data/
 │   ├── training/               ← 400 ARC training tasks (JSON)
@@ -81,22 +86,26 @@ arc-agi-search/
 
 ## Architecture Overview
 
-The system has two layers that communicate through a single embedding bridge:
+The system couples PSO swarm topology with LLM code generation. N particles with specialist roles generate K candidate mutations each, informed by shared pbest/gbest code. Candidates are evaluated in the sandbox and the highest-fitness winner is selected (greedy).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         CONTINUOUS SPACE                            │
+│                       PSO SWARM TOPOLOGY                            │
 │                                                                     │
-│   x₁ ●──────────────────────────────────────────────────────►      │
-│        velocity v₁                                   gbest ★        │
-│   x₂ ●──────────────────────────────────────────────────────►      │
-│   x₃ ●──────────────────────────────────────────────────────►      │
-│   x₄ ●──────────────────────────────────────────────────────►      │
-│                   PSO update equations                              │
+│   Particle 1 (geometric)  ──► K candidates ──► sandbox eval         │
+│   Particle 2 (color)      ──► K candidates ──► sandbox eval         │
+│   Particle 3 (pattern)    ──► K candidates ──► sandbox eval         │
+│   Particle 4 (object)     ──► K candidates ──► sandbox eval         │
+│   Particle 5 (rule)       ──► K candidates ──► sandbox eval         │
+│   Particle 6 (hybrid)     ──► K candidates ──► sandbox eval         │
+│                                                                     │
+│   Each informed by:  pbest_code + gbest_code + eval diffs           │
+│   Selection:         highest fitness wins (greedy)                  │
+│   Sharing:           gbest snapshot broadcast each iteration        │
 └──────────────────────────┬──────────────────────────────────────────┘
-                           │  embed() / cosine distance
+                           │
 ┌──────────────────────────▼──────────────────────────────────────────┐
-│                         DISCRETE SPACE                              │
+│                         CODE SPACE                                  │
 │                                                                     │
 │   "def transform(g):        "def transform(g):                      │
 │       return rotate(g)"         return recolor(g, 1, 2)"           │
@@ -154,6 +163,9 @@ Colour:      recolor · mask · overlay
 Fill:        flood_fill · fill_enclosed_regions
 Detection:   find_objects · bounding_box · crop_to_content
 Physics:     gravity(grid, direction, bg_color=0)
+Padding:     pad · symmetrize
+Properties:  get_color · get_size · get_centroid
+Analysis:    detect_grid_layout · find_periodicity
 ```
 
 These are the only allowed operations inside generated `transform()` functions. They are injected into the sandbox execution namespace automatically.
@@ -161,6 +173,20 @@ These are the only allowed operations inside generated `transform()` functions. 
 **`fill_enclosed_regions(grid, fill_color, bg_color=None)`** — BFS from all border cells; any background cell unreachable from the border is *enclosed* and gets painted `fill_color`. Handles rings, thick borders, and multi-region interiors. `bg_color` defaults to `background_color(grid)`.
 
 **`gravity(grid, direction, bg_color=0)`** — Slides all non-background cells toward an edge (`"up"`, `"down"`, `"left"`, `"right"`). The `bg_color` parameter (default `0`) lets gravity work correctly on grids whose empty colour is not black.
+
+**`pad(grid, top, bottom, left, right, fill)`** — Add padding around the grid with the specified fill value.
+
+**`symmetrize(grid, axis)`** — Mirror the grid: axis=0 reflects left→right, axis=1 reflects top→bottom, axis=2 both. Only overwrites background (0) cells in the destination half to avoid clobbering existing content.
+
+**`get_color(obj)`** — Most common non-zero color in a subgrid; 0 if all-zero.
+
+**`get_size(obj)`** — Count of non-zero cells.
+
+**`get_centroid(obj)`** — `(row, col)` centroid of non-zero cells.
+
+**`detect_grid_layout(grid)`** — Detect sub-grid structure from divider lines (full rows/cols of a single non-zero value). Returns `(n_row_sections, n_col_sections)` or `None`.
+
+**`find_periodicity(grid)`** — Smallest `(row_period, col_period)` for exact tiling, or `None`.
 
 ---
 
@@ -189,6 +215,8 @@ Generated code is untrusted and could contain infinite loops, import statements,
 
 Using a persistent pool eliminates the 50–200 ms process-spawn overhead on every sandbox call. Workers are forked from the parent so the DSL namespace is inherited without re-importing.
 
+**`safe_neighbors(grid, r, c, size=1)`** — Neighbourhood of `(r,c)` clamped to grid boundaries. Returns a sub-array of shape up to `(2*size+1, 2*size+1)`. Use instead of `grid[r-1:r+2, c-1:c+2]` to avoid negative index wrapping bugs at row 0 or the last row/column.
+
 Security guards:
 - `input()` / `sys.stdin` usage → rejected before spawning
 - Hard timeout via `future.result(timeout=t)` → timed-out worker replaced automatically by the pool
@@ -213,22 +241,29 @@ Two evaluation modes:
 
 **Binary** (`evaluate_task`): used by the existing multi-agent and ensemble strategies.
 
-**Continuous** (`calculate_continuous_fitness`): used by PSO to get a gradient signal beyond pass/fail.
+**Continuous** (`calculate_continuous_fitness`): used by PSO to get a gradient signal beyond pass/fail. See [Continuous Fitness Function](#continuous-fitness-function) for full details.
 
 ```
-fitness = 0.20 × dim_score + 0.30 × color_score + 0.50 × pixel_score
+fitness = 0.15 × dim_score + 0.20 × color_score + 0.30 × pixel_score + 0.35 × color_iou_score
 
 dim_score   = min(H_pred,H_target)/max(...) × min(W_pred,W_target)/max(...)
 color_score = |colors_pred ∩ colors_target| / |colors_pred ∪ colors_target|
 pixel_score = correct_cells / total_target_cells
+color_iou_score = mean per-color positional IoU (same-shape only; 0.0 otherwise)
 ```
 
 | Case | Fitness |
 |---|---|
 | Prediction is `None` (crash) | `0.0` |
 | Perfect pixel-perfect match | `1.0` |
+| Right colours, right positions for most colors | `0.7–0.9` |
 | Right colours, wrong positions | `0.2–0.5` |
 | Wrong shape | `< 0.5` |
+
+**Curriculum-Weighted Mode** (when `progress` is passed): uses 5 components with weights that shift from shape/palette matching early to pixel exactness late:
+- Dimension score (20%→10%), Color palette (20%→10%), Object count (15%→10%), Pixel accuracy (20%→50%), Per-color IoU (25%→20%)
+- Object count uses 8-connectivity (`_count_objects_total`)
+- Used by PSO to gradually increase pressure for pixel-perfect solutions
 
 **AST Complexity Penalty** (`calculate_complexity_penalty`): deducted from fitness to penalise memorisation code. Two additive terms, overall cap `0.50`:
 
@@ -283,12 +318,13 @@ Six role classes, each wrapping an `LLMClient` with a purpose-built system promp
 
 ```
 Hypothesizer   generates 3 competing natural-language hypotheses about the
-               transformation rule. System prompt includes six pattern
-               categories: MOVEMENT/ATTRACTION, SATELLITE, DIRECTION
-               ENCODING, COLOR PERMUTATION/SWAP, OUTPUT SYMMETRY, and
-               BLOCK SELECTION. Categories reference [Cross-pair analysis]
-               hints injected by the orchestrator so the model can detect
-               global swap tables, mirrored outputs, and block selection.
+               transformation rule. System prompt includes seven pattern
+               categories: MOVEMENT/ATTRACTION, COLOR PERMUTATION/SWAP,
+               OUTPUT SYMMETRY, BLOCK SELECTION, OBJECT OPERATIONS,
+               PATTERN FILL, and GRAVITY/PROJECTION. Categories reference
+               [Structural] hints injected by the orchestrator so the
+               model can detect swap tables, mirrored outputs, and block
+               selection.
 
 Coder          translates one hypothesis into a Python transform() function
                using only the DSL primitives.
@@ -310,19 +346,25 @@ Critic         reads the error diff and decides:
                ⚠ IDENTITY TRANSFORM warning when the code returns the input
                unchanged, enabling detection of no-op bugs.
 
-Decomposer     fires on stagnation (≥2 consecutive non-improving cycles);
-               decomposes the task into sub-goals to break the agent out
-               of a local-minimum hypothesis
+Decomposer     fires when the hypothesis is stuck (no_improve_count ≥ 2 AND
+               n_correct == 0) AND there has been partial progress earlier
+               in the solve (best_n_correct > 0). Decomposes the task into
+               sub-goals to break out of a local-minimum hypothesis.
+               Only fires once per hypothesis (decomp_tried flag).
+               When best_n_correct == 0, the Decomposer is skipped and
+               the system escalates directly to the next hypothesis.
 
 Verifier       gates success — re-reads the code and training pairs and
                confirms all_correct before the loop exits; fail-safe
                (returns passes=True) on any malformed or missing response
 
 PSOCoder       generates K distinct Python functions that blend the logic of
-               pbest and gbest to move toward the PSO target.
+               pbest and gbest.
                failed_examples= parameter: list of (snippet, fitness, error)
                tuples shown before the reference code so the model avoids
                repeating candidates that already proved ineffective.
+               Capped at the 5 most recent failures per particle (rolling
+               window).
                Also includes DEFENSIVE CODING guards (same as Coder).
 ```
 
@@ -330,7 +372,7 @@ PSOCoder       generates K distinct Python functions that blend the logic of
 
 #### `agents/multi_agent.py` — Multi-Agent Orchestrator
 
-A **state machine** that runs up to `max_cycles` total LLM calls (CLI: `--max-cycles`, default 9). The Decomposer fires when `no_improve_count >= 2` (hard-coded constant in the solve loop). Phases 3–4 added Decomposer, Verifier, spatial diffs, and near-miss candidate collection:
+A **state machine** that runs up to `max_cycles` total LLM calls (CLI: `--max-cycles`, default 9). Phases 3–4 added Decomposer, Verifier, spatial diffs, and near-miss candidate collection:
 
 ```
 ┌────────────────┐
@@ -350,11 +392,13 @@ A **state machine** that runs up to `max_cycles` total LLM calls (CLI: `--max-cy
 │     Critic     │     (spatial diff + grid comparison + identity warning)
 │  diagnoses     │     ROUTE=coder ──────────► Coder retries with feedback
 └───────┬────────┘
-        │ stagnation (≥2 non-improving cycles)
+        │ stagnation (no_improve_count ≥ 2 AND n_correct == 0
+        │             AND best_n_correct > 0)
         ▼
 ┌────────────────┐
 │  Decomposer    │──── breaks task into sub-goals ──► Hypothesizer restart
-└────────────────┘
+└────────────────┘     (only fires once per hypothesis; skipped when
+                        best_n_correct == 0 — escalates to next hyp instead)
 ```
 
 **Cross-pair analysis** (`_cross_pair_notes`): runs once per task before the first Hypothesizer call and appends a `[Cross-pair analysis]` block to the task description. Detects four cross-example signals:
@@ -374,7 +418,7 @@ A **state machine** that runs up to `max_cycles` total LLM calls (CLI: `--max-cy
 
 #### `agents/orchestrator.py` — Pooling Orchestrator
 
-Extends `MultiAgent` with candidate collection for the Ensemble layer. Derives `max_cycles` from `n_hypotheses × (1 + max_retries × 2)`. Its `solve()` method calls the parent loop but collects every correct code string (with fitness scores) into a `candidates` list so `Ensemble` can run majority voting across them.
+Extends `MultiAgent` with candidate collection for the Ensemble layer. Derives `max_cycles` from `1 + n_hypotheses × (1 + max_retries × 2)` (the leading 1 accounts for the initial Hypothesizer call). Its `solve()` method calls the parent loop but collects every correct code string (with fitness scores) into a `candidates` list so `Ensemble` can run majority voting across them.
 
 ---
 
@@ -398,9 +442,33 @@ Key additions beyond the base PSO loop:
 
 **Parallel particle updates** — each iteration runs all N particles concurrently inside a `ThreadPoolExecutor(max_workers=N)`. Ollama HTTP calls release the GIL, so all N LLM mutation requests are in-flight simultaneously. A gbest snapshot is taken before each iteration; Step 7 (global best update) reconciles in the main thread after all futures complete. An early-exit cancels queued futures the moment any particle reaches `fitness ≥ 1.0`.
 
+**Hypothesis-guided initialization** — before generating initial code for each particle, the Hypothesizer produces N hypotheses (at least 3, or `n_particles` if larger). Each particle receives a different hypothesis matching its specialist role, guiding its initial solution toward a diverse starting point. This replaces generic role-only prompting with task-specific reasoning.
+
+**Adaptive K** — the number of mutation candidates per particle is adjusted each iteration based on personal best fitness:
+- `pbest_fitness ≥ 0.7` → `k_eff = max(2, k/2)` (exploit: fewer, focused candidates)
+- `pbest_fitness < 0.7` → `k_eff = k` (explore: full candidate budget)
+
+**Single-pair pre-filter** — when a task has 2+ training pairs, each candidate is first tested on only the first pair. Candidates that crash or score zero fitness are skipped, avoiding the cost of full multi-pair evaluation.
+
+**Per-particle stagnation** — independent of global stagnation, any particle whose personal best hasn't improved for 3 consecutive iterations is reinitialized with a fresh hypothesis from the Hypothesizer. This prevents a single particle from wasting LLM budget on an unproductive region while the rest of the swarm makes progress.
+
+**Crossover on stagnation** — when the swarm stagnates (gbest unchanged for `stagnation_limit` iterations), the solver attempts LLM-based crossover before reinitializing. It asks the LLM to study what each parent does correctly and write a single `transform` that merges the strongest logic from both — not just picking one parent. If crossover produces a better solution, stagnation resets; otherwise, the worst particle is reinitialized.
+
+**Phase 3 — Targeted Refinement** (fitness ≥ 0.60): when the best solution is promising but not perfect, the solver runs up to 8 focused fix attempts. Each attempt provides the LLM with:
+- Full diff context for all training pairs (up to 24 mismatches shown)
+- For near-perfect solutions (≥ 0.97): full predicted vs expected grid comparisons
+- Pass/fail contrast hints (which pairs pass and which fail)
+- Structural hints from training data
+
+Terminates early if no improvement is seen for 2 consecutive attempts.
+
+**Phase 4 — Particle Ensemble Fallback**: if the gbest code doesn't solve the test input, the solver tries every unique code from all particles' personal bests (sorted by fitness, best first) on the test input. The first code that produces a correct test output is returned as the solution. This recovers cases where a non-gbest particle found a solution that generalises better to the test input.
+
 **Staleness early-exit** — if `gbest_fitness` hasn't improved by more than `0.01` for 3 consecutive iterations, the loop terminates early and logs `"[pso] Stagnation detected after {n} iterations, terminating"`. This is independent of the existing particle-reinit stagnation mechanism (which uses a tighter `1e-6` threshold and triggers crossover/reinit instead of stopping).
 
 **`seed_particles(initial_codes)`** — call before `solve()` to pre-seed the first N particles with provided code strings instead of LLM-generated initialisation. Used by `TwoPhaseOrchestrator` to hand the MultiAgent's best code directly to PSO. Empty strings fall back to normal LLM init; the seed list is consumed (reset to `[]`) at the start of each `solve()` call.
+
+**Behavioral Embedding** (default `embed_mode="behavioral"`): instead of embedding the Python source code, the system runs the code against all training pairs and embeds a textual representation of the predicted outputs. This means particles are positioned in embedding space based on *what they produce*, not *how they're written* — two syntactically different programs that produce the same outputs will occupy the same point. Small grids (≤10×10) are embedded as full matrices; larger grids use a sparse active-coordinate format to avoid token blowout. Results are cached per unique behavior string. Fallback: if behavioral embedding fails (e.g. sandbox crash), falls back to embedding the code text directly.
 
 ---
 
@@ -469,12 +537,14 @@ Each of the N particles represents one candidate solution. It maintains:
 @dataclass
 class Particle:
     code:          str          # current Python transform() function
-    pos:           np.ndarray   # embedding of current code  (768-dim, unit norm)
-    velocity:      np.ndarray   # direction of travel in embedding space
+    pos:           np.ndarray   # behavioral embedding (for position tracking)
+    velocity:      np.ndarray   # currently unused (hardcoded to zeros)
     fitness:       float        # continuous fitness in [0, 1]
     pbest_code:    str          # best code this particle ever found
     pbest_pos:     np.ndarray   # embedding of pbest
     pbest_fitness: float        # fitness of pbest
+    stagnation_iters: int       # consecutive iters with no pbest improvement
+    failed_history:   list      # rolling window of failed candidates (max 5)
 ```
 
 ### Particle Roles
@@ -490,60 +560,52 @@ Six specialist roles seed diverse initial solutions:
 | `rule_abstractor` | Minimal abstract rules, clean generalisation |
 | `hybrid_solver` | Holistic, combines all of the above |
 
-### Update Equations
+### How Particles Update
 
-```
-# Inertia keeps the particle moving in its current direction
-# Cognitive term pulls toward personal best (memory)
-# Social term pulls toward global best (collaboration)
+Each iteration, particles generate candidates by asking the LLM to blend their personal best code (`pbest_code`) with the global best code (`gbest_code`). The LLM acts as the mutation operator — there is no vector arithmetic on embeddings for candidate selection. Selection is purely fitness-greedy: the candidate with the highest sandbox fitness wins.
 
-v_i ← w · v_i
-    + c1 · r1 · (pbest_i − x_i)
-    + c2 · r2 · (gbest   − x_i)
+**Adaptive inertia**: `w` decreases linearly from `w` to `w×0.4` over the iteration budget (e.g. 0.50 → 0.20). Early iterations explore; later ones exploit local optima.
 
-target_i ← (x_i + v_i) / ‖x_i + v_i‖₂    # project back to unit sphere
-```
-
-Default hyperparameters: `w=0.5`, `c1=1.5`, `c2=1.5`
+Default hyperparameters: `w=0.5` (initial, linearly annealed to `w×0.4`), `c1=1.5`, `c2=1.5`
 
 ---
 
-## The Generate-and-Project Bridge
+## The Mutation-and-Select Bridge
 
-This is the key innovation that solves the Inverse Mapping Problem:
+This is the mechanism that connects PSO swarm structure with LLM code generation:
 
 ```
-Step 1 — PSO computes target_pos in ℝ⁷⁶⁸
-         (unit sphere, L2-normalised)
-
-Step 2 — LLM generates K=10 candidate functions
+Step 1 — PSOCoder generates K candidates
          Each is a blend of pbest_code and gbest_code
-         guided by a prompt that shares both solutions
-         and their fitness scores
+         guided by a prompt that shares both solutions,
+         their fitness scores, eval diffs, and failed history
 
-Step 3 — Embed all K candidates
-         embed(candidate_k) → ê_k ∈ ℝ⁷⁶⁸
+Step 2 — Pre-filter on first training pair
+         Candidates that crash or score zero on pair 0
+         are skipped (saves full multi-pair eval cost)
 
-Step 4 — Select the candidate closest to target_pos
-         best = argmin_k  cosine_distance(ê_k, target_pos)
+Step 3 — Full sandbox evaluation of surviving candidates
+         Each candidate is run against all training pairs
+         fitness = calculate_continuous_fitness(pred, target)
 
-Step 5 — Update particle
-         x_i     ← ê_best   (actual new position)
-         v_i     ← x_i_new − x_i_old  (implied velocity)
-         fitness ← sandbox.evaluate(best_candidate)
+Step 4 — Select highest-fitness candidate (greedy)
+         best = max(candidates, key=fitness)
+
+Step 5 — Update particle state
+         particle.code = best_candidate
+         if fitness > pbest: update pbest
+         if fitness > gbest: update gbest (after all particles finish)
 ```
-
-**Why cosine distance?** All embeddings are L2-normalised onto the unit sphere, so cosine distance and Euclidean distance are equivalent. The unit sphere constraint also prevents velocity vectors from diverging to infinity.
 
 ---
 
 ## Continuous Fitness Function
 
-Standard ARC evaluation is binary (pass/fail). PSO needs a gradient to know if a particle is moving in the right direction. `calculate_continuous_fitness` decomposes correctness into three orthogonal signals:
+Standard ARC evaluation is binary (pass/fail). PSO needs a gradient to know if a particle is moving in the right direction. `calculate_continuous_fitness` decomposes correctness into four orthogonal signals:
 
 ```
-                    ┌── 20% ──┐  ┌───── 30% ──────┐  ┌──── 50% ────┐
-fitness =  weight × dim_score + weight × color_score + weight × pixel_score
+              ┌── 15% ──┐  ┌── 20% ──┐  ┌── 30% ──┐  ┌──── 35% ────┐
+fitness =      dim_score   color_score   pixel_score   color_iou_score
 
 dim_score:
   if pred.shape == target.shape → 1.0
@@ -560,6 +622,12 @@ pixel_score:
   if same shape → correct_cells / total_cells
   else          → overlap_matches / total_target_cells
   (penalises wrong-size outputs via denominator)
+
+color_iou_score (per-color positional IoU):
+  For each unique color in the target grid, compute the IoU (intersection
+  over union) of that color's position mask between predicted and target grids.
+  Score is the mean IoU across all target colors.
+  Only computed when shapes match; 0.0 otherwise.
 ```
 
 Example progression during PSO:
@@ -587,16 +655,16 @@ Iteration 4  fitness=1.00  (solved ✓)
                     └─────────┬──────────┘
                               │
               ┌───────────────▼──────────────────┐
-              │           INITIALISATION          │
+              │         PHASE 1: INIT              │
+              │                                   │
+              │  Hypothesizer → N hypotheses       │
               │                                   │
               │  for each particle i in [1..N]:   │
               │    code_i  ← LLM.generate(        │
               │               role_i prompt,      │
-              │               task_description)   │
-              │    pos_i   ← embed(code_i)         │
-              │    vel_i   ← zeros(768)            │
+              │               hypothesis_i)       │
               │    fit_i   ← evaluate(code_i)     │
-              │    pbest_i ← (code_i, pos_i, fit_i)│
+              │    pbest_i ← (code_i, fit_i)      │
               │                                   │
               │  gbest ← argmax_i(fit_i)           │
               └───────────────┬──────────────────┘
@@ -605,54 +673,58 @@ Iteration 4  fitness=1.00  (solved ✓)
                               │
                          NO   ▼
               ┌───────────────────────────────────┐
+              │  PHASE 2: PSO ITERATION LOOP       │
               │  for iteration in [1..MAX_ITERS]:  │
               │                                   │
-              │    for each particle i:           │
+              │    snapshot gbest for all particles│
+              │                                   │
+              │    for each particle i (parallel): │
               │      ┌─────────────────────────┐  │
-              │      │  PSO VELOCITY UPDATE    │  │
-              │      │  r1,r2 ~ Uniform(0,1)   │  │
-              │      │  v ← w·v                │  │
-              │      │    + c1·r1·(pbest−x)    │  │
-              │      │    + c2·r2·(gbest−x)    │  │
-              │      │  target ← norm(x + v)   │  │
+              │      │  ADAPTIVE K             │  │
+              │      │  k_eff = k/2 if         │  │
+              │      │    pbest_fit≥0.7 else k │  │
               │      └────────────┬────────────┘  │
               │                   │               │
               │      ┌────────────▼────────────┐  │
-              │      │  LLM MUTATION (K=10)    │  │
-              │      │  candidates ← LLM(      │  │
+              │      │  LLM MUTATION (k_eff)   │  │
+              │      │  candidates ← PSOCoder( │  │
               │      │    pbest_code,           │  │
               │      │    gbest_code,           │  │
-              │      │    current_fitness)      │  │
+              │      │    eval_diffs,           │  │
+              │      │    failed_history)       │  │
               │      └────────────┬────────────┘  │
               │                   │               │
               │      ┌────────────▼────────────┐  │
-              │      │  GENERATE-AND-PROJECT   │  │
-              │      │  for c in candidates:   │  │
-              │      │    ê_c ← embed(c)       │  │
-              │      │  best ← argmin cosine(  │  │
-              │      │           ê_c, target)  │  │
+              │      │  EVALUATE & SELECT      │  │
+              │      │  pre-filter on pair 0   │  │
+              │      │  full eval survivors    │  │
+              │      │  best = max(fitness)    │  │
               │      └────────────┬────────────┘  │
               │                   │               │
               │      ┌────────────▼────────────┐  │
-              │      │  EVALUATE & UPDATE      │  │
-              │      │  x_i   ← embed(best)    │  │
-              │      │  fit_i ← sandbox(best)  │  │
+              │      │  UPDATE PARTICLE        │  │
               │      │  if fit > pbest: update │  │
-              │      │  if fit > gbest: update │  │
               │      └────────────┬────────────┘  │
               │                   │               │
+              │    update gbest (main thread)     │
+              │    stagnation → crossover/reinit  │
+              │    per-particle stagnation check  │
+              │    staleness early-exit check     │
+              │                                   │
               │         fit==1.0? ├─YES─► DONE    │
-              │                   │               │
               └───────────────────┘               │
                               │                   │
                     (budget   ▼   exhausted)       │
-                    return gbest_code              │
-                              │                   │
-                    ┌─────────▼──────────┐         │
-                    │  sandbox.execute(  │         │
-                    │   gbest_code,      │         │
-                    │   test_input)      │         │
-                    └─────────┬──────────┘         │
+              ┌───────────────────────────────────┐
+              │  PHASE 3: REFINEMENT (≥0.60)       │
+              │  Up to 8 targeted fix attempts     │
+              └───────────────┬──────────────────┘
+                              │
+              ┌───────────────▼──────────────────┐
+              │  PHASE 4: PARTICLE ENSEMBLE       │
+              │  Try all unique particle codes    │
+              │  on test input (best-first)       │
+              └───────────────┬──────────────────┘
                               │
                     ┌─────────▼──────────┐
                     │   Final prediction  │
@@ -719,59 +791,76 @@ Iteration 4  fitness=1.00  (solved ✓)
 ### PSO Main Loop
 
 ```python
-# ── INITIALISATION ──────────────────────────────────────────────────────────
+# ── PHASE 1: INITIALISATION ─────────────────────────────────────────────────
+hypotheses = Hypothesizer.generate(task, n=max(3, N_PARTICLES))
+
 for i in range(N_PARTICLES):
-    particle[i].code     = LLM.generate(role_prompt[i], task)
-    particle[i].pos      = normalize(embed(particle[i].code))
-    particle[i].velocity = zeros(768)
+    particle[i].code     = LLM.generate(role_prompt[i], task, hypothesis=hypotheses[i])
     particle[i].fitness  = continuous_fitness(sandbox(particle[i].code))
     particle[i].pbest    = copy(particle[i])
 
 gbest = particle with highest fitness
 
-# ── ITERATION LOOP ───────────────────────────────────────────────────────────
+# ── PHASE 2: ITERATION LOOP ─────────────────────────────────────────────────
 for iteration in range(MAX_ITERATIONS):
-    for i in range(N_PARTICLES):
+    progress = iteration / (MAX_ITERATIONS - 1)
+    w_eff = W * (1.0 - 0.6 * progress)      # adaptive inertia: 0.50 → 0.20
 
-        # Step 1 — PSO velocity update (continuous embedding space)
-        r1, r2 = random(0,1), random(0,1)
-        velocity[i] = (W  * velocity[i]
-                    + C1 * r1 * (pbest[i].pos - pos[i])
-                    + C2 * r2 * (gbest.pos    - pos[i]))
-        target_pos = normalize(pos[i] + velocity[i])
+    gbest_snapshot = gbest                    # all particles see same gbest
 
-        # Step 2 — LLM generates K mutations in discrete code space
-        candidates = LLM.generate_k_mutations(
-            k              = K_CANDIDATES,
+    for i in range(N_PARTICLES):  # (parallel via ThreadPoolExecutor)
+
+        # Adaptive K
+        if pbest[i].fitness >= 0.7:
+            k_eff = max(2, K // 2)            # exploit: fewer candidates
+        else:
+            k_eff = K                          # explore: full budget
+
+        # LLM generates k_eff mutations
+        candidates = PSOCoder.generate_mutations(
+            k              = k_eff,
             pbest_code     = pbest[i].code,
-            gbest_code     = gbest.code,
-            current_fitness = fitness[i],
+            gbest_code     = gbest_snapshot.code,
+            eval_diffs     = format_eval_diff(particle[i].last_eval),
+            failed_history = particle[i].failed_history[-5:],
         )
 
-        # Step 3 — Generate-and-Project: find closest candidate to target_pos
-        embeddings    = [normalize(embed(c)) for c in candidates]
-        distances     = [cosine(emb, target_pos) for emb in embeddings]
-        best_idx      = argmin(distances)
-        selected_code = candidates[best_idx]
-        selected_emb  = embeddings[best_idx]
+        # Pre-filter + evaluate
+        for c in candidates:
+            if prefilter_fitness(c, pair_0) == 0: skip
+            fitness[c] = full_sandbox_eval(c)
 
-        # Step 4 — Update particle state
-        velocity[i] = selected_emb - pos[i]   # implied displacement
-        pos[i]      = selected_emb
-        fitness[i]  = continuous_fitness(sandbox(selected_code))
+        best = max(candidates, key=fitness)    # greedy selection
 
-        # Step 5 — Update personal best
-        if fitness[i] > pbest[i].fitness:
-            pbest[i] = (selected_code, selected_emb, fitness[i])
+        # Update particle
+        particle[i].code    = best
+        particle[i].fitness = fitness[best]
+        if fitness[best] > pbest[i].fitness:
+            pbest[i] = (best, fitness[best])
+            particle[i].stagnation_iters = 0
+        else:
+            particle[i].stagnation_iters += 1
 
-        # Step 6 — Update global best
-        if fitness[i] > gbest.fitness:
-            gbest = (selected_code, selected_emb, fitness[i])
+    # Update global best (main thread)
+    gbest = max(all particles, key=pbest.fitness)
 
     if gbest.fitness == 1.0:
         break   # solved all training pairs
 
-# ── FINAL PREDICTION ─────────────────────────────────────────────────────────
+    # Stagnation → crossover → reinit worst particle
+    # Per-particle stagnation → reinit stuck particles (3+ flat iters)
+    # Staleness early-exit (3 iters with <0.01 gbest improvement)
+
+# ── PHASE 3: REFINEMENT (fitness ≥ 0.60) ────────────────────────────────────
+if 0.60 <= gbest.fitness < 1.0:
+    gbest = refinement_phase(gbest, max_attempts=8)
+
+# ── PHASE 4: PARTICLE ENSEMBLE ──────────────────────────────────────────────
+if gbest fails on test_input:
+    for alt_code in unique_particle_codes(sorted by fitness):
+        if sandbox(alt_code, test_input) == test_output:
+            return alt_code
+
 return sandbox.execute(gbest.code, test_input)
 ```
 
@@ -782,26 +871,37 @@ def continuous_fitness(pred, target):
     if pred is None:
         return 0.0
 
-    # Dimension score (20%)
+    # Dimension score (15%)
     if pred.shape == target.shape:
         dim_score = 1.0
     else:
         dim_score = (min(pred.rows, target.rows) / max(pred.rows, target.rows)
                    * min(pred.cols, target.cols) / max(pred.cols, target.cols))
 
-    # Colour palette score (30%) — Jaccard index
+    # Colour palette score (20%) — Jaccard index
     pred_colors   = set(unique(pred))
     target_colors = set(unique(target))
     color_score   = |pred_colors ∩ target_colors| / |pred_colors ∪ target_colors|
 
-    # Pixel accuracy (50%)
+    # Pixel accuracy (30%)
     if pred.shape == target.shape:
         pixel_score = count(pred == target) / target.size
     else:
         overlap     = pred[:min_rows, :min_cols]
         pixel_score = count(overlap == target[:min_rows, :min_cols]) / target.size
 
-    return 0.20 * dim_score + 0.30 * color_score + 0.50 * pixel_score
+    # Per-color positional IoU (35%) — same-shape only
+    if pred.shape == target.shape:
+        ious = []
+        for color in unique(target):
+            inter = count(pred==color AND target==color)
+            union = count(pred==color OR  target==color)
+            ious.append(inter / union if union > 0 else 1.0)
+        color_iou_score = mean(ious)
+    else:
+        color_iou_score = 0.0
+
+    return 0.15 * dim_score + 0.20 * color_score + 0.30 * pixel_score + 0.35 * color_iou_score
 ```
 
 ### Critic Routing (Multi-Agent)
@@ -845,13 +945,16 @@ USER:
     def transform(input_grid):
         [gbest_code]
 
+  [per-pair fitness breakdown]
+  [eval diff of current failures]
+  [failed history — do NOT repeat these]
+
   Generate {K} variations. Each in its own ```python``` block.
   Named transform_1 ... transform_{K}.
-  Blend the logic of both — do not simply copy one.
 
 → LLM returns K code blocks
 → normalise all function names to "transform"
-→ embed each → pick closest to PSO target_pos
+→ sandbox eval → select highest fitness (greedy)
 ```
 
 ---
@@ -863,13 +966,14 @@ USER:
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+# Note: scipy is listed as an optional dependency but not currently used.
 
 # Start Ollama — tiered model selection based on available VRAM
 TIER=small  ./start_ollama.sh      # ~8 GB  — deepseek-r1:8b  + qwen2.5-coder:7b
-TIER=medium ./start_ollama.sh      # ~16 GB — deepseek-r1:14b + qwen2.5-coder:14b (default)
+TIER=medium ./start_ollama.sh      # ~16 GB — deepseek-r1:14b + qwen2.5-coder:14b
 TIER=large  ./start_ollama.sh      # ~32 GB — deepseek-r1:32b + qwen2.5-coder:32b
-TIER=ultra  ./start_ollama.sh      # ~25 GB model weights — deepseek-r1:32b (reasoner) + qwen2.5-coder:7b (fast coder)
-                                   #          optimal for ≥64 GB machines — ~39 GB KV cache headroom
+TIER=ultra  ./start_ollama.sh      # deepseek-r1:32b (~20 GB at Q4) + qwen2.5-coder:7b (~5 GB) (default)
+                                   #   optimal for ≥64 GB machines — ~39 GB KV cache headroom with parallel=1
 # Also pulls: nomic-embed-text (embeddings, 274 MB)
 # Prints ready-to-paste CLI invocations for each strategy after startup
 
@@ -879,6 +983,8 @@ TIER=ultra  ./start_ollama.sh      # ~25 GB model weights — deepseek-r1:32b (r
 #                                  frees ~6 GB on 64 GB machines for an extra parallel slot
 #   OLLAMA_NUM_PARALLEL=1       — MUST be 1 for deepseek-r1:32b on 64 GB (see start_ollama.sh)
 #   OLLAMA_KEEP_ALIVE=-1        — models stay loaded; avoids 30-60s reload penalty
+#   OLLAMA_MAX_LOADED_MODELS=2  — keep reasoner + coder both loaded in VRAM
+#                                  avoids 30-60s model swap penalty
 ```
 
 ### PSO Solver
@@ -899,7 +1005,7 @@ python run_pso.py --task data/training/007bbfb7.json \
     --n-particles 6      \   # number of particles (max 6)
     --max-iterations 15  \   # PSO iteration budget
     --k-candidates 10    \   # LLM mutations per particle per iteration
-    --w 0.5              \   # inertia weight
+    --w 0.5              \   # inertia weight (initial; annealed to w×0.4)
     --c1 1.5             \   # cognitive coefficient
     --c2 1.5             \   # social coefficient
     --temperature 0.7    \   # LLM sampling temperature
@@ -910,12 +1016,30 @@ python run_pso.py --task-dir data/training/ \
     --max-tasks 50 \
     --output results/pso_run.json
 
+# Batch evaluation with per-task timeout
+python run_pso.py --task-dir data/training/ \
+    --max-tasks 50 \
+    --task-timeout 300 \
+    --output results/pso_run.json
+
 # Use Anthropic backend for generation (embeddings still via Ollama)
-# Use the exact model ID from Anthropic's API (e.g. claude-sonnet-4-20250514)
 python run_pso.py --task data/training/007bbfb7.json \
     --backend anthropic \
-    --model claude-sonnet-4-20250514
+    --model claude-sonnet-4-6
 ```
+
+**CLI Parameters:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--n-particles` | 6 | Number of swarm particles (max 6) |
+| `--max-iterations` | 10 | PSO iteration budget |
+| `--k-candidates` | 10 | LLM mutation candidates per particle per iteration |
+| `--w` | 0.5 | PSO inertia weight (initial; annealed to w×0.4) |
+| `--c1` | 1.5 | Cognitive coefficient (pull toward personal best) |
+| `--c2` | 1.5 | Social coefficient (pull toward global best) |
+| `--fitness-alpha` | 0.4 | Reserved parameter; currently unused in candidate selection |
+| `--task-timeout` | None | (batch only) Max seconds per task before skipping |
 
 ### Unified CLI (all strategies)
 
@@ -958,7 +1082,7 @@ python run_multi_agent.py --task data/training/007bbfb7.json --strategy two_phas
 ## Running Tests
 
 ```bash
-# Run all 658 tests
+# Run all 646 tests
 python -m pytest
 
 # With coverage report
@@ -975,7 +1099,7 @@ python -m pytest tests/test_ensemble.py -v \
   -k "PixelMajority or CheckPrediction or CandidateFiltering or SelfCorrection"
 ```
 
-Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Ollama server required to run the test suite.
+Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Ollama server required to run the test suite. Coverage numbers below are approximate; run `pytest --cov` for current figures.
 
 ### Test Coverage
 
@@ -993,7 +1117,7 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 | `agents/pso_orchestrator.py` | 82% |
 | `agents/llm_client.py` | 86% |
 | `agents/dsl_reference.py` | 100% |
-| **Total** | **87%** |
+| **Total** | **94%** |
 
 > `arc/sandbox.py` subprocess worker bodies (`_subprocess_worker`, `_param_search_worker`) are tested by calling them directly in-process. The persistent `ProcessPoolExecutor` is registered with `atexit` so pytest exits cleanly without hanging. Coverage is lower on this module because some error-handling paths (broken pool recovery, spatial diff edge cases) are exercised only under real multiprocessing conditions.
 
@@ -1001,10 +1125,14 @@ Tests are fully offline — all LLM calls are mocked via `unittest.mock`. No Oll
 
 ## Key Design Decisions
 
+**Why behavioral embeddings?** Position tracking embeds what code *does* (its output on training pairs) rather than the code text, so similar-behaving programs cluster together. Two syntactically different programs that produce the same outputs occupy the same point in embedding space.
+
+**Why fitness-greedy selection?** Direct fitness maximization gives stronger signal than embedding proximity, especially when the embedding space doesn't perfectly correlate with solution quality. The system selects the candidate with the highest sandbox fitness rather than the one closest to a target vector.
+
+**Why adaptive K?** High-fitness particles need fewer candidates (exploitation); low-fitness particles get the full budget (exploration). This saves LLM budget where it matters least.
+
+**Why parallel particle updates?** Ollama HTTP calls release the GIL, so all N particles can query the LLM simultaneously via `ThreadPoolExecutor`. A gbest snapshot is taken at iteration start so particles don't interfere.
+
 **Why nomic-embed-text?** It is a 768-dimensional open-weight model that runs locally via Ollama, producing high-quality code embeddings without API costs or rate limits.
-
-**Why L2-normalise onto the unit sphere?** Cosine distance and Euclidean distance are equivalent on the unit sphere. Normalisation also prevents PSO velocities from diverging to infinity across iterations.
-
-**Why re-compute velocity as displacement?** The standard PSO velocity update can accumulate floating-point drift when embeddings are regenerated each step. Computing `v_new = x_new − x_old` (the actual displacement) resets the velocity to a geometrically meaningful value each iteration.
 
 **Why 6 fixed roles?** Diversity in the initial population is critical for PSO to avoid premature convergence. Six specialist roles (geometric, colour, pattern, object, rule, hybrid) cover the main reasoning strategies seen across ARC tasks. More roles would increase LLM cost without proportional benefit.
