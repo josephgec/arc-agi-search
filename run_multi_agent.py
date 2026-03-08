@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """CLI entry point for multi-agent ARC-AGI solvers.
 
-Supports five strategies selectable via --strategy:
+Supports six strategies selectable via --strategy:
   multi      — Hypothesizer → Coder → Critic feedback loop (default)
   ensemble   — Multiple Orchestrator runs with majority voting
   pso        — Particle Swarm Optimization swarm (see run_pso.py for full options)
   single     — Simple single-agent baseline
   two_phase  — Fast MultiAgent (phase 1) then seed-PSO if unsolved (phase 2)
+  mcts       — Monte Carlo Tree Search over DSL pipelines (LLM-free)
 
 Usage examples
 --------------
@@ -43,6 +44,7 @@ from agents.multi_agent import MultiAgent
 from agents.ensemble import Ensemble
 from agents.single_agent import SingleAgent
 from agents.pso_orchestrator import PSOOrchestrator
+from agents.mcts_solver import MCTSSolver
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
 
     # Strategy
     p.add_argument("--strategy", default="multi",
-                   choices=["multi", "ensemble", "pso", "single", "two_phase"],
+                   choices=["multi", "ensemble", "pso", "single", "two_phase", "mcts"],
                    help="Solving strategy.")
 
     # Shared LLM config
@@ -90,6 +92,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pso-c1",             type=float, default=1.5)
     p.add_argument("--pso-c2",             type=float, default=1.5)
     p.add_argument("--pso-embed-model",    default="nomic-embed-text")
+
+    # MCTS-specific
+    p.add_argument("--mcts-max-depth",      type=int,   default=5)
+    p.add_argument("--mcts-max-iterations", type=int,   default=2000)
+    p.add_argument("--mcts-max-time",       type=float, default=120.0)
+    p.add_argument("--mcts-exploration",    type=float, default=1.414)
+    p.add_argument("--mcts-rollout-depth",  type=int,   default=3)
 
     # Output
     p.add_argument("--max-tasks",    type=int, default=None)
@@ -209,6 +218,15 @@ def build_solver(args: argparse.Namespace):
             debug=args.debug,
             target_candidates=args.ensemble_candidates,
             max_runs=args.ensemble_runs,
+        )
+    elif args.strategy == "mcts":
+        return MCTSSolver(
+            max_depth=args.mcts_max_depth,
+            max_iterations=args.mcts_max_iterations,
+            max_time=args.mcts_max_time,
+            exploration=args.mcts_exploration,
+            rollout_depth=args.mcts_rollout_depth,
+            debug=args.debug,
         )
     elif args.strategy == "single":
         return SingleAgent(
