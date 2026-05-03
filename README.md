@@ -1,5 +1,7 @@
 # ARC-AGI PSO Swarm Solver
 
+> **Writeup:** [Solving ARC-AGI with a PSO + LLM swarm](https://jthomas.site/blog/arc-swarm.html)
+
 A hybrid **Particle Swarm Optimization + LLM** architecture for the [ARC-AGI challenge](https://github.com/fchollet/ARC-AGI). Standard LLM agent loops get stuck in repetitive generation cycles (local minima). This system escapes that trap by coupling PSO swarm topology (pbest/gbest sharing, stagnation reinit, crossover) with LLM code generation via a **Mutation-and-Select bridge**.
 
 ---
